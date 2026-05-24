@@ -210,6 +210,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-market-deviation-pct", type=float, default=1.5, help="For SMART_RETEST market fallback: skip entry if price has moved more than this percent beyond the trigger. Default 1.5.")
     parser.add_argument("--no-market-fallback", action="store_true", help="For SMART_RETEST, never place a market order after timeout. Keep watching for the retest limit entry indefinitely.")
     parser.add_argument("--entry-stale-minutes", type=float, default=30.0, help="Drop unplaced triggered entries, or cancel LIMIT entries, after this many minutes. Prevents old queued signals and never-filling orders from blocking later opportunities. 0 = off.")
+    parser.add_argument("--rotation-auto-cut-loss", action="store_true", help="Auto-approve cutting a losing position to make room for an exploder, instead of waiting on the interactive Windows popup. Required for headless / VPS deployments. Profitable rotations are always automatic regardless of this flag.")
+    parser.add_argument("--equity-peak-reset-pct", type=float, default=15.0, help="Auto-reset .equity_peak.json when wallet equity changes by more than this percent in one scan tick (interpreted as a manual withdrawal or deposit, not a trade loss). Prevents drawdown-haircut sizing from triggering after you move money in or out. 0 = off (peak only resets on manual file deletion).")
     parser.add_argument("--adaptive-entry", action="store_true", help="Pick the entry execution mode per coin from its market regime: abnormal volume -> instant market entry, strong trend -> trailing retest, choppy -> retest, illiquid/meme -> strict retest. Also ranks candidates by momentum.")
     parser.add_argument("--skip-entry-regimes", default="", help="Comma-separated adaptive entry regimes to skip live, e.g. TRAILING_RETEST. Default: include all.")
     parser.add_argument("--ml-rank-model", type=Path, help="Live-compatible JSON model artifact used to rank qualifying signals. Ranking only; it does not hard-filter trades.")
@@ -947,13 +949,25 @@ def _close_position(
     return True
 
 
-def _prompt_cut_losing_trade(symbol: str, pnl: float, exploding_symbol: str) -> bool:
-    """Show a Windows popup asking whether to cut a losing trade to chase an exploding coin."""
+def _prompt_cut_losing_trade(symbol: str, pnl: float, exploding_symbol: str, args: argparse.Namespace | None = None) -> bool:
+    """Decide whether to cut a losing trade to chase an exploding coin.
+
+    Auto-approve when --rotation-auto-cut-loss is set (headless VPS mode) or
+    when stdin is not a TTY (no operator available to answer the popup).
+    Otherwise show the Windows popup and wait for the answer.
+    """
     message = (
         f"{symbol} is in a LOSS of {pnl:.2f} USDT. "
         f"{exploding_symbol} is exploding and there is no free slot. "
         f"Cut {symbol} at a loss to chase {exploding_symbol}?"
     )
+    auto_cut = bool(args and getattr(args, "rotation_auto_cut_loss", False))
+    # Detect non-interactive (VPS / nohup / systemd / piped) sessions.
+    headless = not sys.stdin.isatty() if hasattr(sys.stdin, "isatty") else True
+    if auto_cut or headless:
+        reason = "--rotation-auto-cut-loss set" if auto_cut else "no TTY (headless run)"
+        print(f"Rotation auto-cut ({reason}): cutting {symbol} at {pnl:.2f} USDT to chase {exploding_symbol}.")
+        return True
     print(
         f"\n*** ROTATION DECISION NEEDED ***\n{message}\n"
         f"(Windows prompt shown - {ROTATION_PROMPT_TIMEOUT}s to answer; no answer = keep {symbol})\n"
@@ -1109,7 +1123,7 @@ def _consider_rotation(
 
     # Only losing positions can free a slot - ask before realizing a loss.
     item, _net, pnl, _score = min(candidates, key=lambda c: c[3])
-    if _prompt_cut_losing_trade(str(item.get("symbol", "")), pnl, exploder.symbol):
+    if _prompt_cut_losing_trade(str(item.get("symbol", "")), pnl, exploder.symbol, args):
         if _close_position(client, item, account, args, reason=f"user cut loss to chase {exploder.symbol}"):
             _remove_pending_entry(args, item)
             _last_rotation_ts = time.time()
@@ -2903,7 +2917,14 @@ def _current_equity(account: dict[str, object]) -> float:
 
 def _resolve_auto_order_margin(args: argparse.Namespace, account: dict[str, object]) -> float:
     """Compute an --sizing-mode auto margin from the live account snapshot, with
-    persistent peak tracking. Returns 0 if not in auto mode or equity unavailable."""
+    persistent peak tracking. Returns 0 if not in auto mode or equity unavailable.
+
+    Auto-reset: when the wallet jumps by more than --equity-peak-reset-pct in
+    one tick the move is treated as a manual withdrawal/deposit (no single
+    trade can move the equity that fast under the bot's own sizing) and the
+    peak resets to the new equity. This lets the operator move money in or
+    out without the drawdown haircut sticking to a stale high.
+    """
     if args.sizing_mode != "auto":
         return 0.0
     equity = _current_equity(account)
@@ -2911,6 +2932,18 @@ def _resolve_auto_order_margin(args: argparse.Namespace, account: dict[str, obje
         return 0.0
     peak_path = Path(args.equity_peak_file)
     peak = _load_equity_peak(peak_path)
+    reset_pct = _safe_float(getattr(args, "equity_peak_reset_pct", 0.0))
+    if reset_pct > 0 and peak > 0:
+        change_pct = abs(equity - peak) / peak * 100.0
+        if change_pct >= reset_pct:
+            direction = "withdrawal" if equity < peak else "deposit"
+            print(
+                f"Auto-sizing: detected {direction} "
+                f"(equity {peak:.2f} -> {equity:.2f}, {change_pct:.1f}% change >= "
+                f"{reset_pct:.1f}% threshold); resetting peak to current equity."
+            )
+            peak = equity
+            _save_equity_peak(peak_path, peak)
     if equity > peak:
         peak = equity
         _save_equity_peak(peak_path, peak)
@@ -3722,6 +3755,17 @@ def _maybe_reposition_sl(
     formatted_sl = format(normalized, "f")
     if "." in formatted_sl:
         formatted_sl = formatted_sl.rstrip("0").rstrip(".")
+
+    # The raw comparison passed because the float was fractionally better, but
+    # after tick-size rounding the new SL equals the existing one. Suppress the
+    # no-op cancel+replace cycle (and the matching log spam) - it wastes API
+    # weight and clutters the terminal every dynamic-sl tick.
+    rounded_new = float(formatted_sl) if formatted_sl else 0.0
+    if rounded_new > 0:
+        if side == "LONG" and rounded_new <= current_sl:
+            return
+        if side == "SHORT" and rounded_new >= current_sl:
+            return
 
     hedge_mode = bool(item.get("hedge_mode", False))
     order_side = "SELL" if side == "LONG" else "BUY"
