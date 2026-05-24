@@ -50,6 +50,35 @@ class TelegramCommandTests(unittest.TestCase):
         self.assertIn("<code>/cancel SYMBOL</code>", text)
         self.assertNotIn("<SYMBOL>", text)
 
+    def test_positions_command_uses_live_mark_when_account_prices_are_zero(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = _command_args(directory)
+            bot = TelegramBot("token", "123")
+            bot._min_send_interval = 0
+            bot.api = _FakeTelegramAPI([_message_update("/positions", chat_id="123")], chat_id="123")
+            client = _FakeClient(
+                account={
+                    "positions": [{
+                        "symbol": "CHIPUSDT",
+                        "positionAmt": "100",
+                        "entryPrice": "0",
+                        "markPrice": "0",
+                        "unrealizedProfit": "-2.5",
+                    }]
+                },
+                marks={"CHIPUSDT": 0.125},
+            )
+            cli._register_telegram_commands(bot, args, client)
+
+            handled = bot.poll_commands(CommandContext(args=args, client=client))
+
+        self.assertEqual(handled, 1)
+        text, _parse_mode = bot.api.sent[0]
+        self.assertIn("<code>CHIPUSDT</code> <b>LONG</b>", text)
+        self.assertIn("• <b>Entry:</b> <code>0.15</code>", text)
+        self.assertIn("• <b>Mark:</b> <code>0.125</code>", text)
+        self.assertNotIn("• <b>Entry:</b> <code>0</code>", text)
+
     def test_send_falls_back_to_plain_text_when_html_parse_fails(self):
         bot = TelegramBot("token", "123")
         bot._min_send_interval = 0
@@ -109,8 +138,18 @@ class _FakeTelegramAPI:
 
 
 class _FakeClient:
+    def __init__(self, account: dict | None = None, marks: dict[str, float] | None = None) -> None:
+        self._account = account or {"totalWalletBalance": "100", "positions": []}
+        self._marks = marks or {}
+
     def account_info(self, recv_window: int = 5000):
-        return {"totalWalletBalance": "100", "positions": []}
+        return self._account
+
+    def mark_prices(self):
+        return dict(self._marks)
+
+    def mark_price(self, symbol: str):
+        return self._marks.get(symbol, 0.0)
 
 
 def _message_update(text: str, chat_id: str = "123", update_id: int = 1) -> dict:

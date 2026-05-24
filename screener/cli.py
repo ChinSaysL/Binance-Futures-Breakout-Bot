@@ -251,25 +251,43 @@ def _register_telegram_commands(bot, args: argparse.Namespace, client: BinanceCl
         if "_error" in acct:
             return format_warning("Account Fetch Failed", fmt_code(acct["_error"]))
             return f"⚠️ {_html.escape(acct['_error'])}"
+        try:
+            live_marks = client.mark_prices()
+        except BinanceClientError:
+            live_marks = {}
         open_pos = []
         for p in acct.get("positions", []):
             if not isinstance(p, dict):
                 continue
+            symbol = str(p.get("symbol", "?"))
             amt = _safe_float(p.get("positionAmt"))
             if abs(amt) <= 0:
                 continue
-            entry = _safe_float(p.get("entryPrice"))
-            mark = _safe_float(p.get("markPrice"))
+            entry = (
+                _safe_float(p.get("entryPrice"))
+                or _safe_float(p.get("breakEvenPrice"))
+                or _safe_float(p.get("avgPrice"))
+            )
+            mark = _safe_float(p.get("markPrice")) or _safe_float(live_marks.get(symbol))
             upnl = _safe_float(p.get("unrealizedProfit"))
+            if mark <= 0:
+                try:
+                    mark = client.mark_price(symbol)
+                except BinanceClientError:
+                    mark = 0.0
+            if entry <= 0 and mark > 0 and upnl and amt:
+                entry = mark - (upnl / amt) if amt > 0 else mark + (upnl / abs(amt))
             pnl_pct = ((mark - entry) / entry * 100.0) if entry > 0 and amt > 0 else \
                       ((entry - mark) / entry * 100.0) if entry > 0 else 0.0
             side = "LONG" if amt > 0 else "SHORT"
+            entry_text = fmt_code(f"{entry:g}") if entry > 0 else "n/a"
+            mark_text = fmt_code(f"{mark:g}") if mark > 0 else "n/a"
             open_pos.append(
                 "\n".join([
-                    f"{fmt_code(p.get('symbol', '?'))} <b>{side}</b>",
+                    f"{fmt_code(symbol)} <b>{side}</b>",
                     format_kv("Qty", fmt_code(f"{abs(amt):g}")),
-                    format_kv("Entry", fmt_code(f"{entry:g}")),
-                    format_kv("Mark", fmt_code(f"{mark:g}")),
+                    format_kv("Entry", entry_text),
+                    format_kv("Mark", mark_text),
                     format_kv("PnL", f"<b>{fmt_money(upnl)} USDT</b> ({fmt_pct(pnl_pct)})"),
                 ])
             )
