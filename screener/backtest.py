@@ -198,6 +198,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--mtf-alignment-ma-period", type=int, default=25, help="Moving-average period on the higher TF used for --mtf-alignment-tf. Default 25.")
     parser.add_argument("--mtf-alignment-ma-type", choices=["sma", "ema"], default="sma", help="Moving-average type for the MTF alignment check. EMA reacts faster to recent price; SMA is smoother.")
     parser.add_argument("--simulate-rotation", action="store_true", help="Use the rotation-aware portfolio sim: when all slots are full and a higher-momentum INSTANT signal arrives, close a weaker profitable position to make room. Mirrors the live rotation logic (90-min min hold, 30-min cooldown, ROTATION_MIN_EDGE).")
+    parser.add_argument("--rotation-cut-losers", action="store_true", help="With --simulate-rotation, also cut a losing position when no profitable candidate is available but the exploder still passes the momentum-edge gate. Matches the behaviour of the live --rotation-auto-cut-loss flag.")
     parser.add_argument("--reserve-last-slot-s-tier", action="store_true", help="When max-concurrent >= 2, the final slot is reserved for S-tier signals (momentum_score >= --s-tier-momentum-threshold). Other slots open to any qualifying signal.")
     parser.add_argument("--s-tier-momentum-threshold", type=float, default=0.85, help="Minimum momentum_score for a signal to qualify as S-tier. Default 0.85 = ~top 15-20%% of historical signals.")
     parser.add_argument("--target-intensity-max", type=float, default=4.0, help="Ceiling on the ATR intensity multiplier used to project the target (target = trigger + risk x 1.5 x intensity). 4.0 = current default; 2.0 caps high-ATR coins at 3R instead of 6R.")
@@ -1819,12 +1820,20 @@ def _simulate_portfolio_with_rotation(
             else:
                 unrealized_pct = (entry_price - mark) / entry_price if entry_price > 0 else 0.0
             net_pct = unrealized_pct - _ROTATION_FEE_RATE
-            if net_pct <= 0:
-                continue  # only rotate out positions that are profitable net of close fees
-            candidates.append((pos, mark))
+            is_profitable = net_pct > 0
+            # By default only rotate out profitable positions (net of fees).
+            # With --rotation-cut-losers, also include losing positions - matching
+            # the live --rotation-auto-cut-loss behaviour.
+            if not is_profitable and not args.rotation_cut_losers:
+                continue
+            candidates.append((pos, mark, is_profitable, net_pct))
         if not candidates:
             continue
-        chosen, chosen_mark = min(candidates, key=lambda c: c[0]["momentum_score"])
+        # Prefer profitable candidates over losing ones, then take the weakest
+        # by momentum_score within the preferred bucket.
+        profitable_candidates = [c for c in candidates if c[2]]
+        pool = profitable_candidates if profitable_candidates else candidates
+        chosen, chosen_mark, _, _ = min(pool, key=lambda c: c[0]["momentum_score"])
         close_position(chosen, trade.entry_time, chosen_mark, by_rotation=True)
         open_positions.remove(chosen)
         last_rotation_time_ms = trade.entry_time

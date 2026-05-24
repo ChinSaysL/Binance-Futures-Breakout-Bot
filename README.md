@@ -101,19 +101,19 @@ python -u .\breakout_detector.py `
   --max-concurrent-orders 2 `
   --skip-entry-regimes TRAILING_RETEST `
   --trailing-stop `
+  --dynamic-sl --sl-update-interval-seconds 300 --sl-lookback 20 `
   --breakeven-trigger-r 1.5 --breakeven-offset-pct 0.1 `
   --stagnation-after-r 0.5 --stagnation-candles 12 `
   --max-sl-loss-pct 35 `
-  --rotation-auto-cut-loss `
   --equity-peak-reset-pct 15 `
   --scan-interval-minutes 3
 ```
 
-**Why these exact flags** — they mirror the validated backtest defaults that produced the +19831% W3 result. The backtester skips `TRAILING_RETEST` by default and runs without `--dynamic-sl`, so the live command must too. Removing `--dynamic-sl` keeps the stop wherever it was originally placed (still tightly bound by `--max-sl-loss-pct`).
+**Why these exact flags** — they mirror the validated backtest defaults that produced the +19831% W3 result. The backtester skips `TRAILING_RETEST` by default. A 4-cell sweep then showed `--dynamic-sl` is a *marginal net positive* on top of the baseline (+0.3% sum equity, +0.004 worst-case R, slightly lower drawdown), so it's kept ON.
 
 **What's deliberately NOT in the recommended config:**
 
-- ❌ `--dynamic-sl` — backtest defaults have it OFF. Including it diverges from the validated +19831% result.
+- ❌ `--rotation-auto-cut-loss` — sweep showed cutting losing positions in rotation hurts every window (-53% W1, -31% W2, -11% W3, -25% worst-case R). The default rotation only swaps *profitable* positions. Flag is available for operators who want it, but it's a regression.
 - ❌ `--exhaustion-exit` — the hardcoded 4-candle stall cuts breakout consolidations short; tested net-negative on 4 windows.
 - ❌ `--reserve-last-slot-s-tier` (backtest flag) — at `N=2` it costs ~95% of return by gating too aggressively.
 - ❌ `--smart-tp` — not re-validated since recent exit-side changes; defaults stand.

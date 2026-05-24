@@ -952,9 +952,16 @@ def _close_position(
 def _prompt_cut_losing_trade(symbol: str, pnl: float, exploding_symbol: str, args: argparse.Namespace | None = None) -> bool:
     """Decide whether to cut a losing trade to chase an exploding coin.
 
-    Auto-approve when --rotation-auto-cut-loss is set (headless VPS mode) or
-    when stdin is not a TTY (no operator available to answer the popup).
-    Otherwise show the Windows popup and wait for the answer.
+    Auto-approve ONLY when --rotation-auto-cut-loss is set. The backtest's
+    rotation never cuts losing positions (it skips when no profitable
+    candidate is available) and a 4x3 sweep showed cutting losers is a
+    net negative on every window (-53% W1, -31% W2, -11% W3 on equity;
+    -25% worst-case R). So:
+
+    - Interactive Windows session: show the popup (operator decides).
+    - Headless (no TTY): default to KEEP the position - matches backtest.
+    - --rotation-auto-cut-loss: opt-in, cuts the loser (unvalidated path,
+      kept as an escape hatch for operators who want it).
     """
     message = (
         f"{symbol} is in a LOSS of {pnl:.2f} USDT. "
@@ -962,12 +969,13 @@ def _prompt_cut_losing_trade(symbol: str, pnl: float, exploding_symbol: str, arg
         f"Cut {symbol} at a loss to chase {exploding_symbol}?"
     )
     auto_cut = bool(args and getattr(args, "rotation_auto_cut_loss", False))
-    # Detect non-interactive (VPS / nohup / systemd / piped) sessions.
     headless = not sys.stdin.isatty() if hasattr(sys.stdin, "isatty") else True
-    if auto_cut or headless:
-        reason = "--rotation-auto-cut-loss set" if auto_cut else "no TTY (headless run)"
-        print(f"Rotation auto-cut ({reason}): cutting {symbol} at {pnl:.2f} USDT to chase {exploding_symbol}.")
+    if auto_cut:
+        print(f"Rotation auto-cut (--rotation-auto-cut-loss set): cutting {symbol} at {pnl:.2f} USDT to chase {exploding_symbol}.")
         return True
+    if headless:
+        print(f"Rotation: keeping {symbol} (headless run, no operator to answer; --rotation-auto-cut-loss not set).")
+        return False
     print(
         f"\n*** ROTATION DECISION NEEDED ***\n{message}\n"
         f"(Windows prompt shown - {ROTATION_PROMPT_TIMEOUT}s to answer; no answer = keep {symbol})\n"
