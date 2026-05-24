@@ -3710,27 +3710,42 @@ def _leverage_capped_stop(side: str, entry: float, stop: float, leverage: int, m
 
 
 def _dynamic_leverage(atr_pct: float, risk_pct: float, base: int) -> int:
-    """Compute per-coin leverage capped at 30x and lowered by stop distance."""
-    atr = atr_pct * 100
-    if atr < 0.8:
-        vol_factor = 3.0
-    elif atr < 1.5:
-        vol_factor = 2.5
-    elif atr < 2.5:
-        vol_factor = 2.0
-    elif atr < 3.5:
-        vol_factor = 1.5
-    elif atr < 5.0:
-        vol_factor = 1.0
-    elif atr < 8.0:
-        vol_factor = 0.7
-    else:
-        vol_factor = 0.5
-    target = round(base * vol_factor)
-    if risk_pct > 0:
-        max_safe = int(0.75 / risk_pct)
-        target = min(target, max_safe)
-    return max(min(target, 30), 1)
+    """Risk-parity dynamic leverage.
+
+    Scales UP from base when the stop is tighter than the strategy's typical
+    distance (better capital efficiency on high-conviction tight setups),
+    capped at 25x. Stays AT base on normal stops. Drops below base only when
+    a liquidation-buffer safety cap demands it - never to penalize a
+    volatile coin for its own sake.
+
+    The previous implementation used a fixed atr-pct → vol-factor table that
+    downscaled high-ATR coins (5-7x leverage on >5% ATR). It lost badly to
+    flat 10x in a 9-cell 3-window sweep: W3 fell from +19831% (flat) to
+    -0.5% (old dynamic), because breakout runners come disproportionately
+    from volatile coins and under-leveraging them caps the upside while
+    keeping the downside.
+
+    Safety: max-loss-per-trade is capped at LIQUIDATION_BUFFER of margin so
+    Binance never auto-liquidates before the configured SL fires.
+    """
+    if base <= 0:
+        return 1
+    if risk_pct <= 0:
+        return max(1, base)
+
+    REFERENCE_RISK_PCT = 0.04  # typical stop distance on this strategy's signals
+    LIQUIDATION_BUFFER = 0.75  # max-loss never exceeds 75% of margin (Binance auto-liq buffer)
+    HARD_CAP = 25              # absolute upper bound regardless of math
+
+    # Risk-parity: a tighter stop earns more leverage so dollar-risk stays flat.
+    risk_parity_target = base * (REFERENCE_RISK_PCT / risk_pct)
+    target = max(base, min(round(risk_parity_target), HARD_CAP))
+
+    # Safety floor: don't let a stop hit consume more than the liquidation buffer.
+    safety_cap = int(LIQUIDATION_BUFFER / risk_pct)
+    target = min(target, safety_cap)
+
+    return max(1, target)
 
 
 def _compact_count(value: int) -> str:
