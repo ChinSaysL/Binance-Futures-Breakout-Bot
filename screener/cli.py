@@ -209,7 +209,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--retest-timeout-seconds", type=float, default=300.0, help="For SMART_RETEST, seconds to wait for retest before entering at market.")
     parser.add_argument("--max-market-deviation-pct", type=float, default=1.5, help="For SMART_RETEST market fallback: skip entry if price has moved more than this percent beyond the trigger. Default 1.5.")
     parser.add_argument("--no-market-fallback", action="store_true", help="For SMART_RETEST, never place a market order after timeout. Keep watching for the retest limit entry indefinitely.")
-    parser.add_argument("--entry-stale-minutes", type=float, default=30.0, help="Cancel a LIMIT entry order that has been waiting to fill for this many minutes and drop the item from pending. Prevents a never-filling order from blocking a concurrency slot. 0 = off.")
+    parser.add_argument("--entry-stale-minutes", type=float, default=30.0, help="Drop unplaced triggered entries, or cancel LIMIT entries, after this many minutes. Prevents old queued signals and never-filling orders from blocking later opportunities. 0 = off.")
     parser.add_argument("--adaptive-entry", action="store_true", help="Pick the entry execution mode per coin from its market regime: abnormal volume -> instant market entry, strong trend -> trailing retest, choppy -> retest, illiquid/meme -> strict retest. Also ranks candidates by momentum.")
     parser.add_argument("--skip-entry-regimes", default="", help="Comma-separated adaptive entry regimes to skip live, e.g. TRAILING_RETEST. Default: include all.")
     parser.add_argument("--ml-rank-model", type=Path, help="Live-compatible JSON model artifact used to rank qualifying signals. Ranking only; it does not hard-filter trades.")
@@ -987,6 +987,7 @@ def _exploder_entry_ready(
     exploder: BreakoutSignal,
     args: argparse.Namespace,
     settings: BreakoutSettings,
+    account: dict[str, object],
 ) -> tuple[BreakoutSignal | None, str]:
     """Confirm an exploding coin can actually be entered before any held
     position is closed to chase it.
@@ -1011,7 +1012,12 @@ def _exploder_entry_ready(
         if args.dynamic_leverage
         else args.leverage
     )
-    if args.dynamic_leverage and args.order_margin > 0:
+    if args.sizing_mode == "auto":
+        margin = _resolve_auto_order_margin(args, account)
+        if margin <= 0:
+            return None, "auto-sizing margin unavailable"
+        notional = margin * leverage
+    elif args.dynamic_leverage and args.order_margin > 0:
         notional = args.order_margin * leverage
     else:
         notional = _order_notional(args)
@@ -1058,7 +1064,7 @@ def _consider_rotation(
         return 0
     # Never close a real position unless the exploder still confirms AND its
     # entry order can actually be placed - otherwise the slot is freed for nothing.
-    ready, skip_reason = _exploder_entry_ready(client, exploder, args, settings)
+    ready, skip_reason = _exploder_entry_ready(client, exploder, args, settings, account)
     if ready is None:
         print(f"Rotation: {exploder.symbol} {skip_reason} - keeping current positions.")
         return 0
@@ -1143,6 +1149,88 @@ def _active_position_count(pending_entries: list[dict[str, object]], account: di
     return count
 
 
+MANAGER_STATE_PRIORITY = {
+    "MONITORING": 0,
+    "ENTRY_ORDER_PLACED": 1,
+    "WAIT_RETEST": 2,
+    "WAIT_BREAKOUT": 3,
+}
+MANAGER_REGIME_PRIORITY = {
+    "INSTANT": 0,
+    "TRAILING_RETEST": 1,
+    "RETEST": 2,
+    "STRICT_RETEST": 3,
+}
+
+
+def _prioritize_pending_entry_plans(pending_entries: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Order pending entries before a manager pass spends any free slot."""
+    indexed = list(enumerate(pending_entries))
+
+    def key(pair: tuple[int, dict[str, object]]) -> tuple[int, int, float, float, int]:
+        index, item = pair
+        state = str(item.get("state", "WAIT_BREAKOUT"))
+        state_rank = MANAGER_STATE_PRIORITY.get(state, 9)
+        if state_rank < MANAGER_STATE_PRIORITY["WAIT_RETEST"]:
+            return (state_rank, 0, 0.0, 0.0, index)
+        regime_rank = MANAGER_REGIME_PRIORITY.get(str(item.get("entry_regime", "RETEST")), 9)
+        return (
+            state_rank,
+            regime_rank,
+            -_safe_float(item.get("momentum_score")),
+            _safe_float(item.get("created_at")),
+            index,
+        )
+
+    return [item for _, item in sorted(indexed, key=key)]
+
+
+def _entry_stale_minutes_for_item(item: dict[str, object], args: argparse.Namespace) -> float:
+    item_minutes = _safe_float(item.get("entry_stale_minutes"))
+    if item_minutes > 0:
+        return item_minutes
+    return _safe_float(getattr(args, "entry_stale_minutes", 0.0))
+
+
+def _stale_waiting_entry_reason(
+    item: dict[str, object],
+    args: argparse.Namespace,
+    now: float | None = None,
+) -> str:
+    if str(item.get("state", "")) != "WAIT_RETEST":
+        return ""
+    threshold_min = _entry_stale_minutes_for_item(item, args)
+    if threshold_min <= 0:
+        return ""
+    started_at = _safe_float(item.get("triggered_at")) or _safe_float(item.get("created_at"))
+    if started_at <= 0:
+        return ""
+    age_seconds = (time.time() if now is None else now) - started_at
+    threshold_seconds = threshold_min * 60.0
+    if age_seconds < threshold_seconds:
+        return ""
+    return (
+        f"{item.get('symbol')}@{item.get('interval', '')}: stale queued entry dropped "
+        f"after {age_seconds / 60.0:.1f} min without a free slot; will rescan/rebuild if still valid"
+    )
+
+
+def _drop_stale_waiting_entries(
+    pending_entries: list[dict[str, object]],
+    args: argparse.Namespace,
+    now: float | None = None,
+) -> tuple[list[dict[str, object]], list[str]]:
+    kept: list[dict[str, object]] = []
+    dropped: list[str] = []
+    for item in pending_entries:
+        reason = _stale_waiting_entry_reason(item, args, now=now)
+        if reason:
+            dropped.append(reason)
+        else:
+            kept.append(item)
+    return kept, dropped
+
+
 def _scan_and_arm(client: BinanceClient, args: argparse.Namespace, settings: BreakoutSettings) -> None:
     """Scan the market, re-rank the queue, and arm the strongest fresh opportunities."""
     args._live_ml_symbol_context = _load_ml_symbol_context(args.ml_context_file)
@@ -1165,12 +1253,16 @@ def _scan_and_arm(client: BinanceClient, args: argparse.Namespace, settings: Bre
     pending = _load_pending_entry_plans(args.entry_state_file)
     account = client.account_info(recv_window=args.recv_window)
 
-    # Rebuild the un-triggered queue from scratch every scan: dropping all WAIT_BREAKOUT
-    # entries and re-arming the top-ranked coins means regime, trigger, retest limit and
-    # exit plans always reflect the latest market state. Committed entries (triggered,
-    # placed, or monitoring) are kept untouched - their breakout is already in motion.
-    committed = [item for item in pending if str(item.get("state", "")) != "WAIT_BREAKOUT"]
-    dropped = len(pending) - len(committed)
+    # Rebuild untriggered and stale triggered entries from scratch every scan:
+    # re-arming the top-ranked coins means regime, trigger, retest limit and
+    # exit plans reflect the latest market state. Placed/monitoring entries are
+    # kept untouched because they already have exchange/account state attached.
+    undropped = [item for item in pending if str(item.get("state", "")) != "WAIT_BREAKOUT"]
+    dropped = len(pending) - len(undropped)
+    committed, stale_waiting = _drop_stale_waiting_entries(undropped, args)
+    dropped += len(stale_waiting)
+    for reason in stale_waiting:
+        print(reason)
     if dropped:
         _write_pending_entry_plans(args.entry_state_file, committed)
     pending = committed
@@ -1218,7 +1310,7 @@ def _scan_and_arm(client: BinanceClient, args: argparse.Namespace, settings: Bre
     results, order_failures = place_best_orders(client, signals, args, settings, account=account)
     armed = sum(1 for result in results if result.role == "ENTRY")
     print(
-        f"Auto-trader scan: rebuilt queue (dropped {dropped} un-triggered), armed {armed} entr(ies); "
+        f"Auto-trader scan: rebuilt queue (dropped {dropped} untriggered/stale), armed {armed} entr(ies); "
         f"watching {'all candidates' if args.queue_size <= 0 else f'up to {args.queue_size}'}, "
         f"max {cap or 'unlimited'} concurrent positions."
     )
@@ -1385,6 +1477,10 @@ def manage_pending_exits(client: BinanceClient, args: argparse.Namespace) -> int
         waiting_fill = 0
         waiting_exit_entry = 0
         failures: list[str] = []
+        pending_entries, stale_waiting = _drop_stale_waiting_entries(pending_entries, args)
+        for reason in stale_waiting:
+            print(reason)
+        pending_entries = _prioritize_pending_entry_plans(pending_entries)
 
         # Bracket sides whose opposite side has already entered (OCO): the loser is cancelled.
         committed_brackets: set[str] = {

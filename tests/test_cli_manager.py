@@ -3,11 +3,16 @@ import tempfile
 import time
 import unittest
 from contextlib import redirect_stdout
+from decimal import Decimal
 from io import StringIO
 from argparse import Namespace
 from pathlib import Path
+from unittest.mock import patch
 
+import screener.cli as cli
+from screener.breakout import BreakoutSettings, BreakoutSignal
 from screener.cli import _dynamic_leverage, manage_pending_exits
+from screener.orders import TradingRule
 
 
 class SmartRetestManagerTests(unittest.TestCase):
@@ -54,6 +59,67 @@ class SmartRetestManagerTests(unittest.TestCase):
             self.assertEqual(client.orders, [])
             remaining = json.loads(entry_file.read_text(encoding="utf-8"))
             self.assertEqual(remaining[0]["state"], "WAIT_BREAKOUT")
+
+    def test_free_slot_uses_pending_priority_before_file_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            entry_file = Path(directory) / "entries.json"
+            exit_file = Path(directory) / "exits.json"
+            near = _pending_entry(
+                state="WAIT_RETEST",
+                mark_side="waiting",
+                symbol="NEARUSDT",
+                regime="TRAILING_RETEST",
+                momentum=0.8541,
+                trigger="2.476",
+                limit="2.463",
+            )
+            nil = _pending_entry(
+                state="WAIT_RETEST",
+                mark_side="waiting",
+                symbol="NILUSDT",
+                regime="INSTANT",
+                momentum=0.9689,
+                trigger="0.07208",
+                limit="0.07171",
+            )
+            entry_file.write_text(json.dumps([near, nil]), encoding="utf-8")
+            client = _FakeClient({"NEARUSDT": 2.50, "NILUSDT": 0.073})
+            args = _args(entry_file, exit_file)
+            args.max_concurrent_orders = 1
+
+            result = _quiet_manage(client, args)
+
+            self.assertEqual(result, 0)
+            self.assertEqual(client.orders[0]["symbol"], "NILUSDT")
+            remaining = {item["symbol"]: item for item in json.loads(entry_file.read_text(encoding="utf-8"))}
+            self.assertEqual(remaining["NILUSDT"]["state"], "ENTRY_ORDER_PLACED")
+            self.assertEqual(remaining["NEARUSDT"]["state"], "WAIT_RETEST")
+
+    def test_drops_stale_waiting_entry_before_spending_free_slot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            entry_file = Path(directory) / "entries.json"
+            exit_file = Path(directory) / "exits.json"
+            entry = _pending_entry(
+                state="WAIT_RETEST",
+                mark_side="waiting",
+                symbol="NILUSDT",
+                regime="INSTANT",
+                momentum=0.9689,
+                trigger="0.07208",
+                limit="0.07171",
+            )
+            entry["triggered_at"] = time.time() - 31 * 60
+            entry["entry_stale_minutes"] = 30.0
+            entry_file.write_text(json.dumps([entry]), encoding="utf-8")
+            client = _FakeClient({"NILUSDT": 0.073})
+            args = _args(entry_file, exit_file)
+            args.max_concurrent_orders = 1
+
+            result = _quiet_manage(client, args)
+
+            self.assertEqual(result, 0)
+            self.assertEqual(client.orders, [])
+            self.assertFalse(entry_file.exists())
 
     def test_removes_monitoring_entry_after_position_closes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -115,11 +181,57 @@ class DynamicLeverageTests(unittest.TestCase):
         )
 
 
+class RotationPrecheckTests(unittest.TestCase):
+    def test_auto_sizing_rotation_precheck_uses_account_margin(self):
+        signal = _breakout_signal()
+        rule = TradingRule(
+            symbol=signal.symbol,
+            price_tick_size=Decimal("0.00001"),
+            quantity_step_size=Decimal("0.1"),
+            min_qty=Decimal("0.1"),
+            max_qty=Decimal("0"),
+            min_notional=Decimal("5"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            args = Namespace(
+                sizing_mode="auto",
+                equity_peak_file=str(Path(directory) / "equity_peak.json"),
+                leverage=10,
+                dynamic_leverage=False,
+                order_margin=0.0,
+                order_notional=0.0,
+                max_sl_loss_pct=35.0,
+                order_working_type="MARK_PRICE",
+                order_price_protect=False,
+                hedge_mode=False,
+                entry_mode="SMART_RETEST",
+                entry_pullback_pct=0.5,
+            )
+            account = {"totalWalletBalance": "22.24", "positions": []}
+
+            with (
+                patch("screener.cli._fresh_order_signal", return_value=signal),
+                patch("screener.cli.trading_rules_from_exchange_info", return_value={signal.symbol: rule}),
+                patch("screener.cli.build_entry_order_plan") as build_entry_order_plan,
+            ):
+                ready, reason = cli._exploder_entry_ready(
+                    _RotationPrecheckClient(),
+                    signal,
+                    args,
+                    BreakoutSettings(),
+                    account,
+                )
+
+        self.assertIs(ready, signal)
+        self.assertEqual(reason, "")
+        self.assertAlmostEqual(build_entry_order_plan.call_args.kwargs["requested_notional"], 122.32, places=2)
+
+
 class _FakeClient:
     api_key = "key"
     api_secret = "secret"
 
-    def __init__(self, mark_price: float) -> None:
+    def __init__(self, mark_price: float | dict[str, float]) -> None:
         self._mark_price = mark_price
         self.orders: list[dict[str, str]] = []
         self.cancelled_algos: list[tuple[str, str]] = []
@@ -128,9 +240,13 @@ class _FakeClient:
         return {"positions": []}
 
     def mark_price(self, symbol: str) -> float:
+        if isinstance(self._mark_price, dict):
+            return self._mark_price.get(symbol, 0.0)
         return self._mark_price
 
     def mark_prices(self) -> dict[str, float]:
+        if isinstance(self._mark_price, dict):
+            return dict(self._mark_price)
         return {"TESTUSDT": self._mark_price}
 
     def change_leverage(self, symbol: str, leverage: int, recv_window: int = 5000):
@@ -151,26 +267,80 @@ class _FakeClient:
         return {"status": "CANCELED"}
 
 
-def _pending_entry(state: str, mark_side: str) -> dict[str, object]:
+class _RotationPrecheckClient:
+    def exchange_info(self):
+        return {}
+
+
+def _breakout_signal() -> BreakoutSignal:
+    return BreakoutSignal(
+        symbol="NILUSDT",
+        interval="15m",
+        side="LONG",
+        status="BREAKOUT",
+        score=1.0,
+        close=0.073,
+        resistance=0.072,
+        support=0.069,
+        breakout_pct=0.01,
+        move_pct=0.0,
+        sweep_pct=0.0,
+        distance_to_trigger_pct=0.0,
+        condition="test",
+        order_type="STOP_MARKET",
+        trigger_price=0.07208,
+        stop_price=0.06954,
+        target_price=0.0866,
+        risk_pct=0.035,
+        reward_pct=0.20,
+        reward_risk=4.0,
+        volume_ratio=3.2,
+        avg_quote_volume=1_000_000.0,
+        min_required_quote_volume=25_000.0,
+        compression_pct=0.05,
+        atr_pct=0.03,
+        trend_score=0.8,
+        close_position=0.9,
+        quote_volume_24h=100_000_000.0,
+        trade_count_24h=100_000,
+        range_pct_24h=18.0,
+        price_change_pct_24h=7.0,
+        book_min_depth=100_000.0,
+        open_interest_notional=1_000_000.0,
+        open_candle=False,
+    )
+
+
+def _pending_entry(
+    state: str,
+    mark_side: str,
+    symbol: str = "TESTUSDT",
+    regime: str = "RETEST",
+    momentum: float = 0.0,
+    trigger: str = "100",
+    limit: str = "99.5",
+) -> dict[str, object]:
     triggered_at = time.time()
     if mark_side == "timeout":
         triggered_at -= 301
     return {
         "created_at": int(time.time()),
         "state": state,
-        "symbol": "TESTUSDT",
+        "symbol": symbol,
         "side": "LONG",
         "interval": "15m",
         "hedge_mode": False,
         "binance_side": "BUY",
         "quantity": "1",
-        "trigger_price": "100",
-        "limit_price": "99.5",
+        "trigger_price": trigger,
+        "limit_price": limit,
         "retest_timeout_seconds": 300,
         "triggered_at": triggered_at,
-        "entry_client_order_id": "bd_TESTUSDT_L15m_1",
+        "entry_client_order_id": f"bd_{symbol}_L15m_1",
         "leverage": 5,
         "margin_type": "",
+        "entry_regime": regime,
+        "momentum_score": momentum,
         "exit_plans": [],
     }
 
@@ -187,6 +357,7 @@ def _args(entry_file: Path, exit_file: Path) -> Namespace:
         max_concurrent_orders=0,
         max_market_deviation_pct=1.5,
         no_market_fallback=False,
+        entry_stale_minutes=30.0,
         dynamic_sl=False,
         sl_update_interval_seconds=300.0,
         sl_lookback=20,
