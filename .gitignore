@@ -1,0 +1,78 @@
+# --- Secrets (never commit) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- Live trading state (account-specific, mutated by the running bot) ---
+.pending_entry_orders.json
+.pending_exit_orders.json
+.equity_peak.json
+.ml_symbol_context.json
+.symbol_r_history.json
+
+# --- Local kline cache (regenerated on demand; ~GB-scale) ---
+.backtest_kline_cache/
+
+# --- Trade logs (default output of --trade-log; rotated per run) ---
+backtest_trades.csv
+backtest_trades_*.csv
+trades_*.csv
+
+# --- Experiment artifacts (regenerable sweep / ablation logs) ---
+*_results.txt
+*_results_*.txt
+*_sweep_results*.txt
+*_validation*.txt
+_ablation_*.txt
+_stag_*.txt
+_sweep_*.ps1
+mtf_variants_results.txt
+
+# --- One-off triage scripts (named with leading underscore) ---
+_*.py
+_*.ps1
+!_*test*.py
+
+# --- Python build / cache ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+build/
+dist/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.hypothesis/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# --- IDE / editor ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# --- Jupyter / notebooks ---
+.ipynb_checkpoints/
+*.ipynb_meta
+
+# --- ML walk-forward outputs (regenerable from train_model.py) ---
+ml_walk_forward_*.csv
+ml_walk_forward_*.json

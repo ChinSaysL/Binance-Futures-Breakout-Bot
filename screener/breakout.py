@@ -1,0 +1,1041 @@
+from __future__ import annotations
+
+import math
+import time
+from dataclasses import dataclass
+from typing import Any, Iterable
+
+
+EPSILON = 1e-12
+BASE_FLOW_INTERVAL_MS = 15 * 60_000
+
+
+@dataclass(frozen=True)
+class Candle:
+    open_time: int
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    close_time: int
+    quote_volume: float
+
+
+@dataclass(frozen=True)
+class BreakoutSettings:
+    resistance_lookback: int = 40
+    squeeze_lookback: int = 20
+    volume_lookback: int = 20
+    atr_lookback: int = 14
+    min_breakout_pct: float = 0.0015
+    target_breakout_pct: float = 0.012
+    max_extension_pct: float = 0.035
+    prior_break_tolerance_pct: float = 0.004
+    watch_distance_pct: float = 0.02
+    max_shakeout_distance_pct: float = 0.04
+    max_pre_trigger_move_pct: float = 0.03
+    entry_buffer_pct: float = 0.001
+    stop_buffer_pct: float = 0.002
+    target_range_multiple: float = 1.5
+    min_sweep_pct: float = 0.0015
+    max_fakeout_close_position: float = 0.55
+    min_volume_ratio: float = 1.45
+    min_watch_volume_ratio: float = 0.8
+    min_avg_quote_volume: float = 25_000
+    min_close_position: float = 0.62
+    max_compression_pct: float = 0.18
+    entry_atr_buffer_multiple: float = 0.0
+    trigger_reject_lookback: int = 4
+    breakout_lookback: int = 24
+    breakout_stop_lookback: int = 10
+    # Explosiveness floor for the simple detector. A 12-run sweep (whole universe,
+    # 3 windows spanning a -21.9% downtrend, a -2.9% flat tape and a +13.7%
+    # uptrend) found 2.5x volume with the ATR floor left at 1.0% the most robust:
+    # positive expectancy in all three regimes (+0.098 / +0.110 / +0.626 R).
+    # Raising the ATR floor to 1.5% lost money in the flat window - ATR is a
+    # trailing average, so a high floor screens out quiet-coil breakouts.
+    min_breakout_volume_ratio: float = 2.5
+    min_breakout_atr_pct: float = 0.010
+    overhead_ma_guard: bool = True
+    # Detection upgrades validated by a 27-run sweep (whole universe, 3 regime
+    # windows). A 1.5x-ATR breakout candle + an extension cap (reject breaks
+    # already >5% past the level) together lifted expectancy +0.278 -> +0.377 R
+    # and the worst-case window +0.098 -> +0.264 R. Relative-strength-vs-BTC and
+    # the tight-base filter each lost money in a regime and were dropped.
+    breakout_min_candle_range_mult: float = 1.5   # breakout candle range must be >= this x ATR
+    breakout_max_extension_pct: float = 0.05      # reject breakouts already this far above the level
+    breakout_max_base_range_pct: float = 0.0      # off - the tight-base filter killed the uptrend edge
+    # MA-aware take-profit: a 6-run sweep (whole universe, 3 regime windows)
+    # showed capping the target just below an overhead MA99 beat the uncapped
+    # target on every metric in every window - expectancy, win rate, profit
+    # factor and drawdown all improved; compounded 49x -> 61x.
+    tp_cap_below_ma: bool = True
+    # Case-aware target capping: the existing target = trigger + risk x 1.5 x intensity
+    # produces 6R targets on high-ATR coins (intensity caps at 4). These two knobs
+    # bring the target back to something hittable when the move is already volatile
+    # or near a recent swing high.
+    target_intensity_max: float = 4.0          # ceiling on the ATR intensity multiplier (tested: 2.0 hurt the right tail)
+    # Cap the target just past the prior swing high/low of the last N candles
+    # (excluding the breakout candle itself) when that resistance is meaningfully
+    # above the trigger. Validated by a 12-run sweep: at 200 candles, expectancy
+    # +0.432 -> +0.518 R, max drawdown 37.8% -> 32.3%, compounded 117x -> 203x.
+    tp_cap_recent_swing_high_candles: int = 200
+    # Volume-trend filter: require the base (pre-breakout window) to show net
+    # accumulation - up-candle volume >= ratio x down-candle volume. 0 = off.
+    breakout_min_up_down_volume_ratio: float = 0.0
+
+
+@dataclass(frozen=True)
+class BreakoutSignal:
+    symbol: str
+    interval: str
+    side: str
+    status: str
+    score: float
+    close: float
+    resistance: float
+    support: float
+    breakout_pct: float
+    move_pct: float
+    sweep_pct: float
+    distance_to_trigger_pct: float
+    condition: str
+    order_type: str
+    trigger_price: float
+    stop_price: float
+    target_price: float
+    risk_pct: float
+    reward_pct: float
+    reward_risk: float
+    volume_ratio: float
+    avg_quote_volume: float
+    min_required_quote_volume: float
+    compression_pct: float
+    atr_pct: float
+    trend_score: float
+    close_position: float
+    quote_volume_24h: float
+    trade_count_24h: int
+    range_pct_24h: float
+    price_change_pct_24h: float
+    book_min_depth: float
+    open_interest_notional: float
+    open_candle: bool
+
+
+def candle_from_kline(kline: list[Any]) -> Candle:
+    return Candle(
+        open_time=int(kline[0]),
+        open=float(kline[1]),
+        high=float(kline[2]),
+        low=float(kline[3]),
+        close=float(kline[4]),
+        volume=float(kline[5]),
+        close_time=int(kline[6]),
+        quote_volume=float(kline[7]),
+    )
+
+
+def candles_from_klines(klines: Iterable[list[Any]]) -> list[Candle]:
+    return [candle_from_kline(kline) for kline in klines]
+
+
+def evaluate_breakout(
+    symbol: str,
+    candles: list[Candle],
+    quote_volume_24h: float,
+    interval_ms: int,
+    interval: str = "",
+    trade_count_24h: int = 0,
+    range_pct_24h: float = 0.0,
+    price_change_pct_24h: float = 0.0,
+    book_min_depth: float = 0.0,
+    open_interest_notional: float = 0.0,
+    settings: BreakoutSettings | None = None,
+    include_confirmed: bool = False,
+    include_rejected: bool = False,
+    now_ms: int | None = None,
+) -> BreakoutSignal | None:
+    settings = settings or BreakoutSettings()
+    min_needed = max(settings.resistance_lookback, settings.squeeze_lookback, settings.volume_lookback, 50) + 2
+    if len(candles) < min_needed:
+        return None
+
+    now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    latest = candles[-1]
+    previous = candles[-2]
+    resistance_window = candles[-settings.resistance_lookback - 1 : -1]
+    squeeze_window = candles[-settings.squeeze_lookback - 1 : -1]
+    volume_window = candles[-settings.volume_lookback - 1 : -1]
+
+    resistance = max(candle.high for candle in resistance_window)
+    support = min(candle.low for candle in squeeze_window)
+    if resistance <= 0 or support <= 0 or support >= resistance:
+        return None
+
+    atr_pct = _atr_pct(candles[-settings.atr_lookback - 1 :], latest.close)
+    trigger_buffer_pct = max(settings.entry_buffer_pct, atr_pct * settings.entry_atr_buffer_multiple)
+    # Volatility-scaled gates: a coin with a wide 24h range gets a proportionally wider
+    # trigger window. Fixed low-volatility gates structurally exclude genuinely hot coins
+    # (post-pump consolidations sit too far from their high to ever register otherwise).
+    vol_scale = _clamp(range_pct_24h / 7.0, 1.0, 7.0)
+    effective_watch_distance = settings.watch_distance_pct * vol_scale
+    effective_pre_trigger_move = settings.max_pre_trigger_move_pct * vol_scale
+    effective_shakeout_distance = settings.max_shakeout_distance_pct * vol_scale
+    effective_max_extension = settings.max_extension_pct * vol_scale
+    long_trigger = resistance * (1 + trigger_buffer_pct)
+    short_trigger = support * (1 - trigger_buffer_pct)
+    breakout_pct = latest.close / resistance - 1.0
+    breakdown_pct = support / max(latest.close, EPSILON) - 1.0
+    prior_break_pct = previous.close / resistance - 1.0
+    prior_breakdown_pct = support / max(previous.close, EPSILON) - 1.0
+    reclaim_pct = latest.close / support - 1.0
+    prior_support_pct = previous.close / support - 1.0
+    support_sweep_pct = support / max(latest.low, EPSILON) - 1.0
+    resistance_sweep_pct = latest.high / resistance - 1.0
+    long_distance_to_trigger_pct = long_trigger / max(latest.close, EPSILON) - 1.0
+    short_distance_to_trigger_pct = latest.close / max(short_trigger, EPSILON) - 1.0
+    long_move_from_base_pct = latest.close / support - 1.0
+    short_move_from_base_pct = resistance / max(latest.close, EPSILON) - 1.0
+    compression_pct = _range_pct(squeeze_window, latest.close)
+    close_position = _close_position(latest)
+    bearish_close_position = 1 - close_position
+    volume_ratio, open_candle = _volume_ratio(latest, volume_window, interval_ms, now_ms)
+    avg_quote_volume = _average_quote_volume(volume_window)
+    min_required_quote_volume = settings.min_avg_quote_volume * interval_ms / BASE_FLOW_INTERVAL_MS
+    has_enough_flow = avg_quote_volume >= min_required_quote_volume
+    trend_score = _trend_score(candles)
+
+    long_is_fresh = prior_break_pct <= settings.prior_break_tolerance_pct
+    short_is_fresh = prior_breakdown_pct <= settings.prior_break_tolerance_pct
+    long_has_not_triggered = latest.high < long_trigger and latest.close < resistance
+    short_has_not_triggered = latest.low > short_trigger and latest.close > support
+    long_trigger_was_rejected = _long_trigger_was_rejected(candles, settings, trigger_buffer_pct)
+    short_trigger_was_rejected = _short_trigger_was_rejected(candles, settings, trigger_buffer_pct)
+
+    candidates: list[BreakoutSignal] = []
+
+    if (
+        long_has_not_triggered
+        and has_enough_flow
+        and long_distance_to_trigger_pct >= 0
+        and long_distance_to_trigger_pct <= effective_watch_distance
+        and long_move_from_base_pct <= effective_pre_trigger_move
+        and long_is_fresh
+        and not long_trigger_was_rejected
+        and volume_ratio >= settings.min_watch_volume_ratio
+        and close_position >= settings.min_close_position
+        and compression_pct <= settings.max_compression_pct * 1.25
+    ):
+        candidates.append(
+            _build_signal(
+                symbol=symbol,
+                interval=interval,
+                side="LONG",
+                status="PRE_BREAKOUT",
+                close=latest.close,
+                resistance=resistance,
+                support=support,
+                breakout_pct=breakout_pct,
+                move_pct=breakout_pct,
+                sweep_pct=0.0,
+                distance_to_trigger_pct=long_distance_to_trigger_pct,
+                trigger_price=long_trigger,
+                stop_price=support * (1 - settings.stop_buffer_pct),
+                target_price=long_trigger + (resistance - support) * settings.target_range_multiple,
+                volume_ratio=volume_ratio,
+                avg_quote_volume=avg_quote_volume,
+                min_required_quote_volume=min_required_quote_volume,
+                compression_pct=compression_pct,
+                atr_pct=atr_pct,
+                close_position=close_position,
+                trend_score=trend_score,
+                quote_volume_24h=quote_volume_24h,
+                trade_count_24h=trade_count_24h,
+                range_pct_24h=range_pct_24h,
+                price_change_pct_24h=price_change_pct_24h,
+                open_candle=open_candle,
+                settings=settings,
+                book_min_depth=book_min_depth,
+                open_interest_notional=open_interest_notional,
+            )
+        )
+
+    if (
+        long_has_not_triggered
+        and has_enough_flow
+        and support_sweep_pct >= settings.min_sweep_pct
+        and reclaim_pct >= 0
+        and prior_support_pct >= -settings.prior_break_tolerance_pct
+        and long_distance_to_trigger_pct <= effective_shakeout_distance
+        and volume_ratio >= settings.min_volume_ratio
+        and close_position >= settings.min_close_position
+        and compression_pct <= settings.max_compression_pct
+    ):
+        candidates.append(
+            _build_signal(
+                symbol=symbol,
+                interval=interval,
+                side="LONG",
+                status="SPRING",
+                close=latest.close,
+                resistance=resistance,
+                support=support,
+                breakout_pct=breakout_pct,
+                move_pct=reclaim_pct,
+                sweep_pct=support_sweep_pct,
+                distance_to_trigger_pct=long_distance_to_trigger_pct,
+                trigger_price=long_trigger,
+                stop_price=latest.low * (1 - settings.stop_buffer_pct),
+                target_price=long_trigger + (resistance - support) * settings.target_range_multiple,
+                volume_ratio=volume_ratio,
+                avg_quote_volume=avg_quote_volume,
+                min_required_quote_volume=min_required_quote_volume,
+                compression_pct=compression_pct,
+                atr_pct=atr_pct,
+                close_position=close_position,
+                trend_score=trend_score,
+                quote_volume_24h=quote_volume_24h,
+                trade_count_24h=trade_count_24h,
+                range_pct_24h=range_pct_24h,
+                price_change_pct_24h=price_change_pct_24h,
+                open_candle=open_candle,
+                settings=settings,
+                book_min_depth=book_min_depth,
+                open_interest_notional=open_interest_notional,
+            )
+        )
+
+    if (
+        include_confirmed
+        and has_enough_flow
+        and breakout_pct >= settings.min_breakout_pct
+        and breakout_pct <= effective_max_extension
+        and long_is_fresh
+        and volume_ratio >= settings.min_volume_ratio
+        and close_position >= settings.min_close_position
+        and compression_pct <= settings.max_compression_pct
+    ):
+        candidates.append(
+            _build_signal(
+                symbol=symbol,
+                interval=interval,
+                side="LONG",
+                status="BREAKOUT",
+                close=latest.close,
+                resistance=resistance,
+                support=support,
+                breakout_pct=breakout_pct,
+                move_pct=breakout_pct,
+                sweep_pct=max(resistance_sweep_pct, 0.0),
+                distance_to_trigger_pct=max(long_distance_to_trigger_pct, 0.0),
+                trigger_price=long_trigger,
+                stop_price=support * (1 - settings.stop_buffer_pct),
+                target_price=long_trigger + (resistance - support) * settings.target_range_multiple,
+                volume_ratio=volume_ratio,
+                avg_quote_volume=avg_quote_volume,
+                min_required_quote_volume=min_required_quote_volume,
+                compression_pct=compression_pct,
+                atr_pct=atr_pct,
+                close_position=close_position,
+                trend_score=trend_score,
+                quote_volume_24h=quote_volume_24h,
+                trade_count_24h=trade_count_24h,
+                range_pct_24h=range_pct_24h,
+                price_change_pct_24h=price_change_pct_24h,
+                open_candle=open_candle,
+                settings=settings,
+                book_min_depth=book_min_depth,
+                open_interest_notional=open_interest_notional,
+            )
+        )
+
+    if (
+        short_has_not_triggered
+        and has_enough_flow
+        and short_distance_to_trigger_pct >= 0
+        and short_distance_to_trigger_pct <= effective_watch_distance
+        and short_move_from_base_pct <= effective_pre_trigger_move
+        and short_is_fresh
+        and not short_trigger_was_rejected
+        and volume_ratio >= settings.min_watch_volume_ratio
+        and bearish_close_position >= settings.min_close_position
+        and compression_pct <= settings.max_compression_pct * 1.25
+    ):
+        candidates.append(
+            _build_signal(
+                symbol=symbol,
+                interval=interval,
+                side="SHORT",
+                status="PRE_BREAKDOWN",
+                close=latest.close,
+                resistance=resistance,
+                support=support,
+                breakout_pct=breakdown_pct,
+                move_pct=breakdown_pct,
+                sweep_pct=0.0,
+                distance_to_trigger_pct=short_distance_to_trigger_pct,
+                trigger_price=short_trigger,
+                stop_price=resistance * (1 + settings.stop_buffer_pct),
+                target_price=max(short_trigger - (resistance - support) * settings.target_range_multiple, EPSILON),
+                volume_ratio=volume_ratio,
+                avg_quote_volume=avg_quote_volume,
+                min_required_quote_volume=min_required_quote_volume,
+                compression_pct=compression_pct,
+                atr_pct=atr_pct,
+                close_position=bearish_close_position,
+                trend_score=trend_score,
+                quote_volume_24h=quote_volume_24h,
+                trade_count_24h=trade_count_24h,
+                range_pct_24h=range_pct_24h,
+                price_change_pct_24h=price_change_pct_24h,
+                open_candle=open_candle,
+                settings=settings,
+                book_min_depth=book_min_depth,
+                open_interest_notional=open_interest_notional,
+            )
+        )
+
+    if (
+        short_has_not_triggered
+        and has_enough_flow
+        and resistance_sweep_pct >= settings.min_sweep_pct
+        and latest.close <= resistance
+        and short_distance_to_trigger_pct <= effective_shakeout_distance
+        and volume_ratio >= settings.min_volume_ratio
+        and bearish_close_position >= settings.min_close_position
+        and compression_pct <= settings.max_compression_pct
+    ):
+        candidates.append(
+            _build_signal(
+                symbol=symbol,
+                interval=interval,
+                side="SHORT",
+                status="UPTHRUST",
+                close=latest.close,
+                resistance=resistance,
+                support=support,
+                breakout_pct=breakdown_pct,
+                move_pct=resistance / max(latest.close, EPSILON) - 1.0,
+                sweep_pct=resistance_sweep_pct,
+                distance_to_trigger_pct=short_distance_to_trigger_pct,
+                trigger_price=short_trigger,
+                stop_price=latest.high * (1 + settings.stop_buffer_pct),
+                target_price=max(short_trigger - (resistance - support) * settings.target_range_multiple, EPSILON),
+                volume_ratio=volume_ratio,
+                avg_quote_volume=avg_quote_volume,
+                min_required_quote_volume=min_required_quote_volume,
+                compression_pct=compression_pct,
+                atr_pct=atr_pct,
+                close_position=bearish_close_position,
+                trend_score=trend_score,
+                quote_volume_24h=quote_volume_24h,
+                trade_count_24h=trade_count_24h,
+                range_pct_24h=range_pct_24h,
+                price_change_pct_24h=price_change_pct_24h,
+                open_candle=open_candle,
+                settings=settings,
+                book_min_depth=book_min_depth,
+                open_interest_notional=open_interest_notional,
+            )
+        )
+
+    if (
+        include_confirmed
+        and has_enough_flow
+        and breakdown_pct >= settings.min_breakout_pct
+        and breakdown_pct <= effective_max_extension
+        and short_is_fresh
+        and volume_ratio >= settings.min_volume_ratio
+        and bearish_close_position >= settings.min_close_position
+        and compression_pct <= settings.max_compression_pct
+    ):
+        candidates.append(
+            _build_signal(
+                symbol=symbol,
+                interval=interval,
+                side="SHORT",
+                status="BREAKDOWN",
+                close=latest.close,
+                resistance=resistance,
+                support=support,
+                breakout_pct=breakdown_pct,
+                move_pct=breakdown_pct,
+                sweep_pct=max(support_sweep_pct, 0.0),
+                distance_to_trigger_pct=max(short_distance_to_trigger_pct, 0.0),
+                trigger_price=short_trigger,
+                stop_price=resistance * (1 + settings.stop_buffer_pct),
+                target_price=max(short_trigger - (resistance - support) * settings.target_range_multiple, EPSILON),
+                volume_ratio=volume_ratio,
+                avg_quote_volume=avg_quote_volume,
+                min_required_quote_volume=min_required_quote_volume,
+                compression_pct=compression_pct,
+                atr_pct=atr_pct,
+                close_position=bearish_close_position,
+                trend_score=trend_score,
+                quote_volume_24h=quote_volume_24h,
+                trade_count_24h=trade_count_24h,
+                range_pct_24h=range_pct_24h,
+                price_change_pct_24h=price_change_pct_24h,
+                open_candle=open_candle,
+                settings=settings,
+                book_min_depth=book_min_depth,
+                open_interest_notional=open_interest_notional,
+            )
+        )
+
+    if include_rejected and not candidates and resistance_sweep_pct >= settings.min_sweep_pct and latest.close < resistance:
+        return None
+
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda candidate: (_candidate_priority(candidate.status), candidate.score))
+
+
+# Overhead-resistance guard: a breakout that fires straight into a long moving
+# average (price still below a near MA99) tends to get rejected there. Skip it
+# unless there is real headroom above, or the MA has already been cleared.
+HEADROOM_MA_PERIOD = 99
+HEADROOM_MIN_PCT = 0.025
+HEADROOM_ATR_MULT = 0.6
+# When tp_cap_below_ma is on, a target that projects past an overhead MA99 is
+# pulled back to just inside that wall (bank the move where it is likely to stall).
+TP_MA_CAP_BUFFER = 0.005
+# Swing-high cap only fires when there is meaningfully higher resistance overhead
+# (or lower support for SHORT); below this threshold there is no real ceiling to
+# bound against and capping would just amputate the target.
+TP_SWING_CAP_MIN_HEADROOM = 0.01
+
+
+def _long_ma(candles: list[Candle]) -> float:
+    """Simple moving average of the last HEADROOM_MA_PERIOD closes, or 0 if short."""
+    if len(candles) < HEADROOM_MA_PERIOD:
+        return 0.0
+    return sum(candle.close for candle in candles[-HEADROOM_MA_PERIOD:]) / HEADROOM_MA_PERIOD
+
+
+def _overhead_ma_blocks(candles: list[Candle], close: float, atr_pct: float, side: str) -> bool:
+    """True when a long moving average sits as a near wall against the breakout."""
+    if len(candles) < HEADROOM_MA_PERIOD or close <= 0:
+        return False
+    ma_long = sum(candle.close for candle in candles[-HEADROOM_MA_PERIOD:]) / HEADROOM_MA_PERIOD
+    required = max(HEADROOM_MIN_PCT, atr_pct * HEADROOM_ATR_MULT)
+    if side == "LONG":
+        return ma_long > close and (ma_long - close) / close < required
+    return ma_long < close and (close - ma_long) / close < required
+
+
+def detect_long_breakout(
+    symbol: str,
+    candles: list[Candle],
+    quote_volume_24h: float,
+    interval_ms: int,
+    interval: str = "",
+    range_pct_24h: float = 0.0,
+    settings: BreakoutSettings | None = None,
+    now_ms: int | None = None,
+) -> BreakoutSignal | None:
+    """High-recall long-breakout detector.
+
+    Fires whenever a coin closes above its recent range high on above-average
+    volume - built to catch almost every real breakout, not just tidy coils.
+    """
+    settings = settings or BreakoutSettings()
+    need = settings.breakout_lookback + max(settings.atr_lookback, settings.volume_lookback) + 2
+    if len(candles) < need:
+        return None
+    now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    latest = candles[-1]
+    prior_window = candles[-settings.breakout_lookback - 1 : -1]
+    prior_high = max(candle.high for candle in prior_window)
+    if prior_high <= 0 or latest.close <= prior_high:
+        return None  # no new high -> no breakout
+
+    if (
+        settings.breakout_max_extension_pct > 0
+        and latest.close / prior_high - 1.0 > settings.breakout_max_extension_pct
+    ):
+        return None  # already too far above the level - entering here is chasing
+    if settings.breakout_max_base_range_pct > 0:
+        prior_low = min(candle.low for candle in prior_window)
+        if prior_low <= 0 or (prior_high - prior_low) / prior_high > settings.breakout_max_base_range_pct:
+            return None  # base too wide/sloppy - not a tight coil
+
+    atr_pct = _atr_pct(candles[-settings.atr_lookback - 1 :], latest.close)
+    if atr_pct < settings.min_breakout_atr_pct:
+        return None  # too sluggish to be a "big" breakout
+    if settings.breakout_min_candle_range_mult > 0:
+        atr_abs = atr_pct * latest.close
+        if atr_abs <= 0 or (latest.high - latest.low) < settings.breakout_min_candle_range_mult * atr_abs:
+            return None  # breakout candle is not a wide-range ignition bar
+    if settings.breakout_min_up_down_volume_ratio > 0:
+        up_vol = sum(_volume(c) for c in prior_window if c.close > c.open)
+        down_vol = sum(_volume(c) for c in prior_window if c.close < c.open)
+        if up_vol < settings.breakout_min_up_down_volume_ratio * down_vol:
+            return None  # base lacks net accumulation - up-day volume < required ratio
+    volume_window = candles[-settings.volume_lookback - 1 : -1]
+    volume_ratio, open_candle = _volume_ratio(latest, volume_window, interval_ms, now_ms)
+    if volume_ratio < settings.min_breakout_volume_ratio:
+        return None  # breakout not backed by volume
+    avg_quote_volume = _average_quote_volume(volume_window)
+    min_required_quote_volume = settings.min_avg_quote_volume * interval_ms / BASE_FLOW_INTERVAL_MS
+    if avg_quote_volume < min_required_quote_volume:
+        return None  # too illiquid to trade
+    close_position = _close_position(latest)
+    if close_position < 0.5:
+        return None  # breakout candle closed weak / rejected
+    if settings.overhead_ma_guard and _overhead_ma_blocks(candles, latest.close, atr_pct, "LONG"):
+        return None  # breakout fired straight into an overhead moving average
+
+    stop_window = candles[-settings.breakout_stop_lookback :]
+    swing_low = min(candle.low for candle in stop_window)
+    stop_price = swing_low * (1 - settings.stop_buffer_pct)
+    trigger_price = prior_high * (1 + settings.entry_buffer_pct)
+    if stop_price <= 0 or stop_price >= trigger_price:
+        return None
+    intensity = min(max(atr_pct / 0.02, 1.0), max(settings.target_intensity_max, 1.0))
+    target_price = trigger_price + (trigger_price - stop_price) * settings.target_range_multiple * intensity
+    if settings.tp_cap_below_ma:
+        ma_long = _long_ma(candles)
+        if trigger_price < ma_long < target_price:
+            capped = ma_long * (1 - TP_MA_CAP_BUFFER)
+            if capped > trigger_price:
+                target_price = capped  # bank the move just under the overhead MA99
+    if settings.tp_cap_recent_swing_high_candles > 0:
+        # Exclude the breakout candle itself - it just MADE a new high, so the
+        # meaningful overhead resistance is whatever is left in the lookback.
+        # Only cap when that prior swing is materially above the trigger; else
+        # there is no real ceiling and capping just amputates the target.
+        n = min(settings.tp_cap_recent_swing_high_candles, len(candles) - 1)
+        if n > 0:
+            prior_n = candles[-n - 1 : -1]
+            if prior_n:
+                swing_high = max(c.high for c in prior_n)
+                if swing_high > trigger_price * (1 + TP_SWING_CAP_MIN_HEADROOM):
+                    capped = swing_high * (1 + TP_MA_CAP_BUFFER)
+                    if trigger_price < capped < target_price:
+                        target_price = capped  # bank just past the higher resistance
+
+    return _build_signal(
+        symbol=symbol,
+        interval=interval,
+        side="LONG",
+        status="BREAKOUT",
+        close=latest.close,
+        resistance=prior_high,
+        support=swing_low,
+        breakout_pct=latest.close / prior_high - 1.0,
+        move_pct=latest.close / prior_high - 1.0,
+        sweep_pct=0.0,
+        distance_to_trigger_pct=0.0,
+        trigger_price=trigger_price,
+        stop_price=stop_price,
+        target_price=target_price,
+        volume_ratio=volume_ratio,
+        avg_quote_volume=avg_quote_volume,
+        min_required_quote_volume=min_required_quote_volume,
+        compression_pct=0.0,
+        atr_pct=atr_pct,
+        close_position=close_position,
+        trend_score=_trend_score(candles),
+        quote_volume_24h=quote_volume_24h,
+        trade_count_24h=0,
+        range_pct_24h=range_pct_24h,
+        price_change_pct_24h=0.0,
+        open_candle=open_candle,
+        settings=settings,
+    )
+
+
+def detect_short_breakdown(
+    symbol: str,
+    candles: list[Candle],
+    quote_volume_24h: float,
+    interval_ms: int,
+    interval: str = "",
+    range_pct_24h: float = 0.0,
+    settings: BreakoutSettings | None = None,
+    now_ms: int | None = None,
+) -> BreakoutSignal | None:
+    """High-recall confirmed breakdown detector, mirroring ``detect_long_breakout``."""
+    settings = settings or BreakoutSettings()
+    need = settings.breakout_lookback + max(settings.atr_lookback, settings.volume_lookback) + 2
+    if len(candles) < need:
+        return None
+    now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    latest = candles[-1]
+    prior_window = candles[-settings.breakout_lookback - 1 : -1]
+    prior_low = min(candle.low for candle in prior_window)
+    if prior_low <= 0 or latest.close >= prior_low:
+        return None
+
+    atr_pct = _atr_pct(candles[-settings.atr_lookback - 1 :], latest.close)
+    if atr_pct < settings.min_breakout_atr_pct:
+        return None
+    volume_window = candles[-settings.volume_lookback - 1 : -1]
+    volume_ratio, open_candle = _volume_ratio(latest, volume_window, interval_ms, now_ms)
+    if volume_ratio < settings.min_breakout_volume_ratio:
+        return None
+    avg_quote_volume = _average_quote_volume(volume_window)
+    min_required_quote_volume = settings.min_avg_quote_volume * interval_ms / BASE_FLOW_INTERVAL_MS
+    if avg_quote_volume < min_required_quote_volume:
+        return None
+    close_position = _close_position(latest)
+    if close_position > 0.5:
+        return None
+    if settings.overhead_ma_guard and _overhead_ma_blocks(candles, latest.close, atr_pct, "SHORT"):
+        return None  # breakdown fired straight into a moving-average support
+    if settings.breakout_min_up_down_volume_ratio > 0:
+        up_vol = sum(_volume(c) for c in prior_window if c.close > c.open)
+        down_vol = sum(_volume(c) for c in prior_window if c.close < c.open)
+        if down_vol < settings.breakout_min_up_down_volume_ratio * up_vol:
+            return None  # base lacks net distribution - down-day volume below required ratio
+
+    stop_window = candles[-settings.breakout_stop_lookback :]
+    swing_high = max(candle.high for candle in stop_window)
+    stop_price = swing_high * (1 + settings.stop_buffer_pct)
+    trigger_price = prior_low * (1 - settings.entry_buffer_pct)
+    if trigger_price <= 0 or stop_price <= trigger_price:
+        return None
+    intensity = min(max(atr_pct / 0.02, 1.0), max(settings.target_intensity_max, 1.0))
+    target_price = max(
+        trigger_price - (stop_price - trigger_price) * settings.target_range_multiple * intensity,
+        EPSILON,
+    )
+    if settings.tp_cap_below_ma:
+        ma_long = _long_ma(candles)
+        if target_price < ma_long < trigger_price:
+            capped = ma_long * (1 + TP_MA_CAP_BUFFER)
+            if capped < trigger_price:
+                target_price = capped  # bank the move just above the overhead MA99
+    if settings.tp_cap_recent_swing_high_candles > 0:
+        n = min(settings.tp_cap_recent_swing_high_candles, len(candles) - 1)
+        if n > 0:
+            prior_n = candles[-n - 1 : -1]
+            if prior_n:
+                swing_low = min(c.low for c in prior_n)
+                if swing_low < trigger_price * (1 - TP_SWING_CAP_MIN_HEADROOM):
+                    capped = swing_low * (1 - TP_MA_CAP_BUFFER)
+                    if target_price < capped < trigger_price:
+                        target_price = capped  # bank just past the lower support
+
+    return _build_signal(
+        symbol=symbol,
+        interval=interval,
+        side="SHORT",
+        status="BREAKDOWN",
+        close=latest.close,
+        resistance=swing_high,
+        support=prior_low,
+        breakout_pct=prior_low / max(latest.close, EPSILON) - 1.0,
+        move_pct=prior_low / max(latest.close, EPSILON) - 1.0,
+        sweep_pct=0.0,
+        distance_to_trigger_pct=0.0,
+        trigger_price=trigger_price,
+        stop_price=stop_price,
+        target_price=target_price,
+        volume_ratio=volume_ratio,
+        avg_quote_volume=avg_quote_volume,
+        min_required_quote_volume=min_required_quote_volume,
+        compression_pct=0.0,
+        atr_pct=atr_pct,
+        close_position=1.0 - close_position,
+        trend_score=_trend_score(candles),
+        quote_volume_24h=quote_volume_24h,
+        trade_count_24h=0,
+        range_pct_24h=range_pct_24h,
+        price_change_pct_24h=0.0,
+        open_candle=open_candle,
+        settings=settings,
+    )
+
+
+def interval_to_ms(interval: str) -> int:
+    units = {"s": 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000, "w": 604_800_000}
+    if interval == "1M":
+        return 30 * 86_400_000
+    unit = interval[-1]
+    if unit not in units:
+        raise ValueError(f"unsupported interval: {interval}")
+    amount = int(interval[:-1])
+    return amount * units[unit]
+
+
+def _build_signal(
+    symbol: str,
+    interval: str,
+    side: str,
+    status: str,
+    close: float,
+    resistance: float,
+    support: float,
+    breakout_pct: float,
+    move_pct: float,
+    sweep_pct: float,
+    distance_to_trigger_pct: float,
+    trigger_price: float,
+    stop_price: float,
+    target_price: float,
+    volume_ratio: float,
+    avg_quote_volume: float,
+    min_required_quote_volume: float,
+    compression_pct: float,
+    atr_pct: float,
+    close_position: float,
+    trend_score: float,
+    quote_volume_24h: float,
+    trade_count_24h: int,
+    range_pct_24h: float,
+    price_change_pct_24h: float,
+    open_candle: bool,
+    settings: BreakoutSettings,
+    book_min_depth: float = 0.0,
+    open_interest_notional: float = 0.0,
+) -> BreakoutSignal:
+    if side == "SHORT":
+        risk_pct = max(stop_price / max(trigger_price, EPSILON) - 1.0, 0.0)
+        reward_pct = max(trigger_price / max(target_price, EPSILON) - 1.0, 0.0)
+        condition = f"mark <= {trigger_price:.12g}"
+        order_type = "SELL STOP_MARKET"
+    else:
+        risk_pct = max(trigger_price / max(stop_price, EPSILON) - 1.0, 0.0)
+        reward_pct = max(target_price / max(trigger_price, EPSILON) - 1.0, 0.0)
+        condition = f"mark >= {trigger_price:.12g}"
+        order_type = "BUY STOP_MARKET"
+
+    reward_risk = reward_pct / risk_pct if risk_pct > 0 else 0.0
+    score = _score(
+        distance_to_trigger_pct=distance_to_trigger_pct,
+        reward_risk=reward_risk,
+        volume_ratio=volume_ratio,
+        compression_pct=compression_pct,
+        close_position=close_position,
+        trend_score=trend_score,
+        settings=settings,
+    )
+
+    return BreakoutSignal(
+        symbol=symbol,
+        interval=interval,
+        side=side,
+        status=status,
+        score=score,
+        close=close,
+        resistance=resistance,
+        support=support,
+        breakout_pct=breakout_pct,
+        move_pct=move_pct,
+        sweep_pct=sweep_pct,
+        distance_to_trigger_pct=distance_to_trigger_pct,
+        condition=condition,
+        order_type=order_type,
+        trigger_price=trigger_price,
+        stop_price=stop_price,
+        target_price=target_price,
+        risk_pct=risk_pct,
+        reward_pct=reward_pct,
+        reward_risk=reward_risk,
+        volume_ratio=volume_ratio,
+        avg_quote_volume=avg_quote_volume,
+        min_required_quote_volume=min_required_quote_volume,
+        compression_pct=compression_pct,
+        atr_pct=atr_pct,
+        trend_score=trend_score,
+        close_position=close_position,
+        quote_volume_24h=quote_volume_24h,
+        trade_count_24h=trade_count_24h,
+        range_pct_24h=range_pct_24h,
+        price_change_pct_24h=price_change_pct_24h,
+        book_min_depth=book_min_depth,
+        open_interest_notional=open_interest_notional,
+        open_candle=open_candle,
+    )
+
+
+def _volume_ratio(
+    latest: Candle,
+    volume_window: list[Candle],
+    interval_ms: int,
+    now_ms: int,
+) -> tuple[float, bool]:
+    average_volume = sum(_volume(candle) for candle in volume_window) / max(len(volume_window), 1)
+    if average_volume <= 0:
+        return 0.0, latest.close_time > now_ms
+
+    latest_volume = _volume(latest)
+    open_candle = latest.close_time > now_ms
+    if open_candle:
+        elapsed = max(now_ms - latest.open_time, 1)
+        elapsed_fraction = min(max(elapsed / max(interval_ms, 1), 0.08), 1.0)
+        latest_volume = latest_volume / elapsed_fraction
+
+    return latest_volume / average_volume, open_candle
+
+
+def _long_trigger_was_rejected(candles: list[Candle], settings: BreakoutSettings, trigger_buffer_pct: float) -> bool:
+    if settings.trigger_reject_lookback <= 0:
+        return False
+    end = len(candles) - 1
+    start = max(settings.resistance_lookback, end - settings.trigger_reject_lookback)
+    for index in range(start, end):
+        prior_window = candles[index - settings.resistance_lookback : index]
+        if not prior_window:
+            continue
+        resistance = max(candle.high for candle in prior_window)
+        trigger = resistance * (1 + trigger_buffer_pct)
+        candle = candles[index]
+        if candle.high >= trigger and candle.close < resistance:
+            return True
+    return False
+
+
+def _short_trigger_was_rejected(candles: list[Candle], settings: BreakoutSettings, trigger_buffer_pct: float) -> bool:
+    if settings.trigger_reject_lookback <= 0:
+        return False
+    end = len(candles) - 1
+    start = max(settings.squeeze_lookback, end - settings.trigger_reject_lookback)
+    for index in range(start, end):
+        prior_window = candles[index - settings.squeeze_lookback : index]
+        if not prior_window:
+            continue
+        support = min(candle.low for candle in prior_window)
+        trigger = support * (1 - trigger_buffer_pct)
+        candle = candles[index]
+        if candle.low <= trigger and candle.close > support:
+            return True
+    return False
+
+
+def _volume(candle: Candle) -> float:
+    return candle.quote_volume if candle.quote_volume > 0 else candle.volume
+
+
+def _average_quote_volume(candles: list[Candle]) -> float:
+    if not candles:
+        return 0.0
+    return sum(_volume(candle) for candle in candles) / len(candles)
+
+
+def _range_pct(candles: list[Candle], price: float) -> float:
+    high = max(candle.high for candle in candles)
+    low = min(candle.low for candle in candles)
+    return (high - low) / max(price, EPSILON)
+
+
+def _close_position(candle: Candle) -> float:
+    width = candle.high - candle.low
+    if width <= 0:
+        return 0.5
+    return (candle.close - candle.low) / width
+
+
+def _atr_pct(candles: list[Candle], price: float) -> float:
+    if len(candles) < 2:
+        return 0.0
+    true_ranges: list[float] = []
+    for previous, current in zip(candles, candles[1:]):
+        true_ranges.append(
+            max(
+                current.high - current.low,
+                abs(current.high - previous.close),
+                abs(current.low - previous.close),
+            )
+        )
+    return (sum(true_ranges) / len(true_ranges)) / max(price, EPSILON)
+
+
+def _trend_score(candles: list[Candle]) -> float:
+    closes = [candle.close for candle in candles]
+    ema20 = _ema(closes[-60:], 20)
+    ema50 = _ema(closes[-80:], 50)
+    if math.isnan(ema20) or math.isnan(ema50):
+        return 0.5
+
+    latest_close = closes[-1]
+    score = 0.2
+    if latest_close > ema20:
+        score += 0.35
+    if ema20 >= ema50:
+        score += 0.3
+    if latest_close >= max(closes[-8:]):
+        score += 0.15
+    return min(score, 1.0)
+
+
+def _ema(values: list[float], period: int) -> float:
+    if len(values) < period:
+        return float("nan")
+    alpha = 2.0 / (period + 1)
+    ema = sum(values[:period]) / period
+    for value in values[period:]:
+        ema = value * alpha + ema * (1 - alpha)
+    return ema
+
+
+def _score(
+    distance_to_trigger_pct: float,
+    reward_risk: float,
+    volume_ratio: float,
+    compression_pct: float,
+    close_position: float,
+    trend_score: float,
+    settings: BreakoutSettings,
+) -> float:
+    distance_score = 1.0 - distance_to_trigger_pct / max(settings.watch_distance_pct, EPSILON)
+    distance_score = _clamp(distance_score, 0.0, 1.0)
+    volume_score = _clamp(volume_ratio / 2.5, 0.0, 1.0)
+    compression_score = 1.0 - compression_pct / max(settings.max_compression_pct, EPSILON)
+    compression_score = _clamp(compression_score, 0.0, 1.0)
+    reward_score = _clamp(reward_risk / 2.0, 0.0, 1.0)
+
+    score = (
+        distance_score * 0.25
+        + volume_score * 0.2
+        + compression_score * 0.18
+        + close_position * 0.15
+        + trend_score * 0.12
+        + reward_score * 0.1
+    )
+    return round(score * 100, 1)
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return min(max(value, low), high)
+
+
+def _candidate_priority(status: str) -> int:
+    return {
+        "SPRING": 3,
+        "UPTHRUST": 3,
+        "PRE_BREAKOUT": 2,
+        "PRE_BREAKDOWN": 2,
+        "BREAKOUT": 1,
+        "BREAKDOWN": 1,
+    }.get(status, 0)
+
+
+def _status(is_pre_breakout: bool, is_shakeout: bool, is_confirmed_breakout: bool, is_fakeout: bool) -> str:
+    if is_shakeout:
+        return "SHAKEOUT"
+    if is_pre_breakout:
+        return "PRE_BREAKOUT"
+    if is_confirmed_breakout:
+        return "BREAKOUT"
+    if is_fakeout:
+        return "FAKEOUT"
+    return "NONE"
+
+
+def _move_pct(status: str, breakout_pct: float, reclaim_pct: float, resistance_sweep_pct: float) -> float:
+    if status == "SHAKEOUT":
+        return reclaim_pct
+    if status == "FAKEOUT":
+        return resistance_sweep_pct
+    return breakout_pct
+
+
+def _stop_price(status: str, support: float, latest_low: float, settings: BreakoutSettings) -> float:
+    base = latest_low if status == "SHAKEOUT" else support
+    return base * (1 - settings.stop_buffer_pct)
