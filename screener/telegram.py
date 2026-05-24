@@ -33,6 +33,7 @@ class TelegramAPI:
         self.token = (token or "").strip()
         self.chat_id = str(chat_id or "").strip()
         self.timeout = timeout
+        self.last_error = ""
 
     @property
     def enabled(self) -> bool:
@@ -47,8 +48,16 @@ class TelegramAPI:
             req = urllib.request.Request(url, data=data, method="POST")
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
-                return payload if payload.get("ok") else None
-        except (urllib.error.URLError, json.JSONDecodeError, ValueError, OSError):
+                if payload.get("ok"):
+                    self.last_error = ""
+                    return payload
+                self.last_error = _telegram_error_description(payload)
+                return None
+        except urllib.error.HTTPError as exc:
+            self.last_error = _telegram_http_error(exc)
+            return None
+        except (urllib.error.URLError, json.JSONDecodeError, ValueError, OSError) as exc:
+            self.last_error = str(exc)
             return None
 
     def _get(self, method: str, params: dict[str, object], timeout: float | None = None) -> dict | None:
@@ -59,11 +68,25 @@ class TelegramAPI:
         try:
             with urllib.request.urlopen(url, timeout=timeout or self.timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
-                return payload if payload.get("ok") else None
-        except (urllib.error.URLError, json.JSONDecodeError, ValueError, OSError):
+                if payload.get("ok"):
+                    self.last_error = ""
+                    return payload
+                self.last_error = _telegram_error_description(payload)
+                return None
+        except urllib.error.HTTPError as exc:
+            self.last_error = _telegram_http_error(exc)
+            return None
+        except (urllib.error.URLError, json.JSONDecodeError, ValueError, OSError) as exc:
+            self.last_error = str(exc)
             return None
 
-    def send_message(self, text: str, silent: bool = False, parse_mode: str = "HTML") -> bool:
+    def send_message(
+        self,
+        text: str,
+        silent: bool = False,
+        parse_mode: str = "HTML",
+        reply_markup: dict | None = None,
+    ) -> bool:
         params: dict[str, object] = {
             "chat_id": self.chat_id,
             "text": text[:4090],  # Telegram limit is 4096; small buffer for safety
@@ -72,7 +95,17 @@ class TelegramAPI:
         }
         if parse_mode:
             params["parse_mode"] = parse_mode
+        if reply_markup:
+            params["reply_markup"] = json.dumps(reply_markup)
         return self._post("sendMessage", params) is not None
+
+    def delete_webhook(self, drop_pending_updates: bool = False) -> bool:
+        return self._post("deleteWebhook", {
+            "drop_pending_updates": "true" if drop_pending_updates else "false",
+        }) is not None
+
+    def set_my_commands(self, commands: list[dict[str, str]]) -> bool:
+        return self._post("setMyCommands", {"commands": json.dumps(commands)}) is not None
 
     def get_updates(self, offset: int, long_poll_timeout: int = 0) -> list[dict]:
         params = {
@@ -107,6 +140,7 @@ class TelegramBot:
         self._next_offset = 0
         self._last_poll = 0.0
         self._commands: dict[str, CommandHandler] = {}
+        self.reply_markup: dict | None = None
         # Shared mutable state (e.g. paused flag, session stats) - exposed to handlers.
         self.state: dict = {
             "paused": False,
@@ -125,16 +159,31 @@ class TelegramBot:
     def register(self, command: str, handler: CommandHandler) -> None:
         self._commands[command.lower()] = handler
 
-    # ---- outbound ----
-
-    def send(self, text: str, silent: bool = False) -> bool:
+    def prepare_for_polling(self) -> bool:
+        """Make long-polling usable even if a webhook was configured earlier."""
         if not self.enabled:
             return False
+        return self.api.delete_webhook(drop_pending_updates=False)
+
+    def set_commands(self, commands: list[dict[str, str]]) -> bool:
+        if not self.enabled:
+            return False
+        return self.api.set_my_commands(commands)
+
+    # ---- outbound ----
+
+    def send(self, text: str, silent: bool = False, reply_markup: dict | None = None) -> bool:
+        if not self.enabled:
+            return False
+        if reply_markup is None:
+            reply_markup = self.reply_markup
         # Trivial throttle so a burst of events doesn't trip Telegram's rate limit.
         gap = time.time() - self._last_send_ts
         if gap < self._min_send_interval:
             time.sleep(self._min_send_interval - gap)
-        sent = self.api.send_message(text, silent=silent)
+        sent = self.api.send_message(text, silent=silent, reply_markup=reply_markup)
+        if not sent and "parse" in self.api.last_error.lower():
+            sent = self.api.send_message(text, silent=silent, parse_mode="", reply_markup=reply_markup)
         self._last_send_ts = time.time()
         return sent
 
@@ -151,6 +200,8 @@ class TelegramBot:
         if not self.enabled:
             return 0
         updates = self.api.get_updates(self._next_offset, long_poll_timeout=long_poll_timeout)
+        if not updates and "webhook" in self.api.last_error.lower():
+            self.api.delete_webhook(drop_pending_updates=False)
         if not updates:
             return 0
         handled = 0
@@ -167,7 +218,10 @@ class TelegramBot:
             command = parts[0].split("@", 1)[0].lower()  # strip @BotName suffix
             handler = self._commands.get(command)
             if not handler:
-                self.send(f"Unknown command <code>{html.escape(command)}</code>. Try /help.")
+                self.send(format_warning(
+                    "Unknown command",
+                    f"{fmt_code(command)} is not registered. Send {fmt_code('/help')} for the command list.",
+                ))
                 continue
             try:
                 reply = handler(ctx, parts[1:])
@@ -209,6 +263,22 @@ class TelegramBot:
         }
 
 
+def _telegram_error_description(payload: dict) -> str:
+    description = payload.get("description")
+    if description:
+        return str(description)
+    return json.dumps(payload, sort_keys=True)
+
+
+def _telegram_http_error(exc: urllib.error.HTTPError) -> str:
+    try:
+        body = exc.read().decode("utf-8", errors="replace")
+        payload = json.loads(body)
+        return _telegram_error_description(payload)
+    except (json.JSONDecodeError, ValueError, OSError):
+        return f"HTTP {exc.code}: {exc.reason}"
+
+
 # -------- formatting helpers --------
 
 
@@ -222,20 +292,85 @@ def fmt_pct(value: float, decimals: int = 2) -> str:
     return f"{sign}{value:.{decimals}f}%"
 
 
+TELEGRAM_RULE = "\u2501" * 18
+TELEGRAM_BULLET = "\u2022"
+
+
+def fmt_code(value: object) -> str:
+    return f"<code>{html.escape(str(value))}</code>"
+
+
+def format_header(icon: str, title: str, subtitle: str = "") -> str:
+    lines = [f"{icon} <b>{html.escape(title)}</b>", TELEGRAM_RULE]
+    if subtitle:
+        lines.append(subtitle)
+    return "\n".join(lines)
+
+
+def format_kv(label: str, value: str) -> str:
+    return f"{TELEGRAM_BULLET} <b>{html.escape(label)}:</b> {value}"
+
+
+def format_success(title: str, body: str) -> str:
+    return "\n".join([
+        format_header("\U00002705", title),
+        body,
+    ])
+
+
+def format_warning(title: str, body: str) -> str:
+    return "\n".join([
+        format_header("\U000026A0\ufe0f", title),
+        body,
+    ])
+
+
+def format_empty(title: str, body: str) -> str:
+    return "\n".join([
+        format_header("\U0001f4ed", title),
+        body,
+    ])
+
+
+def command_keyboard() -> dict:
+    """Persistent safe-action keyboard shown under Telegram messages."""
+    return {
+        "keyboard": [
+            [{"text": "/status"}, {"text": "/positions"}],
+            [{"text": "/queue"}, {"text": "/stats"}, {"text": "/equity"}],
+            [{"text": "/pause"}, {"text": "/resume"}, {"text": "/help"}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+        "one_time_keyboard": False,
+    }
+
+
 def format_entry_filled(symbol: str, side: str, entry_price: float, quantity: float, sl: float, tp1: float | None = None) -> str:
     lines = [
-        f"\U0001f7e2 <b>ENTRY FILLED</b> {html.escape(symbol)} {side}",
-        f"  entry: <code>{entry_price:g}</code>",
-        f"  size:  <code>{quantity:g}</code>",
-        f"  SL:    <code>{sl:g}</code>",
+        format_header("\U0001f7e2", "Entry Filled"),
+        format_kv("Symbol", fmt_code(symbol)),
+        format_kv("Side", f"<b>{html.escape(side)}</b>"),
+        format_kv("Entry", fmt_code(f"{entry_price:g}")),
+        format_kv("Size", fmt_code(f"{quantity:g}")),
+        format_kv("Stop loss", fmt_code(f"{sl:g}")),
     ]
     if tp1 is not None and tp1 > 0:
-        lines.append(f"  TP1:   <code>{tp1:g}</code>")
+        lines.append(format_kv("TP1", fmt_code(f"{tp1:g}")))
     return "\n".join(lines)
 
 
 def format_position_closed(symbol: str, side: str, reason: str, exit_price: float, pnl_usdt: float, pnl_pct: float, hold_minutes: float) -> str:
     icon = "\U0001f7e2" if pnl_usdt > 0 else "\U0001f534"
+    return "\n".join([
+        format_header(icon, "Position Closed"),
+        format_kv("Symbol", fmt_code(symbol)),
+        format_kv("Side", f"<b>{html.escape(side)}</b>"),
+        format_kv("Reason", html.escape(reason)),
+        format_kv("Exit", fmt_code(f"{exit_price:g}")),
+        format_kv("PnL", f"<b>{fmt_money(pnl_usdt)} USDT</b> ({fmt_pct(pnl_pct)})"),
+        format_kv("Held", f"{hold_minutes:.0f} min"),
+    ])
     return "\n".join([
         f"{icon} <b>CLOSED</b> {html.escape(symbol)} {side} — {html.escape(reason)}",
         f"  exit:  <code>{exit_price:g}</code>",
@@ -245,4 +380,5 @@ def format_position_closed(symbol: str, side: str, reason: str, exit_price: floa
 
 
 def format_error(message: str) -> str:
+    return format_warning("Error", fmt_code(message[:1500]))
     return f"⚠️ <b>ERROR</b>\n<code>{html.escape(message[:1500])}</code>"

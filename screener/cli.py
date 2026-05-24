@@ -149,7 +149,18 @@ def main(argv: list[str] | None = None) -> int:
 def _register_telegram_commands(bot, args: argparse.Namespace, client: BinanceClient) -> None:
     """Wire up every /command the operator can send from Telegram."""
     import html as _html
-    from screener.telegram import CommandContext, fmt_money, fmt_pct
+    from screener.telegram import (
+        CommandContext,
+        command_keyboard,
+        fmt_code,
+        fmt_money,
+        fmt_pct,
+        format_empty,
+        format_header,
+        format_kv,
+        format_success,
+        format_warning,
+    )
 
     HELP_TEXT = (
         "<b>Auto-trader commands</b>\n"
@@ -160,11 +171,37 @@ def _register_telegram_commands(bot, args: argparse.Namespace, client: BinanceCl
         "/equity — current wallet balance + peak\n"
         "/pause — stop arming new entries (existing positions keep being managed)\n"
         "/resume — re-enable arming\n"
-        "/cancel <SYMBOL> — close one position or drop one pending entry\n"
+        "<code>/cancel SYMBOL</code> — close one position or drop one pending entry\n"
         "/cancel_all — close every open position and drop the queue (PANIC)\n"
         "/stop — exit the bot cleanly (systemd will restart if configured)\n"
         "/help — show this message"
     )
+
+    def _cmd_line(command: str, description: str) -> str:
+        return f"{fmt_code(command)}  {description}"
+
+    def _pretty_state(value: object) -> str:
+        return str(value or "?").replace("_", " ").title()
+
+    def _pretty_regime(value: object) -> str:
+        return str(value or "?").replace("_", " ").title()
+
+    HELP_TEXT = "\n".join([
+        format_header("\U0001f916", "Auto-trader Control", "Commands are handled by the live trading process."),
+        "<b>Market desk</b>",
+        _cmd_line("/status", "Equity, positions, queue, and mode"),
+        _cmd_line("/positions", "Open positions with mark price and PnL"),
+        _cmd_line("/queue", "Pending entries waiting on trigger/retest"),
+        _cmd_line("/stats", "Session trades, win rate, and PnL"),
+        _cmd_line("/equity", "Wallet balance, peak, and drawdown"),
+        "",
+        "<b>Trading controls</b>",
+        _cmd_line("/pause", "Stop arming new entries"),
+        _cmd_line("/resume", "Resume arming new entries"),
+        _cmd_line("/cancel SYMBOL", "Close one position or drop one pending entry"),
+        _cmd_line("/cancel_all", "Close every position and clear the queue"),
+        _cmd_line("/stop", "Exit after sending an acknowledgement"),
+    ])
 
     def _account():
         try:
@@ -178,6 +215,7 @@ def _register_telegram_commands(bot, args: argparse.Namespace, client: BinanceCl
     def cmd_status(ctx: CommandContext, parts: list[str]) -> str:
         acct = _account()
         if "_error" in acct:
+            return format_warning("Account Fetch Failed", fmt_code(acct["_error"]))
             return f"⚠️ account fetch failed: <code>{_html.escape(acct['_error'])}</code>"
         equity = _current_equity(acct)
         open_positions = [
@@ -191,6 +229,15 @@ def _register_telegram_commands(bot, args: argparse.Namespace, client: BinanceCl
         entry_placed = sum(1 for it in pending if str(it.get("state", "")) == "ENTRY_ORDER_PLACED")
         u_pnl = sum(_safe_float(p.get("unrealizedProfit")) for p in open_positions)
         paused = bot.state.get("paused", False)
+        mode = "\U000023f8\ufe0f Paused" if paused else "\U000025b6\ufe0f Live"
+        capacity = str(args.max_concurrent_orders or "unlimited")
+        return "\n".join([
+            format_header("\U0001f4ca", "Status", f"Mode: <b>{mode}</b>"),
+            format_kv("Equity", f"<b>{equity:.2f} USDT</b>"),
+            format_kv("Unrealized PnL", f"<b>{fmt_money(u_pnl)} USDT</b>"),
+            format_kv("Positions", f"{len(open_positions)} / {capacity}"),
+            format_kv("Queue", f"{wait_breakout} breakout watch | {wait_retest} retest | {entry_placed} placed | {monitoring} managed"),
+        ])
         return (
             f"<b>Status</b> {'⏸️ PAUSED' if paused else '▶️ live'}\n"
             f"  equity: <b>{equity:.2f} USDT</b>  (uPnL {fmt_money(u_pnl)})\n"
@@ -202,6 +249,7 @@ def _register_telegram_commands(bot, args: argparse.Namespace, client: BinanceCl
     def cmd_positions(ctx: CommandContext, parts: list[str]) -> str:
         acct = _account()
         if "_error" in acct:
+            return format_warning("Account Fetch Failed", fmt_code(acct["_error"]))
             return f"⚠️ {_html.escape(acct['_error'])}"
         open_pos = []
         for p in acct.get("positions", []):
@@ -217,49 +265,70 @@ def _register_telegram_commands(bot, args: argparse.Namespace, client: BinanceCl
                       ((entry - mark) / entry * 100.0) if entry > 0 else 0.0
             side = "LONG" if amt > 0 else "SHORT"
             open_pos.append(
-                f"  {p.get('symbol')} {side} qty={abs(amt):g} "
-                f"entry=<code>{entry:g}</code> mark=<code>{mark:g}</code> "
-                f"PnL=<b>{fmt_money(upnl)}</b> ({fmt_pct(pnl_pct)})"
+                "\n".join([
+                    f"{fmt_code(p.get('symbol', '?'))} <b>{side}</b>",
+                    format_kv("Qty", fmt_code(f"{abs(amt):g}")),
+                    format_kv("Entry", fmt_code(f"{entry:g}")),
+                    format_kv("Mark", fmt_code(f"{mark:g}")),
+                    format_kv("PnL", f"<b>{fmt_money(upnl)} USDT</b> ({fmt_pct(pnl_pct)})"),
+                ])
             )
         if not open_pos:
-            return "No open positions."
-        return "<b>Open positions</b>\n" + "\n".join(open_pos)
+            return format_empty("Open Positions", "No open positions right now.")
+        return format_header("\U0001f4cc", "Open Positions", f"{len(open_pos)} active") + "\n\n" + "\n\n".join(open_pos)
 
     def cmd_queue(ctx: CommandContext, parts: list[str]) -> str:
         pending = _load_pending_entry_plans(args.entry_state_file)
         if not pending:
-            return "Queue is empty."
-        lines = ["<b>Pending entries</b>"]
-        for it in pending:
+            return format_empty("Pending Queue", "No pending entries are being watched.")
+        visible = pending[:12]
+        lines = [format_header("\U0001f9fe", "Pending Queue", f"{len(pending)} tracked entries")]
+        for it in visible:
             state = it.get("state", "?")
             sym = it.get("symbol", "?")
             tf = it.get("interval", "?")
             regime = it.get("entry_regime", "?")
             mom = _safe_float(it.get("momentum_score"))
             trigger = it.get("trigger_price", "?")
-            lines.append(f"  <code>{_html.escape(str(sym))}</code> {tf} {state} {regime} mom={mom:.3f} trig={trigger}")
+            lines.append("\n".join([
+                f"\n{fmt_code(sym)} <b>{_html.escape(_pretty_state(state))}</b>",
+                format_kv("Timeframe", fmt_code(tf)),
+                format_kv("Regime", _html.escape(_pretty_regime(regime))),
+                format_kv("Momentum", f"{mom:.3f}"),
+                format_kv("Trigger", fmt_code(trigger)),
+            ]))
+        if len(pending) > len(visible):
+            lines.append(f"\n... {len(pending) - len(visible)} more entries hidden")
         return "\n".join(lines)
 
     def cmd_stats(ctx: CommandContext, parts: list[str]) -> str:
         s = bot.session_stats()
         if s["n"] == 0:
-            return f"No trades closed this session yet ({s['session_hours']:.1f}h running)."
-        return (
-            "<b>Session statistics</b>\n"
-            f"  session: {s['session_hours']:.1f}h\n"
-            f"  trades:  {s['n']}  ({s['wins']}W / {s['losses']}L)\n"
-            f"  win rate: {s['win_rate']:.1f}%\n"
-            f"  total PnL: <b>{fmt_money(s['total_pnl'])} USDT</b>\n"
-            f"  avg win: {fmt_money(s['avg_win'])}  |  avg loss: {fmt_money(s['avg_loss'])}"
-        )
+            return format_empty("Session Statistics", f"No trades closed yet. Runtime: {s['session_hours']:.1f}h.")
+        icon = "\U0001f7e2" if s["total_pnl"] > 0 else "\U0001f534" if s["total_pnl"] < 0 else "\U0001f4c8"
+        return "\n".join([
+            format_header(icon, "Session Statistics", f"{s['session_hours']:.1f}h running"),
+            format_kv("Trades", f"{s['n']} ({s['wins']}W / {s['losses']}L)"),
+            format_kv("Win rate", f"<b>{s['win_rate']:.1f}%</b>"),
+            format_kv("Total PnL", f"<b>{fmt_money(s['total_pnl'])} USDT</b>"),
+            format_kv("Average win", fmt_money(s["avg_win"])),
+            format_kv("Average loss", fmt_money(s["avg_loss"])),
+        ])
 
     def cmd_equity(ctx: CommandContext, parts: list[str]) -> str:
         acct = _account()
         if "_error" in acct:
+            return format_warning("Account Fetch Failed", fmt_code(acct["_error"]))
             return f"⚠️ {_html.escape(acct['_error'])}"
         equity = _current_equity(acct)
         peak = _load_equity_peak(Path(args.equity_peak_file))
         dd = ((peak - equity) / peak * 100.0) if peak > 0 else 0.0
+        return "\n".join([
+            format_header("\U0001f4b0", "Equity"),
+            format_kv("Current", f"<b>{equity:.2f} USDT</b>"),
+            format_kv("Peak", f"{peak:.2f} USDT"),
+            format_kv("Drawdown", f"{dd:.2f}%"),
+        ])
         return (
             f"<b>Equity</b>\n"
             f"  current: <b>{equity:.2f} USDT</b>\n"
@@ -269,24 +338,30 @@ def _register_telegram_commands(bot, args: argparse.Namespace, client: BinanceCl
 
     def cmd_pause(ctx: CommandContext, parts: list[str]) -> str:
         if bot.state.get("paused"):
-            return "Already paused. Use /resume to re-enable arming."
+            return format_empty("Already Paused", f"Send {fmt_code('/resume')} when you want to arm new entries again.")
         bot.state["paused"] = True
+        return format_success(
+            "Trading Paused",
+            "New entries will not be armed. Existing positions keep SL, TP, stagnation, and trailing management active.",
+        )
         return "⏸️ <b>Paused.</b> Existing positions keep being managed (SL/TP/stagnation/trail all active). New entries will NOT be armed. Use /resume to re-enable."
 
     def cmd_resume(ctx: CommandContext, parts: list[str]) -> str:
         if not bot.state.get("paused"):
-            return "Already running."
+            return format_empty("Already Live", "New entries are already enabled.")
         bot.state["paused"] = False
+        return format_success("Trading Resumed", "New entries can be armed again on the next scan.")
         return "▶️ <b>Resumed.</b> Arming new entries again on the next scan."
 
     def cmd_cancel(ctx: CommandContext, parts: list[str]) -> str:
         if not parts:
-            return "Usage: <code>/cancel SYMBOL</code> (e.g. <code>/cancel BTCUSDT</code>)"
+            return format_warning("Symbol Required", f"Usage: {fmt_code('/cancel BTCUSDT')}")
         target = parts[0].upper()
         if not target.endswith("USDT") and not target.endswith("USDC"):
             target = target + "USDT"
         acct = _account()
         if "_error" in acct:
+            return format_warning("Account Fetch Failed", fmt_code(acct["_error"]))
             return f"⚠️ {_html.escape(acct['_error'])}"
         # Try closing an open position first.
         for p in acct.get("positions", []):
@@ -301,6 +376,7 @@ def _register_telegram_commands(bot, args: argparse.Namespace, client: BinanceCl
                         "quantity": str(abs(amt)), "reduceOnly": "true",
                     }, test=False, recv_window=args.recv_window)
                 except BinanceClientError as exc:
+                    return format_warning("Close Failed", fmt_code(str(exc)))
                     return f"⚠️ close failed: <code>{_html.escape(str(exc))}</code>"
                 # Cancel leftover orders for the symbol.
                 try:
@@ -311,12 +387,19 @@ def _register_telegram_commands(bot, args: argparse.Namespace, client: BinanceCl
                 pending = _load_pending_entry_plans(args.entry_state_file)
                 kept = [it for it in pending if it.get("symbol") != target]
                 _write_pending_entry_plans(args.entry_state_file, kept)
-                return f"\U0001f534 Closed {target} ({amt:g}) and cancelled leftover orders."
+                return format_success(
+                    "Position Closed",
+                    "\n".join([
+                        format_kv("Symbol", fmt_code(target)),
+                        format_kv("Quantity", fmt_code(f"{abs(amt):g}")),
+                        "Leftover open orders were cancelled.",
+                    ]),
+                )
         # No open position - check pending file.
         pending = _load_pending_entry_plans(args.entry_state_file)
         match = next((it for it in pending if it.get("symbol") == target), None)
         if not match:
-            return f"No open position or pending entry for {target}."
+            return format_empty("Nothing To Cancel", f"No open position or pending entry for {fmt_code(target)}.")
         # If it has an ENTRY_ORDER_PLACED, cancel the order on Binance too.
         if str(match.get("state", "")) == "ENTRY_ORDER_PLACED":
             cid = str(match.get("entry_client_order_id", ""))
@@ -329,11 +412,12 @@ def _register_telegram_commands(bot, args: argparse.Namespace, client: BinanceCl
                     pass
         kept = [it for it in pending if it.get("symbol") != target]
         _write_pending_entry_plans(args.entry_state_file, kept)
-        return f"Dropped pending {target} from the queue."
+        return format_success("Pending Entry Dropped", f"{fmt_code(target)} was removed from the queue.")
 
     def cmd_cancel_all(ctx: CommandContext, parts: list[str]) -> str:
         acct = _account()
         if "_error" in acct:
+            return format_warning("Account Fetch Failed", fmt_code(acct["_error"]))
             return f"⚠️ {_html.escape(acct['_error'])}"
         closed: list[str] = []
         for p in acct.get("positions", []):
@@ -359,11 +443,18 @@ def _register_telegram_commands(bot, args: argparse.Namespace, client: BinanceCl
         # Wipe the pending queue.
         _write_pending_entry_plans(args.entry_state_file, [])
         if closed:
-            return f"\U0001f534 <b>PANIC CLOSE</b>\nClosed: {', '.join(closed)}\nQueue cleared."
-        return "No open positions. Queue cleared."
+            closed_list = ", ".join(closed)
+            return format_warning(
+                "Panic Close Complete",
+                "\n".join([
+                    format_kv("Closed", _html.escape(closed_list)),
+                    "Pending queue cleared.",
+                ]),
+            )
+        return format_success("Queue Cleared", "No open positions were found. Pending queue cleared.")
 
     def cmd_stop(ctx: CommandContext, parts: list[str]) -> str:
-        bot.send("\U0001f6d1 <b>Stopping</b> — bot will exit after this acknowledgement. systemd may restart it.")
+        bot.send(format_warning("Stopping", "The bot will exit after this acknowledgement. systemd may restart it."))
         # Defer the exit so the message has time to flush.
         bot.state["_stop_requested"] = True
         return ""
@@ -386,7 +477,7 @@ def _init_telegram_bot(args: argparse.Namespace, client: BinanceClient):
     from TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID env vars (loaded from .env).
     Returns the configured bot, or a disabled stub if no credentials.
     """
-    from screener.telegram import TelegramBot
+    from screener.telegram import TelegramBot, command_keyboard, format_header, format_kv
 
     token = (
         getattr(args, "telegram_bot_token", "")
@@ -401,13 +492,35 @@ def _init_telegram_bot(args: argparse.Namespace, client: BinanceClient):
     bot = TelegramBot(token, chat_id)
     if not bot.enabled:
         return bot
+    bot.reply_markup = command_keyboard()
+    if not bot.prepare_for_polling():
+        print(
+            f"Telegram command polling may be unavailable: {bot.api.last_error or 'deleteWebhook failed'}",
+            file=sys.stderr,
+        )
+    bot.set_commands([
+        {"command": "status", "description": "Equity, positions, queue, and mode"},
+        {"command": "positions", "description": "Open positions with PnL"},
+        {"command": "queue", "description": "Pending entry queue"},
+        {"command": "stats", "description": "Session trades, win rate, and PnL"},
+        {"command": "equity", "description": "Wallet balance, peak, and drawdown"},
+        {"command": "pause", "description": "Stop arming new entries"},
+        {"command": "resume", "description": "Resume arming new entries"},
+        {"command": "cancel", "description": "Close one symbol or drop a pending entry"},
+        {"command": "cancel_all", "description": "Close all positions and clear queue"},
+        {"command": "stop", "description": "Exit the bot cleanly"},
+        {"command": "help", "description": "Show command list"},
+    ])
     _register_telegram_commands(bot, args, client)
     bot.send(
-        "\U0001f916 <b>Auto-trader started</b>\n"
-        f"max concurrent: {args.max_concurrent_orders or 'unlimited'}\n"
-        f"sizing: {args.sizing_mode}\n"
-        f"scan every: {args.scan_interval_minutes} min\n\n"
-        "Type /help for commands.",
+        "\n".join([
+            format_header("\U0001f916", "Auto-trader Started", "Telegram controls are online."),
+            format_kv("Max positions", str(args.max_concurrent_orders or "unlimited")),
+            format_kv("Sizing", str(args.sizing_mode)),
+            format_kv("Scan interval", f"{args.scan_interval_minutes} min"),
+            "",
+            f"Use the keyboard below or send <code>/help</code>.",
+        ]),
         silent=True,
     )
     return bot
