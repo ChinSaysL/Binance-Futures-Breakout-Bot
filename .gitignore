@@ -28,6 +28,10 @@ trades_*.csv
 _ablation_*.txt
 _stag_*.txt
 _sweep_*.ps1
+_bt_*.txt
+_bt_*.csv
+codex_*.txt
+codex_*.csv
 mtf_variants_results.txt
 
 # --- One-off triage scripts (named with leading underscore) ---

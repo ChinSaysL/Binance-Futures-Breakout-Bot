@@ -99,19 +99,25 @@ python -u .\breakout_detector.py `
   --manage-exits `
   --sizing-mode auto --leverage 10 `
   --max-concurrent-orders 2 `
+  --skip-entry-regimes TRAILING_RETEST `
   --trailing-stop `
-  --dynamic-sl --sl-update-interval-seconds 300 --sl-lookback 20 `
   --breakeven-trigger-r 1.5 --breakeven-offset-pct 0.1 `
   --stagnation-after-r 0.5 --stagnation-candles 12 `
   --max-sl-loss-pct 35 `
+  --rotation-auto-cut-loss `
+  --equity-peak-reset-pct 15 `
   --scan-interval-minutes 3
 ```
 
+**Why these exact flags** — they mirror the validated backtest defaults that produced the +19831% W3 result. The backtester skips `TRAILING_RETEST` by default and runs without `--dynamic-sl`, so the live command must too. Removing `--dynamic-sl` keeps the stop wherever it was originally placed (still tightly bound by `--max-sl-loss-pct`).
+
 **What's deliberately NOT in the recommended config:**
 
+- ❌ `--dynamic-sl` — backtest defaults have it OFF. Including it diverges from the validated +19831% result.
 - ❌ `--exhaustion-exit` — the hardcoded 4-candle stall cuts breakout consolidations short; tested net-negative on 4 windows.
 - ❌ `--reserve-last-slot-s-tier` (backtest flag) — at `N=2` it costs ~95% of return by gating too aggressively.
 - ❌ `--smart-tp` — not re-validated since recent exit-side changes; defaults stand.
+- ❌ `--dynamic-leverage` — sweep-validated as 9x worse than flat 10x; left available as a conservative-mode opt-in only.
 
 ---
 
