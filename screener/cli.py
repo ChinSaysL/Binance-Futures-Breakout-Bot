@@ -209,6 +209,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--retest-timeout-seconds", type=float, default=300.0, help="For SMART_RETEST, seconds to wait for retest before entering at market.")
     parser.add_argument("--max-market-deviation-pct", type=float, default=1.5, help="For SMART_RETEST market fallback: skip entry if price has moved more than this percent beyond the trigger. Default 1.5.")
     parser.add_argument("--no-market-fallback", action="store_true", help="For SMART_RETEST, never place a market order after timeout. Keep watching for the retest limit entry indefinitely.")
+    parser.add_argument("--entry-stale-minutes", type=float, default=30.0, help="Cancel a LIMIT entry order that has been waiting to fill for this many minutes and drop the item from pending. Prevents a never-filling order from blocking a concurrency slot. 0 = off.")
     parser.add_argument("--adaptive-entry", action="store_true", help="Pick the entry execution mode per coin from its market regime: abnormal volume -> instant market entry, strong trend -> trailing retest, choppy -> retest, illiquid/meme -> strict retest. Also ranks candidates by momentum.")
     parser.add_argument("--skip-entry-regimes", default="", help="Comma-separated adaptive entry regimes to skip live, e.g. TRAILING_RETEST. Default: include all.")
     parser.add_argument("--ml-rank-model", type=Path, help="Live-compatible JSON model artifact used to rank qualifying signals. Ranking only; it does not hard-filter trades.")
@@ -1171,6 +1172,25 @@ def _scan_and_arm(client: BinanceClient, args: argparse.Namespace, settings: Bre
     pending_symbols = {str(item.get("symbol", "")) for item in pending}
     fresh = [s for s in signals if s.symbol not in pending_symbols]
 
+    # Clear stale ENTRY_ORDER_PLACED items whose LIMIT entry has been waiting
+    # too long. A never-filling order blocks a concurrency slot indefinitely;
+    # when a higher-scoring fresh signal exists, swap to it.
+    cleared_stale: list[dict[str, object]] = []
+    for item in pending:
+        if str(item.get("state", "")) != "ENTRY_ORDER_PLACED":
+            continue
+        stale_failures: list[str] = []
+        if _maybe_clear_stale_entry_order(client, item, args, fresh, account, stale_failures):
+            cleared_stale.append(item)
+        for failure in stale_failures:
+            print(f"- {failure}")
+    if cleared_stale:
+        stale_ids = {str(it.get("entry_client_order_id", "")) for it in cleared_stale}
+        pending = [it for it in pending if str(it.get("entry_client_order_id", "")) not in stale_ids]
+        _write_pending_entry_plans(args.entry_state_file, pending)
+        pending_symbols = {str(item.get("symbol", "")) for item in pending}
+        fresh = [s for s in signals if s.symbol not in pending_symbols]
+
     # Position rotation: when every concurrency slot is taken and an exploding coin is
     # waiting, close a weaker open position to make room for it.
     cap = args.max_concurrent_orders
@@ -1778,6 +1798,94 @@ def _sweep_dust_position(
     return True
 
 
+def _cancel_entry_order(
+    client: BinanceClient,
+    item: dict[str, object],
+    args: argparse.Namespace,
+) -> bool:
+    """Cancel the live entry order for an ENTRY_ORDER_PLACED item. Returns True on
+    success (or if the order was already gone). The caller is responsible for
+    dropping the item from the pending file."""
+    symbol = str(item.get("symbol", ""))
+    client_order_id = str(item.get("entry_client_order_id", ""))
+    if not symbol or not client_order_id:
+        return False
+    try:
+        client._signed_request(
+            "DELETE",
+            "/order",
+            {"symbol": symbol, "origClientOrderId": client_order_id, "recvWindow": args.recv_window},
+        )
+        return True
+    except BinanceClientError as exc:
+        msg = str(exc)
+        # "Unknown order" or "Order does not exist" means Binance already removed
+        # it (filled, expired, or cancelled by the user). Treat as success.
+        if "Unknown order" in msg or "Order does not exist" in msg or "-2011" in msg:
+            return True
+        return False
+
+
+def _maybe_clear_stale_entry_order(
+    client: BinanceClient,
+    item: dict[str, object],
+    args: argparse.Namespace,
+    fresh: list[object],
+    account: dict[str, object],
+    failures: list[str],
+) -> bool:
+    """Drop an ENTRY_ORDER_PLACED item when its LIMIT entry has been waiting too
+    long. Two trigger conditions, OR'd:
+      1. age > entry_stale_minutes AND a higher-scoring fresh signal is waiting
+         for a slot (priority swap to the best opportunity).
+      2. age > 2 * entry_stale_minutes (hard timeout, even with no replacement).
+    Returns True when the stale order was cancelled and the item should be
+    dropped from pending."""
+    threshold_min = _safe_float(args.entry_stale_minutes)
+    if threshold_min <= 0:
+        return False
+    submitted_at = _safe_float(item.get("entry_submitted_at"))
+    if submitted_at <= 0:
+        return False
+    age_seconds = time.time() - submitted_at
+    threshold_seconds = threshold_min * 60.0
+    if age_seconds < threshold_seconds:
+        return False
+
+    symbol = str(item.get("symbol", ""))
+    side = str(item.get("side", ""))
+    hedge_mode = bool(item.get("hedge_mode", False))
+
+    # Defensive: if a position actually exists now, the manager should promote it
+    # to MONITORING, not cancel it. Skip the stale check.
+    if _has_open_position(account, symbol=symbol, side=side, hedge_mode=hedge_mode):
+        return False
+
+    own_score = _safe_float(item.get("momentum_score"))
+    has_better_fresh = any(
+        _momentum_score(s) > own_score
+        for s in fresh
+        if str(getattr(s, "symbol", "")) != symbol
+    )
+    hard_timeout = age_seconds >= 2 * threshold_seconds
+    if not (has_better_fresh or hard_timeout):
+        return False
+
+    age_min = age_seconds / 60.0
+    if _cancel_entry_order(client, item, args):
+        reason = "hard timeout" if hard_timeout else f"swapped for higher-scoring fresh signal"
+        print(
+            f"{symbol}@{item.get('interval', '')}: stale entry order cancelled "
+            f"after {age_min:.1f} min ({reason}); slot freed."
+        )
+        return True
+    failures.append(
+        f"{symbol}@{item.get('interval', '')}: stale entry cancel failed at {age_min:.1f} min, "
+        f"will retry next scan."
+    )
+    return False
+
+
 def _cancel_exit_algos_for_closed_entry(
     client: BinanceClient,
     item: dict[str, object],
@@ -2217,6 +2325,7 @@ def _save_pending_entry_plan(
             "trigger_price": entry_plan.trigger_price,
             "limit_price": entry_plan.limit_price,
             "retest_timeout_seconds": args.retest_timeout_seconds,
+            "entry_stale_minutes": args.entry_stale_minutes,
             "entry_client_order_id": entry_plan.client_order_id,
             "leverage": leverage or args.leverage,
             "margin_type": args.margin_type or "",
