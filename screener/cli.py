@@ -142,7 +142,275 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    args._telegram_bot = _init_telegram_bot(args, client)
     return run_auto_trader(client, args, settings)
+
+
+def _register_telegram_commands(bot, args: argparse.Namespace, client: BinanceClient) -> None:
+    """Wire up every /command the operator can send from Telegram."""
+    import html as _html
+    from screener.telegram import CommandContext, fmt_money, fmt_pct
+
+    HELP_TEXT = (
+        "<b>Auto-trader commands</b>\n"
+        "/status — overview (equity, open positions, queue size)\n"
+        "/positions — detailed open positions with PnL\n"
+        "/queue — pending entries waiting on trigger/retest\n"
+        "/stats — session statistics (trades, win rate, PnL)\n"
+        "/equity — current wallet balance + peak\n"
+        "/pause — stop arming new entries (existing positions keep being managed)\n"
+        "/resume — re-enable arming\n"
+        "/cancel <SYMBOL> — close one position or drop one pending entry\n"
+        "/cancel_all — close every open position and drop the queue (PANIC)\n"
+        "/stop — exit the bot cleanly (systemd will restart if configured)\n"
+        "/help — show this message"
+    )
+
+    def _account():
+        try:
+            return client.account_info(recv_window=args.recv_window)
+        except BinanceClientError as exc:
+            return {"_error": str(exc)}
+
+    def cmd_help(ctx: CommandContext, parts: list[str]) -> str:
+        return HELP_TEXT
+
+    def cmd_status(ctx: CommandContext, parts: list[str]) -> str:
+        acct = _account()
+        if "_error" in acct:
+            return f"⚠️ account fetch failed: <code>{_html.escape(acct['_error'])}</code>"
+        equity = _current_equity(acct)
+        open_positions = [
+            p for p in acct.get("positions", [])
+            if isinstance(p, dict) and abs(_safe_float(p.get("positionAmt"))) > 0
+        ]
+        pending = _load_pending_entry_plans(args.entry_state_file)
+        monitoring = sum(1 for it in pending if str(it.get("state", "")) == "MONITORING")
+        wait_breakout = sum(1 for it in pending if str(it.get("state", "")) == "WAIT_BREAKOUT")
+        wait_retest = sum(1 for it in pending if str(it.get("state", "")) == "WAIT_RETEST")
+        entry_placed = sum(1 for it in pending if str(it.get("state", "")) == "ENTRY_ORDER_PLACED")
+        u_pnl = sum(_safe_float(p.get("unrealizedProfit")) for p in open_positions)
+        paused = bot.state.get("paused", False)
+        return (
+            f"<b>Status</b> {'⏸️ PAUSED' if paused else '▶️ live'}\n"
+            f"  equity: <b>{equity:.2f} USDT</b>  (uPnL {fmt_money(u_pnl)})\n"
+            f"  positions: {len(open_positions)} / {args.max_concurrent_orders or '∞'}\n"
+            f"  queue: {wait_breakout} watching breakout, {wait_retest} watching retest, "
+            f"{entry_placed} placed, {monitoring} in monitoring"
+        )
+
+    def cmd_positions(ctx: CommandContext, parts: list[str]) -> str:
+        acct = _account()
+        if "_error" in acct:
+            return f"⚠️ {_html.escape(acct['_error'])}"
+        open_pos = []
+        for p in acct.get("positions", []):
+            if not isinstance(p, dict):
+                continue
+            amt = _safe_float(p.get("positionAmt"))
+            if abs(amt) <= 0:
+                continue
+            entry = _safe_float(p.get("entryPrice"))
+            mark = _safe_float(p.get("markPrice"))
+            upnl = _safe_float(p.get("unrealizedProfit"))
+            pnl_pct = ((mark - entry) / entry * 100.0) if entry > 0 and amt > 0 else \
+                      ((entry - mark) / entry * 100.0) if entry > 0 else 0.0
+            side = "LONG" if amt > 0 else "SHORT"
+            open_pos.append(
+                f"  {p.get('symbol')} {side} qty={abs(amt):g} "
+                f"entry=<code>{entry:g}</code> mark=<code>{mark:g}</code> "
+                f"PnL=<b>{fmt_money(upnl)}</b> ({fmt_pct(pnl_pct)})"
+            )
+        if not open_pos:
+            return "No open positions."
+        return "<b>Open positions</b>\n" + "\n".join(open_pos)
+
+    def cmd_queue(ctx: CommandContext, parts: list[str]) -> str:
+        pending = _load_pending_entry_plans(args.entry_state_file)
+        if not pending:
+            return "Queue is empty."
+        lines = ["<b>Pending entries</b>"]
+        for it in pending:
+            state = it.get("state", "?")
+            sym = it.get("symbol", "?")
+            tf = it.get("interval", "?")
+            regime = it.get("entry_regime", "?")
+            mom = _safe_float(it.get("momentum_score"))
+            trigger = it.get("trigger_price", "?")
+            lines.append(f"  <code>{_html.escape(str(sym))}</code> {tf} {state} {regime} mom={mom:.3f} trig={trigger}")
+        return "\n".join(lines)
+
+    def cmd_stats(ctx: CommandContext, parts: list[str]) -> str:
+        s = bot.session_stats()
+        if s["n"] == 0:
+            return f"No trades closed this session yet ({s['session_hours']:.1f}h running)."
+        return (
+            "<b>Session statistics</b>\n"
+            f"  session: {s['session_hours']:.1f}h\n"
+            f"  trades:  {s['n']}  ({s['wins']}W / {s['losses']}L)\n"
+            f"  win rate: {s['win_rate']:.1f}%\n"
+            f"  total PnL: <b>{fmt_money(s['total_pnl'])} USDT</b>\n"
+            f"  avg win: {fmt_money(s['avg_win'])}  |  avg loss: {fmt_money(s['avg_loss'])}"
+        )
+
+    def cmd_equity(ctx: CommandContext, parts: list[str]) -> str:
+        acct = _account()
+        if "_error" in acct:
+            return f"⚠️ {_html.escape(acct['_error'])}"
+        equity = _current_equity(acct)
+        peak = _load_equity_peak(Path(args.equity_peak_file))
+        dd = ((peak - equity) / peak * 100.0) if peak > 0 else 0.0
+        return (
+            f"<b>Equity</b>\n"
+            f"  current: <b>{equity:.2f} USDT</b>\n"
+            f"  peak:    {peak:.2f} USDT\n"
+            f"  drawdown: {dd:.2f}%"
+        )
+
+    def cmd_pause(ctx: CommandContext, parts: list[str]) -> str:
+        if bot.state.get("paused"):
+            return "Already paused. Use /resume to re-enable arming."
+        bot.state["paused"] = True
+        return "⏸️ <b>Paused.</b> Existing positions keep being managed (SL/TP/stagnation/trail all active). New entries will NOT be armed. Use /resume to re-enable."
+
+    def cmd_resume(ctx: CommandContext, parts: list[str]) -> str:
+        if not bot.state.get("paused"):
+            return "Already running."
+        bot.state["paused"] = False
+        return "▶️ <b>Resumed.</b> Arming new entries again on the next scan."
+
+    def cmd_cancel(ctx: CommandContext, parts: list[str]) -> str:
+        if not parts:
+            return "Usage: <code>/cancel SYMBOL</code> (e.g. <code>/cancel BTCUSDT</code>)"
+        target = parts[0].upper()
+        if not target.endswith("USDT") and not target.endswith("USDC"):
+            target = target + "USDT"
+        acct = _account()
+        if "_error" in acct:
+            return f"⚠️ {_html.escape(acct['_error'])}"
+        # Try closing an open position first.
+        for p in acct.get("positions", []):
+            if not isinstance(p, dict) or p.get("symbol") != target:
+                continue
+            amt = _safe_float(p.get("positionAmt"))
+            if abs(amt) > 0:
+                side_to_send = "SELL" if amt > 0 else "BUY"
+                try:
+                    client.place_order({
+                        "symbol": target, "side": side_to_send, "type": "MARKET",
+                        "quantity": str(abs(amt)), "reduceOnly": "true",
+                    }, test=False, recv_window=args.recv_window)
+                except BinanceClientError as exc:
+                    return f"⚠️ close failed: <code>{_html.escape(str(exc))}</code>"
+                # Cancel leftover orders for the symbol.
+                try:
+                    client._signed_request("DELETE", "/allOpenOrders", {"symbol": target, "recvWindow": args.recv_window})
+                except BinanceClientError:
+                    pass
+                # Drop from pending if present.
+                pending = _load_pending_entry_plans(args.entry_state_file)
+                kept = [it for it in pending if it.get("symbol") != target]
+                _write_pending_entry_plans(args.entry_state_file, kept)
+                return f"\U0001f534 Closed {target} ({amt:g}) and cancelled leftover orders."
+        # No open position - check pending file.
+        pending = _load_pending_entry_plans(args.entry_state_file)
+        match = next((it for it in pending if it.get("symbol") == target), None)
+        if not match:
+            return f"No open position or pending entry for {target}."
+        # If it has an ENTRY_ORDER_PLACED, cancel the order on Binance too.
+        if str(match.get("state", "")) == "ENTRY_ORDER_PLACED":
+            cid = str(match.get("entry_client_order_id", ""))
+            if cid:
+                try:
+                    client._signed_request("DELETE", "/order", {
+                        "symbol": target, "origClientOrderId": cid, "recvWindow": args.recv_window,
+                    })
+                except BinanceClientError:
+                    pass
+        kept = [it for it in pending if it.get("symbol") != target]
+        _write_pending_entry_plans(args.entry_state_file, kept)
+        return f"Dropped pending {target} from the queue."
+
+    def cmd_cancel_all(ctx: CommandContext, parts: list[str]) -> str:
+        acct = _account()
+        if "_error" in acct:
+            return f"⚠️ {_html.escape(acct['_error'])}"
+        closed: list[str] = []
+        for p in acct.get("positions", []):
+            if not isinstance(p, dict):
+                continue
+            amt = _safe_float(p.get("positionAmt"))
+            if abs(amt) <= 0:
+                continue
+            sym = str(p.get("symbol", ""))
+            side_to_send = "SELL" if amt > 0 else "BUY"
+            try:
+                client.place_order({
+                    "symbol": sym, "side": side_to_send, "type": "MARKET",
+                    "quantity": str(abs(amt)), "reduceOnly": "true",
+                }, test=False, recv_window=args.recv_window)
+                closed.append(sym)
+            except BinanceClientError:
+                continue
+            try:
+                client._signed_request("DELETE", "/allOpenOrders", {"symbol": sym, "recvWindow": args.recv_window})
+            except BinanceClientError:
+                pass
+        # Wipe the pending queue.
+        _write_pending_entry_plans(args.entry_state_file, [])
+        if closed:
+            return f"\U0001f534 <b>PANIC CLOSE</b>\nClosed: {', '.join(closed)}\nQueue cleared."
+        return "No open positions. Queue cleared."
+
+    def cmd_stop(ctx: CommandContext, parts: list[str]) -> str:
+        bot.send("\U0001f6d1 <b>Stopping</b> — bot will exit after this acknowledgement. systemd may restart it.")
+        # Defer the exit so the message has time to flush.
+        bot.state["_stop_requested"] = True
+        return ""
+
+    for cmd, handler in [
+        ("/help", cmd_help), ("/start", cmd_help),
+        ("/status", cmd_status), ("/positions", cmd_positions),
+        ("/queue", cmd_queue), ("/stats", cmd_stats), ("/equity", cmd_equity),
+        ("/pause", cmd_pause), ("/resume", cmd_resume),
+        ("/cancel", cmd_cancel), ("/cancel_all", cmd_cancel_all), ("/cancelall", cmd_cancel_all),
+        ("/stop", cmd_stop),
+    ]:
+        bot.register(cmd, handler)
+
+
+def _init_telegram_bot(args: argparse.Namespace, client: BinanceClient):
+    """Wire up the optional Telegram notifier + command handler.
+
+    Looks up credentials from --telegram-bot-token/--telegram-chat-id, then
+    from TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID env vars (loaded from .env).
+    Returns the configured bot, or a disabled stub if no credentials.
+    """
+    from screener.telegram import TelegramBot
+
+    token = (
+        getattr(args, "telegram_bot_token", "")
+        or os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        or ""
+    ).strip()
+    chat_id = (
+        getattr(args, "telegram_chat_id", "")
+        or os.environ.get("TELEGRAM_CHAT_ID", "")
+        or ""
+    ).strip()
+    bot = TelegramBot(token, chat_id)
+    if not bot.enabled:
+        return bot
+    _register_telegram_commands(bot, args, client)
+    bot.send(
+        "\U0001f916 <b>Auto-trader started</b>\n"
+        f"max concurrent: {args.max_concurrent_orders or 'unlimited'}\n"
+        f"sizing: {args.sizing_mode}\n"
+        f"scan every: {args.scan_interval_minutes} min\n\n"
+        "Type /help for commands.",
+        silent=True,
+    )
+    return bot
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -212,6 +480,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--entry-stale-minutes", type=float, default=30.0, help="Drop unplaced triggered entries, or cancel LIMIT entries, after this many minutes. Prevents old queued signals and never-filling orders from blocking later opportunities. 0 = off.")
     parser.add_argument("--rotation-auto-cut-loss", action="store_true", help="Auto-approve cutting a losing position to make room for an exploder, instead of waiting on the interactive Windows popup. Required for headless / VPS deployments. Profitable rotations are always automatic regardless of this flag.")
     parser.add_argument("--equity-peak-reset-pct", type=float, default=15.0, help="Auto-reset .equity_peak.json when wallet equity changes by more than this percent in one scan tick (interpreted as a manual withdrawal or deposit, not a trade loss). Prevents drawdown-haircut sizing from triggering after you move money in or out. 0 = off (peak only resets on manual file deletion).")
+    parser.add_argument("--telegram-bot-token", default="", help="Telegram bot token from @BotFather. Empty = read from TELEGRAM_BOT_TOKEN env var; if neither is set the Telegram integration stays off.")
+    parser.add_argument("--telegram-chat-id", default="", help="Telegram chat id (your own user id, get from @userinfobot). Empty = read from TELEGRAM_CHAT_ID env var.")
     parser.add_argument("--adaptive-entry", action="store_true", help="Pick the entry execution mode per coin from its market regime: abnormal volume -> instant market entry, strong trend -> trailing retest, choppy -> retest, illiquid/meme -> strict retest. Also ranks candidates by momentum.")
     parser.add_argument("--skip-entry-regimes", default="", help="Comma-separated adaptive entry regimes to skip live, e.g. TRAILING_RETEST. Default: include all.")
     parser.add_argument("--ml-rank-model", type=Path, help="Live-compatible JSON model artifact used to rank qualifying signals. Ranking only; it does not hard-filter trades.")
@@ -1388,8 +1658,25 @@ def run_auto_trader(client: BinanceClient, args: argparse.Namespace, settings: B
             f"(+{args.stagnation_after_r:.2g}R then {args.stagnation_candles}c no new extreme)."
         )
     _print_monitored_coins(_load_pending_entry_plans(args.entry_state_file))
+    tg_bot = getattr(args, "_telegram_bot", None)
+    tg_ctx = None
+    if tg_bot is not None and tg_bot.enabled:
+        from screener.telegram import CommandContext
+        tg_ctx = CommandContext(args=args, client=client)
     while True:
-        if time.time() - last_scan >= scan_interval:
+        # Poll Telegram every tick so /stop /pause /cancel commands take effect
+        # within seconds, not at the next scan boundary.
+        if tg_bot and tg_bot.enabled and tg_ctx is not None:
+            try:
+                tg_bot.poll_commands(tg_ctx)
+            except Exception as exc:  # noqa: BLE001 - never crash the trader on a TG hiccup
+                print(f"Telegram poll failed: {exc}")
+            if tg_bot.state.get("_stop_requested"):
+                print("Telegram /stop received. Exiting.")
+                return 0
+
+        paused = bool(tg_bot and tg_bot.state.get("paused"))
+        if (not paused) and time.time() - last_scan >= scan_interval:
             try:
                 _scan_and_arm(client, args, settings)
             except BinanceClientError as exc:
@@ -1555,6 +1842,7 @@ def manage_pending_exits(client: BinanceClient, args: argparse.Namespace) -> int
                         item["sl_trigger_price"] = str(sl_entry.get("payload", {}).get("triggerPrice", "0"))
                     item["last_sl_update"] = 0.0
                     item["entry_filled_at"] = time.time()
+                    _notify_entry_filled(args, item, position)
                 item["live_entry_price"] = _safe_float(position.get("entryPrice"))
                 item["live_initial_stop"] = item.get("live_initial_stop") or _initial_stop_from_item(item)
                 # Dust sweep: when TP1 + trail floor-round independently they can
@@ -1585,6 +1873,7 @@ def manage_pending_exits(client: BinanceClient, args: argparse.Namespace) -> int
                 mark = mark_prices.get(symbol, 0.0)
                 if mark > 0:
                     _record_symbol_r_from_close(args, item, None, mark)
+                _notify_position_closed(args, client, item, mark)
                 cancelled = _cancel_exit_algos_for_closed_entry(client, item, args, failures)
                 closed_positions += 1
                 if cancelled:
@@ -1920,6 +2209,102 @@ def _sweep_dust_position(
         print(f"{symbol}: dust sweep closed residual position.")
     _remove_pending_entry(args, item)
     return True
+
+
+def _notify_entry_filled(args: argparse.Namespace, item: dict[str, object], position: dict[str, object]) -> None:
+    """Push a Telegram notification when an entry order fills and the bot
+    promotes the item from ENTRY_ORDER_PLACED to MONITORING."""
+    bot = getattr(args, "_telegram_bot", None)
+    if not bot or not bot.enabled:
+        return
+    try:
+        from screener.telegram import format_entry_filled
+        sl = _initial_stop_from_item(item)
+        tp1 = 0.0
+        for plan in item.get("exit_plans", []) or []:
+            if isinstance(plan, dict) and plan.get("role") == "TAKE_PROFIT_1":
+                tp1 = _safe_float(plan.get("payload", {}).get("triggerPrice"))
+                break
+        bot.send(format_entry_filled(
+            symbol=str(item.get("symbol", "")),
+            side=str(item.get("side", "")),
+            entry_price=_safe_float(position.get("entryPrice")),
+            quantity=abs(_safe_float(position.get("positionAmt"))),
+            sl=sl,
+            tp1=tp1 or None,
+        ))
+    except Exception as exc:  # noqa: BLE001 - never let a notification crash the trader
+        print(f"Telegram entry-fill notify failed: {exc}")
+
+
+def _notify_position_closed(args: argparse.Namespace, client: BinanceClient, item: dict[str, object], mark: float) -> None:
+    """Push a Telegram notification when the bot detects a position has
+    closed, with realized PnL (fetched from Binance user trades) and a
+    best-effort reason inferred from the exit price vs planned SL/TP/trail."""
+    bot = getattr(args, "_telegram_bot", None)
+    if not bot or not bot.enabled:
+        return
+    try:
+        from screener.telegram import format_position_closed
+        symbol = str(item.get("symbol", ""))
+        side = str(item.get("side", ""))
+        entry_filled_at = _safe_float(item.get("entry_filled_at"))
+        since_ms = int(entry_filled_at * 1000) if entry_filled_at > 0 else int((time.time() - 86400) * 1000)
+        realized_pnl = 0.0
+        exit_price = mark
+        exit_qty = 0.0
+        try:
+            trades = client._signed_get(
+                "/userTrades",
+                {"symbol": symbol, "startTime": since_ms, "recvWindow": args.recv_window},
+            )
+            if isinstance(trades, list):
+                for t in trades:
+                    realized_pnl += _safe_float(t.get("realizedPnl"))
+                # Use the most recent close-side fill as the exit price.
+                closing_side = "SELL" if side == "LONG" else "BUY"
+                closing_fills = [t for t in trades if str(t.get("side")) == closing_side]
+                if closing_fills:
+                    last = closing_fills[-1]
+                    exit_price = _safe_float(last.get("price")) or mark
+                    exit_qty = _safe_float(last.get("qty"))
+        except BinanceClientError:
+            pass  # fall back to mark+0 pnl
+
+        entry = _safe_float(item.get("live_entry_price")) or 0.0
+        if entry <= 0:
+            entry = _safe_float(item.get("trigger_price"))
+        if entry > 0 and exit_price > 0:
+            pnl_pct = ((exit_price - entry) / entry * 100.0) if side == "LONG" else ((entry - exit_price) / entry * 100.0)
+        else:
+            pnl_pct = 0.0
+        hold_minutes = (time.time() - entry_filled_at) / 60.0 if entry_filled_at > 0 else 0.0
+
+        # Best-effort reason: compare exit price to planned levels.
+        sl_trigger = _safe_float(item.get("sl_trigger_price")) or _initial_stop_from_item(item)
+        tp1 = 0.0
+        for plan in item.get("exit_plans", []) or []:
+            if isinstance(plan, dict) and plan.get("role") == "TAKE_PROFIT_1":
+                tp1 = _safe_float(plan.get("payload", {}).get("triggerPrice"))
+                break
+        reason = "Trail / other"
+        if sl_trigger > 0 and abs(exit_price - sl_trigger) / sl_trigger < 0.005:
+            reason = "Stop Loss"
+        elif tp1 > 0 and abs(exit_price - tp1) / tp1 < 0.01:
+            reason = "Take Profit 1"
+        elif realized_pnl > 0:
+            reason = "Trail (profit)"
+        elif realized_pnl < 0:
+            reason = "Trail (loss)"
+
+        bot.record_trade(symbol, reason, realized_pnl)
+        bot.send(format_position_closed(
+            symbol=symbol, side=side, reason=reason,
+            exit_price=exit_price, pnl_usdt=realized_pnl, pnl_pct=pnl_pct,
+            hold_minutes=hold_minutes,
+        ))
+    except Exception as exc:  # noqa: BLE001
+        print(f"Telegram close notify failed: {exc}")
 
 
 def _cancel_entry_order(

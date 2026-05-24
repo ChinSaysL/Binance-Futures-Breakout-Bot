@@ -60,6 +60,10 @@ BINANCE_API_SECRET=your-real-secret
 # Optional: Binance demo / testnet keys, used with --testnet
 BINANCE_TESTNET_API_KEY=your-testnet-key
 BINANCE_TESTNET_API_SECRET=your-testnet-secret
+
+# Optional: Telegram notifications + remote control (see "Telegram" section)
+TELEGRAM_BOT_TOKEN=your-bot-token
+TELEGRAM_CHAT_ID=your-chat-id
 ```
 
 `.env` is gitignored. Never commit it.
@@ -395,6 +399,51 @@ python .\breakout_detector.py --ml-rank-model my_model.json --ml-rank-score tail
 ```
 
 A trained example model is shipped: `model_live_context_tail_rank.json`.
+
+---
+
+## Telegram integration
+
+Optional but recommended for VPS deployments. The bot sends push notifications on every entry fill and position close, and accepts remote commands over a long-polled Telegram connection (no webhook / port forwarding required).
+
+### Setup
+
+1. **Create the bot** — message [@BotFather](https://t.me/BotFather) on Telegram, send `/newbot`, follow prompts. Copy the token it gives you.
+2. **Find your chat id** — message [@userinfobot](https://t.me/userinfobot) or any chat-id bot; copy the numeric id.
+3. **Add to `.env`**:
+
+   ```ini
+   TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
+   TELEGRAM_CHAT_ID=987654321
+   ```
+
+4. Restart the bot. You should receive a "🤖 Auto-trader started" message immediately.
+
+If either env var is missing the integration silently stays off — the bot runs normally without Telegram.
+
+### Notifications
+
+- 🟢 **Entry filled** — symbol, side, fill price, size, SL, TP1
+- 🟢 / 🔴 **Position closed** — symbol, side, inferred reason (Stop Loss / Take Profit 1 / Trail), exit price, realized PnL in USDT and %, hold time
+- ⚠️ **Errors** — for serious failures
+
+### Commands (send to your bot in Telegram)
+
+| Command | What it does |
+|---|---|
+| `/status` | Equity, open positions count, queue summary, paused state |
+| `/positions` | Detailed open positions with PnL |
+| `/queue` | Pending entries waiting on trigger/retest, sorted by state |
+| `/stats` | Session statistics (trades, win rate, total PnL since restart) |
+| `/equity` | Wallet balance + recorded peak + drawdown |
+| `/pause` | Stop arming new entries (existing positions keep being managed) |
+| `/resume` | Re-enable arming |
+| `/cancel BTCUSDT` | Close one position OR drop one pending entry |
+| `/cancel_all` | **PANIC**: close every open position, cancel every order, clear the queue |
+| `/stop` | Exit the bot cleanly (systemd will restart if configured) |
+| `/help` | Show command list |
+
+The bot only responds to messages from the configured `TELEGRAM_CHAT_ID` — others are ignored. All command/notification interactions are over Telegram's HTTPS API; no inbound ports need opening on the VPS.
 
 ---
 
