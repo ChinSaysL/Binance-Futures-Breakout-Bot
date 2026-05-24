@@ -212,6 +212,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--tp-count", type=int, default=1, help="Number of partial take-profits.")
     parser.add_argument("--trailing-stop", action="store_true", help="Model a trailing-stop runner.")
     parser.add_argument("--trailing-callback-pct", type=float, default=1.2, help="Trailing-stop callback percent.")
+    parser.add_argument("--trail-activation-r", type=float, default=0.0, help="Gate the trailing stop behind this R-multiple of unrealized profit. 0 = trail is live the moment the position fills (current behaviour). 0.5 = trail only starts tracking once the trade reaches +0.5R. Prevents wick-out losses on entry pullbacks at the cost of letting losing trades fall further before the trail catches them.")
     parser.add_argument("--runner-pct", type=float, default=50.0, help="Percent of position left for the trailing runner when --trailing-stop is used.")
     parser.add_argument("--smart-tp", action="store_true", help="Adapt the target, TP splits, and runner size from each signal's conviction.")
     parser.add_argument("--smart-tp-max-target-multiplier", type=float, default=1.0, help="Extra multiplier on the detector target for top-conviction signals. The detector target is already ATR-scaled, so keep this near 1.0; high values push the target out of reach and clog slots.")
@@ -1388,6 +1389,12 @@ def _simulate_exit(
     peak = entry
     trough = entry
     initial_risk = abs(entry - stop) if entry > 0 else 0.0
+    # Activation gate: the trail starts as "armed but inactive" when
+    # --trail-activation-r > 0. The price has to reach entry + activation_r*risk
+    # (or entry - activation_r*risk for shorts) before the trail starts tracking.
+    activation_r = getattr(args, "trail_activation_r", 0.0) or 0.0
+    activation_buffer = activation_r * initial_risk if activation_r > 0 else 0.0
+    runner_active = runner_open and activation_buffer <= 0
     # Track the bar where peak/trough last updated for the exhaustion-exit stall check.
     peak_idx = start_index
     trough_idx = start_index
@@ -1462,11 +1469,14 @@ def _simulate_exit(
                     realized += tp_fracs[k] * tp_prices[k]
                     remaining -= tp_fracs[k]
             if runner_open:
-                trail = peak * (1.0 - callback)
-                if candle.low <= trail and trail > stop:
-                    realized += runner_frac * trail
-                    remaining -= runner_frac
-                    runner_open = False
+                if not runner_active and candle.high >= entry + activation_buffer:
+                    runner_active = True
+                if runner_active:
+                    trail = peak * (1.0 - callback)
+                    if candle.low <= trail and trail > stop:
+                        realized += runner_frac * trail
+                        remaining -= runner_frac
+                        runner_open = False
         else:
             if candle.high >= stop:
                 realized += remaining * stop
@@ -1477,11 +1487,14 @@ def _simulate_exit(
                     realized += tp_fracs[k] * tp_prices[k]
                     remaining -= tp_fracs[k]
             if runner_open:
-                trail = trough * (1.0 + callback)
-                if candle.high >= trail and trail < stop:
-                    realized += runner_frac * trail
-                    remaining -= runner_frac
-                    runner_open = False
+                if not runner_active and candle.low <= entry - activation_buffer:
+                    runner_active = True
+                if runner_active:
+                    trail = trough * (1.0 + callback)
+                    if candle.high >= trail and trail < stop:
+                        realized += runner_frac * trail
+                        remaining -= runner_frac
+                        runner_open = False
         # Exhaustion exit: once the trade has reached +0.5R, close on a bearish
         # rejection candle near the peak (long upper wick + bearish close) or
         # after 4 candles with no new favourable extreme. Catches give-back
