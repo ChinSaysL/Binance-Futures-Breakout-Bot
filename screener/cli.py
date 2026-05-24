@@ -4364,3 +4364,7 @@ def _filter_summary(args: argparse.Namespace) -> dict[str, float | int | bool]:
         "min_candle_quote_volume": args.min_candle_quote_volume,
         "top": args.top,
     }
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
