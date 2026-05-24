@@ -1692,7 +1692,13 @@ def run_auto_trader(client: BinanceClient, args: argparse.Namespace, settings: B
             time.sleep(max(args.exit_poll_seconds, 1.0))
         else:
             idle_for = max(scan_interval - (time.time() - last_scan), 1.0)
-            time.sleep(min(idle_for, scan_interval))
+            # When Telegram is enabled, cap the idle sleep at 5s so commands
+            # are picked up within a few seconds instead of waiting up to the
+            # full scan interval (the bot only polls Telegram between loop
+            # iterations, and the sleep used to run for ~3 minutes with no
+            # pending trade work).
+            sleep_cap = 5.0 if (tg_bot and tg_bot.enabled) else scan_interval
+            time.sleep(min(idle_for, sleep_cap))
 
 
 # Status-line dedup state, persisted across the auto-trader's repeated manage passes.
