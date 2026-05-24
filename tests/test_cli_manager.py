@@ -74,25 +74,45 @@ class SmartRetestManagerTests(unittest.TestCase):
 class DynamicLeverageTests(unittest.TestCase):
     def test_safety_cap_reduces_leverage_on_dangerously_wide_stop(self):
         # 20% stop with base=10 would be a 200% margin loss = forced liquidation.
-        # Safety floor (75% of margin) caps leverage at floor(0.75 / 0.20) = 3.
-        self.assertEqual(_dynamic_leverage(atr_pct=0.01, risk_pct=0.20, base=10), 3)
+        # Safety floor (75% of margin) caps leverage at floor(0.75 / 0.20) = 3,
+        # regardless of conviction.
+        self.assertEqual(
+            _dynamic_leverage(atr_pct=0.01, risk_pct=0.20, base=10, conviction=1.5),
+            3,
+        )
 
-    def test_tight_stop_scales_leverage_up_from_base(self):
-        # 2% stop is half the reference 4%; risk-parity doubles leverage.
-        self.assertEqual(_dynamic_leverage(atr_pct=0.01, risk_pct=0.02, base=10), 20)
+    def test_normal_conviction_keeps_base_leverage(self):
+        # momentum_score around 0.5-1.0 = normal signal -> base leverage.
+        self.assertEqual(
+            _dynamic_leverage(atr_pct=0.03, risk_pct=0.04, base=10, conviction=0.7),
+            10,
+        )
 
-    def test_normal_stop_keeps_base_leverage(self):
-        # 4% stop = reference; no adjustment.
-        self.assertEqual(_dynamic_leverage(atr_pct=0.03, risk_pct=0.04, base=10), 10)
+    def test_weak_conviction_downscales_to_80pct(self):
+        self.assertEqual(
+            _dynamic_leverage(atr_pct=0.03, risk_pct=0.04, base=10, conviction=0.3),
+            8,
+        )
 
-    def test_wide_but_safe_stop_does_not_downscale(self):
-        # Previous behaviour would have downscaled to 7x on 6% ATR. New
-        # behaviour keeps base because the stop is still within safety bounds.
-        self.assertEqual(_dynamic_leverage(atr_pct=0.06, risk_pct=0.05, base=10), 10)
+    def test_strong_conviction_scales_to_130pct(self):
+        self.assertEqual(
+            _dynamic_leverage(atr_pct=0.03, risk_pct=0.04, base=10, conviction=1.1),
+            13,
+        )
+
+    def test_s_tier_conviction_scales_to_160pct(self):
+        self.assertEqual(
+            _dynamic_leverage(atr_pct=0.03, risk_pct=0.04, base=10, conviction=1.6),
+            16,
+        )
 
     def test_hard_cap_at_25x(self):
-        # Very tight 0.5% stop would imply 80x by pure risk parity.
-        self.assertEqual(_dynamic_leverage(atr_pct=0.005, risk_pct=0.005, base=10), 25)
+        # Conviction 1.7 boosts to base*1.6=32; needs a tight stop so the
+        # safety_cap doesn't fire first. risk=2% -> safety_cap=37.
+        self.assertEqual(
+            _dynamic_leverage(atr_pct=0.03, risk_pct=0.02, base=20, conviction=1.7),
+            25,
+        )
 
 
 class _FakeClient:

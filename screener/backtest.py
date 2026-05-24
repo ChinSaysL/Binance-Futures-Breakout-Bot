@@ -1267,7 +1267,7 @@ def _simulate_trade(
         return None
     trigger_candle = candles[triggered_index]
 
-    leverage = _dynamic_leverage(signal.atr_pct, signal.risk_pct, args.leverage) if args.dynamic_leverage else args.leverage
+    leverage = _dynamic_leverage(signal.atr_pct, signal.risk_pct, args.leverage, conviction=_momentum_score(signal)) if args.dynamic_leverage else args.leverage
     stop = _leverage_capped_stop(side, entry, stop, int(leverage), args.max_sl_loss_pct)
     profile = (
         smart_take_profit_profile(

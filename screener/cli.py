@@ -592,7 +592,7 @@ def place_best_orders(
             failures.append(f"{signal.symbol}: exchange trading rules were not found")
             continue
 
-        effective_leverage = _dynamic_leverage(signal.atr_pct, signal.risk_pct, args.leverage) if args.dynamic_leverage else args.leverage
+        effective_leverage = _dynamic_leverage(signal.atr_pct, signal.risk_pct, args.leverage, conviction=_momentum_score(signal)) if args.dynamic_leverage else args.leverage
         if auto_margin > 0:
             effective_margin = auto_margin
             effective_notional = auto_margin * effective_leverage
@@ -1007,7 +1007,7 @@ def _exploder_entry_ready(
     if rule is None:
         return None, "no exchange trading rule found"
     leverage = (
-        _dynamic_leverage(fresh.atr_pct, fresh.risk_pct, args.leverage)
+        _dynamic_leverage(fresh.atr_pct, fresh.risk_pct, args.leverage, conviction=_momentum_score(fresh))
         if args.dynamic_leverage
         else args.leverage
     )
@@ -3709,43 +3709,56 @@ def _leverage_capped_stop(side: str, entry: float, stop: float, leverage: int, m
     return min(stop, entry * (1.0 + max_price_risk))
 
 
-def _dynamic_leverage(atr_pct: float, risk_pct: float, base: int) -> int:
-    """Risk-parity dynamic leverage.
+def _dynamic_leverage(atr_pct: float, risk_pct: float, base: int, conviction: float = 1.0) -> int:
+    """Conviction-scaled dynamic leverage.
 
-    Scales UP from base when the stop is tighter than the strategy's typical
-    distance (better capital efficiency on high-conviction tight setups),
-    capped at 25x. Stays AT base on normal stops. Drops below base only when
-    a liquidation-buffer safety cap demands it - never to penalize a
-    volatile coin for its own sake.
+    The strategy's edge is asymmetric: a small minority of trades produce the
+    bulk of returns. To beat flat-base leverage, dynamic must *concentrate*
+    capital on high-conviction setups (where momentum_score is high) and
+    de-emphasize weak setups - not just normalize risk across all trades.
 
-    The previous implementation used a fixed atr-pct → vol-factor table that
-    downscaled high-ATR coins (5-7x leverage on >5% ATR). It lost badly to
-    flat 10x in a 9-cell 3-window sweep: W3 fell from +19831% (flat) to
-    -0.5% (old dynamic), because breakout runners come disproportionately
-    from volatile coins and under-leveraging them caps the upside while
-    keeping the downside.
+    Conviction (momentum_score 0..~2) drives the multiplier:
+      >= 1.5  -> base * 1.6  (S+ tier explosive breakouts)
+      >= 1.0  -> base * 1.3  (strong)
+      >= 0.5  -> base        (normal)
+      <  0.5  -> base * 0.8  (weak)
 
-    Safety: max-loss-per-trade is capped at LIQUIDATION_BUFFER of margin so
-    Binance never auto-liquidates before the configured SL fires.
+    Safety: a liquidation-buffer cap limits per-trade max-loss to LIQUIDATION_BUFFER
+    of margin so Binance never auto-liquidates before the configured SL fires.
+    The function is purely conviction-driven now - stop distance no longer
+    scales leverage, because a "risk-parity" approach equalizes exposure and
+    destroys the strategy's fat-tail edge (lost 10x to flat in the prior
+    iteration).
+
+    The previous fixed atr -> vol-factor table downscaled high-ATR coins,
+    which broke worst of all - those are exactly where the breakout runners
+    come from. The history of this function is a cautionary tale: this
+    strategy wants MORE exposure on the volatile, high-conviction signals,
+    not less.
     """
     if base <= 0:
         return 1
     if risk_pct <= 0:
         return max(1, base)
 
-    REFERENCE_RISK_PCT = 0.04  # typical stop distance on this strategy's signals
-    LIQUIDATION_BUFFER = 0.75  # max-loss never exceeds 75% of margin (Binance auto-liq buffer)
-    HARD_CAP = 25              # absolute upper bound regardless of math
+    LIQUIDATION_BUFFER = 0.75
+    HARD_CAP = 25
 
-    # Risk-parity: a tighter stop earns more leverage so dollar-risk stays flat.
-    risk_parity_target = base * (REFERENCE_RISK_PCT / risk_pct)
-    target = max(base, min(round(risk_parity_target), HARD_CAP))
+    if conviction >= 1.5:
+        mult = 1.6
+    elif conviction >= 1.0:
+        mult = 1.3
+    elif conviction >= 0.5:
+        mult = 1.0
+    else:
+        mult = 0.8
 
-    # Safety floor: don't let a stop hit consume more than the liquidation buffer.
+    target = round(base * mult)
+
     safety_cap = int(LIQUIDATION_BUFFER / risk_pct)
     target = min(target, safety_cap)
 
-    return max(1, target)
+    return max(1, min(target, HARD_CAP))
 
 
 def _compact_count(value: int) -> str:
