@@ -537,12 +537,12 @@ def place_best_orders(
     if args.btc_market_guards and btc_guard_point is None:
         failures.append("BTC market guard: BTCUSDT trend unavailable; treating market as hostile")
 
-    if args.adaptive_entry and (args.skip_entry_regimes or args.btc_market_guards):
+    if args.skip_entry_regimes or args.btc_market_guards:
         tradable_signals: list[BreakoutSignal] = []
         for candidate in signals:
             entry_regime = _classify_entry_regime(candidate)
             if entry_regime in args.skip_entry_regimes:
-                failures.append(f"{candidate.symbol}@{candidate.interval}: skipped, adaptive entry regime {entry_regime}")
+                failures.append(f"{candidate.symbol}@{candidate.interval}: skipped, entry regime {entry_regime}")
             elif btc_reason := _btc_guard_reject_reason(entry_regime, btc_guard_point, args):
                 failures.append(f"{candidate.symbol}@{candidate.interval}: skipped, {btc_reason}")
             else:
@@ -604,11 +604,17 @@ def place_best_orders(
             effective_margin = requested_margin
         signal = _with_leverage_capped_stop(signal, effective_leverage, args.max_sl_loss_pct)
 
-        entry_regime = _classify_entry_regime(signal) if args.adaptive_entry else "RETEST"
-        if args.adaptive_entry and entry_regime in args.skip_entry_regimes:
-            failures.append(f"{signal.symbol}@{signal.interval}: skipped after recheck, adaptive entry regime {entry_regime}")
+        # Always classify regime (matching backtest behaviour); --adaptive-entry
+        # is no longer a gate on classification — only on the optional skip
+        # filter and BTC guards, which check themselves below. Live used to
+        # force every signal to "RETEST" without --adaptive-entry, which is
+        # the worst-performing regime in the validated dataset
+        # (INSTANT carried +1145 USDT of +1182 in the W3 baseline).
+        entry_regime = _classify_entry_regime(signal)
+        if entry_regime in args.skip_entry_regimes:
+            failures.append(f"{signal.symbol}@{signal.interval}: skipped after recheck, entry regime {entry_regime}")
             continue
-        if args.adaptive_entry and (btc_reason := _btc_guard_reject_reason(entry_regime, btc_guard_point, args)):
+        if btc_reason := _btc_guard_reject_reason(entry_regime, btc_guard_point, args):
             failures.append(f"{signal.symbol}@{signal.interval}: skipped after recheck, {btc_reason}")
             continue
 
@@ -3414,7 +3420,13 @@ def _live_ml_rank_score(signal: BreakoutSignal, args: argparse.Namespace) -> flo
 
 
 def _rank_order_signals(signals: list[BreakoutSignal], args: argparse.Namespace) -> None:
-    fallback_key = _momentum_sort_key if args.adaptive_entry else _quality_sort_key
+    # Sort by momentum so the priority key matches what the rotation system
+    # and stale-entry watchdog use (momentum_score). Previously this was gated
+    # on --adaptive-entry, so without that flag the queue was ranked by
+    # quality_score while rotation compared by momentum_score - the "best"
+    # signal in the queue could be a different one than rotation would
+    # actually swap to. Quality sort remains available as a tiebreaker.
+    fallback_key = _momentum_sort_key
     if getattr(args, "ml_rank_model_data", None):
         signals.sort(key=lambda signal: (-_live_ml_rank_score(signal, args), *fallback_key(signal)))
     else:
