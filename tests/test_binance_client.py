@@ -94,6 +94,15 @@ class DiscoverSymbolsTests(unittest.TestCase):
         self.assertEqual(position["markPrice"], "0.323")
         self.assertIn("/fapi/v3/positionRisk", client.paths)
 
+    def test_position_risk_falls_back_to_v2_for_missing_leverage(self):
+        client = V2FallbackClient()
+
+        account = client.account_info()
+        position = account["positions"][0]
+
+        self.assertEqual(position["leverage"], "20")
+        self.assertIn("/fapi/v2/positionRisk", client.paths)
+
 
 class FakeClient:
     market = "futures"
@@ -178,6 +187,50 @@ class EnrichingClient(BinanceClient):
                 "leverage": "10",
                 "markPrice": "0.323",
                 "unRealizedProfit": "0.8294",
+            }]
+        raise AssertionError(path)
+
+
+class V2FallbackClient(BinanceClient):
+    def __init__(self):
+        super().__init__(api_key="key", api_secret="secret")
+        self.paths: list[str] = []
+
+    def _signed_get(self, path, params):
+        self.paths.append(path)
+        if path == "/fapi/v3/account":
+            return {
+                "positions": [{
+                    "symbol": "PHAUSDT",
+                    "positionAmt": "2410",
+                    "positionSide": "BOTH",
+                    "entryPrice": None,
+                    "breakEvenPrice": None,
+                    "leverage": None,
+                    "unrealizedProfit": "0.68465690",
+                }]
+            }
+        if path == "/fapi/v3/positionRisk":
+            return [{
+                "symbol": "PHAUSDT",
+                "positionAmt": "2410",
+                "positionSide": "BOTH",
+                "entryPrice": "0.05116",
+                "breakEvenPrice": "0.05118558",
+                "leverage": None,
+                "markPrice": "0.05144409",
+                "unRealizedProfit": "0.68465690",
+            }]
+        if path == "/fapi/v2/positionRisk":
+            return [{
+                "symbol": "PHAUSDT",
+                "positionAmt": "2410",
+                "positionSide": "BOTH",
+                "entryPrice": "0.05116",
+                "breakEvenPrice": "0.05118558",
+                "leverage": "20",
+                "markPrice": "0.05144409",
+                "unRealizedProfit": "0.68465690",
             }]
         raise AssertionError(path)
 

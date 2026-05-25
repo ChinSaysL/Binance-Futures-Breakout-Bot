@@ -162,7 +162,17 @@ class BinanceClient:
             payload = self._signed_get("/fapi/v3/positionRisk", params)
         except BinanceClientError:
             payload = self._signed_get("/fapi/v2/positionRisk", params)
-        return payload if isinstance(payload, list) else []
+            return payload if isinstance(payload, list) else []
+        if not isinstance(payload, list):
+            return []
+        if _risk_missing_leverage(payload):
+            try:
+                fallback = self._signed_get("/fapi/v2/positionRisk", params)
+            except BinanceClientError:
+                return payload
+            if isinstance(fallback, list):
+                payload = _merge_risk_leverage(payload, fallback)
+        return payload
 
     def place_order(self, params: dict[str, Any], test: bool, recv_window: int = 5000) -> dict[str, Any]:
         path = "/order/test" if test else "/order"
@@ -713,6 +723,48 @@ def _range_pct(high_price: float, low_price: float, last_price: float) -> float:
     if high_price <= 0 or low_price <= 0 or last_price <= 0:
         return 0.0
     return (high_price - low_price) / last_price * 100.0
+
+
+def _risk_missing_leverage(risk_positions: list[Any]) -> bool:
+    for position in risk_positions:
+        if not isinstance(position, dict):
+            continue
+        if abs(_as_float(position.get("positionAmt"))) <= 0:
+            continue
+        if _as_float(position.get("leverage")) <= 0:
+            return True
+    return False
+
+
+def _merge_risk_leverage(primary: list[Any], fallback: list[Any]) -> list[Any]:
+    fallback_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    fallback_by_symbol: dict[str, dict[str, Any]] = {}
+    for position in fallback:
+        if not isinstance(position, dict):
+            continue
+        symbol = str(position.get("symbol", ""))
+        if not symbol:
+            continue
+        side = str(position.get("positionSide", "BOTH"))
+        fallback_by_key[(symbol, side)] = position
+        if abs(_as_float(position.get("positionAmt"))) > 0:
+            fallback_by_symbol[symbol] = position
+    for position in primary:
+        if not isinstance(position, dict):
+            continue
+        if _as_float(position.get("leverage")) > 0:
+            continue
+        symbol = str(position.get("symbol", ""))
+        if not symbol:
+            continue
+        side = str(position.get("positionSide", "BOTH"))
+        candidate = fallback_by_key.get((symbol, side)) or fallback_by_symbol.get(symbol)
+        if not candidate:
+            continue
+        leverage = candidate.get("leverage")
+        if _as_float(leverage) > 0:
+            position["leverage"] = leverage
+    return primary
 
 
 def _levels(raw_levels: list[Any]) -> list[tuple[float, float]]:
