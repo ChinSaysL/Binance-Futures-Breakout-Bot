@@ -217,7 +217,6 @@ def _register_telegram_commands(bot, args: argparse.Namespace, client: BinanceCl
         acct = _account()
         if "_error" in acct:
             return format_warning("Account Fetch Failed", fmt_code(acct["_error"]))
-            return f"⚠️ account fetch failed: <code>{_html.escape(acct['_error'])}</code>"
         equity = _current_equity(acct)
         open_positions = [
             p for p in acct.get("positions", [])
@@ -251,7 +250,6 @@ def _register_telegram_commands(bot, args: argparse.Namespace, client: BinanceCl
         acct = _account()
         if "_error" in acct:
             return format_warning("Account Fetch Failed", fmt_code(acct["_error"]))
-            return f"⚠️ {_html.escape(acct['_error'])}"
         try:
             live_marks = client.mark_prices()
         except BinanceClientError:
@@ -338,7 +336,6 @@ def _register_telegram_commands(bot, args: argparse.Namespace, client: BinanceCl
         acct = _account()
         if "_error" in acct:
             return format_warning("Account Fetch Failed", fmt_code(acct["_error"]))
-            return f"⚠️ {_html.escape(acct['_error'])}"
         equity = _current_equity(acct)
         peak = _load_equity_peak(Path(args.equity_peak_file))
         dd = ((peak - equity) / peak * 100.0) if peak > 0 else 0.0
@@ -348,12 +345,6 @@ def _register_telegram_commands(bot, args: argparse.Namespace, client: BinanceCl
             format_kv("Peak", f"{peak:.2f} USDT"),
             format_kv("Drawdown", f"{dd:.2f}%"),
         ])
-        return (
-            f"<b>Equity</b>\n"
-            f"  current: <b>{equity:.2f} USDT</b>\n"
-            f"  peak:    {peak:.2f} USDT\n"
-            f"  drawdown: {dd:.2f}%"
-        )
 
     def cmd_pause(ctx: CommandContext, parts: list[str]) -> str:
         if bot.state.get("paused"):
@@ -363,14 +354,12 @@ def _register_telegram_commands(bot, args: argparse.Namespace, client: BinanceCl
             "Trading Paused",
             "New entries will not be armed. Existing positions keep SL, TP, stagnation, and trailing management active.",
         )
-        return "⏸️ <b>Paused.</b> Existing positions keep being managed (SL/TP/stagnation/trail all active). New entries will NOT be armed. Use /resume to re-enable."
 
     def cmd_resume(ctx: CommandContext, parts: list[str]) -> str:
         if not bot.state.get("paused"):
             return format_empty("Already Live", "New entries are already enabled.")
         bot.state["paused"] = False
         return format_success("Trading Resumed", "New entries can be armed again on the next scan.")
-        return "▶️ <b>Resumed.</b> Arming new entries again on the next scan."
 
     def cmd_cancel(ctx: CommandContext, parts: list[str]) -> str:
         if not parts:
@@ -381,7 +370,6 @@ def _register_telegram_commands(bot, args: argparse.Namespace, client: BinanceCl
         acct = _account()
         if "_error" in acct:
             return format_warning("Account Fetch Failed", fmt_code(acct["_error"]))
-            return f"⚠️ {_html.escape(acct['_error'])}"
         # Try closing an open position first.
         for p in acct.get("positions", []):
             if not isinstance(p, dict) or p.get("symbol") != target:
@@ -396,7 +384,6 @@ def _register_telegram_commands(bot, args: argparse.Namespace, client: BinanceCl
                     }, test=False, recv_window=args.recv_window)
                 except BinanceClientError as exc:
                     return format_warning("Close Failed", fmt_code(str(exc)))
-                    return f"⚠️ close failed: <code>{_html.escape(str(exc))}</code>"
                 # Cancel leftover orders for the symbol.
                 try:
                     client._signed_request("DELETE", "/allOpenOrders", {"symbol": target, "recvWindow": args.recv_window})
@@ -437,7 +424,6 @@ def _register_telegram_commands(bot, args: argparse.Namespace, client: BinanceCl
         acct = _account()
         if "_error" in acct:
             return format_warning("Account Fetch Failed", fmt_code(acct["_error"]))
-            return f"⚠️ {_html.escape(acct['_error'])}"
         closed: list[str] = []
         for p in acct.get("positions", []):
             if not isinstance(p, dict):
@@ -1862,7 +1848,7 @@ def _scan_and_arm(client: BinanceClient, args: argparse.Namespace, settings: Bre
             active_count = _active_position_count(pending, account, pending_exits)
 
     if cap > 0 and active_count >= cap:
-        print(f"Auto-trader scan: max concurrent positions full ({active_count}/{cap}); {len(fresh)} candidate(s) waiting.")
+        _capacity_full_heartbeat(active_count, cap, len(fresh))
         return
 
     room = _queue_room(pending, args, pending_exits)
@@ -1898,6 +1884,26 @@ def _quiet_scan_heartbeat() -> None:
     ts = _dt.datetime.now(_dt.timezone.utc).strftime("%H:%M UTC")
     print(f"[{ts}] Auto-trader: quiet market - no qualifying setups; bot still scanning.")
     _LAST_QUIET_HEARTBEAT_TS = now
+
+
+def _capacity_full_heartbeat(active: int, cap: int, candidates: int) -> None:
+    """Print a low-rate notice when every concurrency slot is full.
+
+    Without throttling this line spams the log every 1-3 minutes for as long
+    as positions are open - which is most of the time on an active account.
+    Heartbeat at the same one-per-hour rate as the quiet-scan notice.
+    """
+    global _LAST_CAPACITY_FULL_TS
+    now = time.time()
+    if now - _LAST_CAPACITY_FULL_TS < _QUIET_HEARTBEAT_INTERVAL_SECONDS:
+        return
+    import datetime as _dt
+    ts = _dt.datetime.now(_dt.timezone.utc).strftime("%H:%M UTC")
+    print(
+        f"[{ts}] Auto-trader: capacity full ({active}/{cap}); "
+        f"{candidates} candidate(s) waiting; will arm on the next free slot."
+    )
+    _LAST_CAPACITY_FULL_TS = now
 
 
 def _print_monitored_coins(pending_entries: list[dict[str, object]]) -> None:
@@ -4080,6 +4086,7 @@ _last_rotation_ts = 0.0
 # market does not spam the log. Active scans print normally and do not reset
 # this; the user still sees an hourly heartbeat that the bot is alive.
 _LAST_QUIET_HEARTBEAT_TS = 0.0
+_LAST_CAPACITY_FULL_TS = 0.0
 _QUIET_HEARTBEAT_INTERVAL_SECONDS = 60 * 60
 
 

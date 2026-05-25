@@ -160,10 +160,35 @@ class TelegramBot:
         self._commands[command.lower()] = handler
 
     def prepare_for_polling(self) -> bool:
-        """Make long-polling usable and discard stale offline commands."""
+        """Make long-polling usable and discard stale offline commands.
+
+        deleteWebhook(drop_pending_updates=True) only drops the queue when a
+        webhook is configured - for pure long-polling bots it's a no-op and
+        old commands (including /stop) replay on the next restart, causing
+        the bot to exit immediately. Telegram's documented escape hatch for
+        long-polling is getUpdates(offset=-1), which returns the most recent
+        update AND marks all earlier ones as confirmed. We then advance our
+        internal cursor past it so the new session starts cleanly.
+        """
         if not self.enabled:
             return False
-        return self.api.delete_webhook(drop_pending_updates=True)
+        webhook_cleared = self.api.delete_webhook(drop_pending_updates=True)
+        # Fetch the latest queued update (if any) so Telegram acknowledges
+        # everything that came in while the bot was offline. Setting
+        # _next_offset past that point means the new session won't replay
+        # them.
+        latest = self.api.get_updates(offset=-1, long_poll_timeout=0)
+        if latest:
+            try:
+                last_id = int(latest[-1].get("update_id", 0))
+            except (TypeError, ValueError):
+                last_id = 0
+            if last_id > 0:
+                self._next_offset = last_id + 1
+                # One more no-op poll with the advanced offset forces Telegram
+                # to mark every queued update as confirmed.
+                self.api.get_updates(offset=self._next_offset, long_poll_timeout=0)
+        return webhook_cleared
 
     def set_commands(self, commands: list[dict[str, str]]) -> bool:
         if not self.enabled:
