@@ -467,6 +467,48 @@ class RotationPrecheckTests(unittest.TestCase):
         self.assertAlmostEqual(build_entry_order_plan.call_args.kwargs["requested_notional"], 122.32, places=2)
 
 
+class RotationScanTests(unittest.TestCase):
+    def test_refreshes_account_after_rotation_before_capacity_check(self):
+        with tempfile.TemporaryDirectory() as directory:
+            entry_file = Path(directory) / "entries.json"
+            exit_file = Path(directory) / "exits.json"
+            ton = _pending_entry(state="MONITORING", mark_side="waiting", symbol="TONUSDT")
+            tia = _pending_entry(state="MONITORING", mark_side="waiting", symbol="TIAUSDT")
+            entry_file.write_text(json.dumps([ton, tia]), encoding="utf-8")
+            args = _scan_args(entry_file, exit_file)
+            signal = _breakout_signal(symbol="PHAUSDT")
+            client = _AccountSequenceClient([
+                {
+                    "positions": [
+                        {"symbol": "TONUSDT", "positionAmt": "1", "entryPrice": "10"},
+                        {"symbol": "TIAUSDT", "positionAmt": "1", "entryPrice": "5"},
+                    ]
+                },
+                {"positions": [{"symbol": "TONUSDT", "positionAmt": "1", "entryPrice": "10"}]},
+            ])
+
+            def rotate(*_args, **_kwargs):
+                entry_file.write_text(json.dumps([ton]), encoding="utf-8")
+                return 1
+
+            with (
+                patch("screener.cli._resolve_symbols", return_value=Namespace(symbols=["PHAUSDT"])),
+                patch("screener.cli._filter_order_books", side_effect=lambda _client, universe, _args: universe),
+                patch("screener.cli._filter_open_interest", side_effect=lambda _client, universe, _args: universe),
+                patch("screener.cli.scan_symbols", return_value=([signal], [])),
+                patch("screener.cli._rank_order_signals"),
+                patch("screener.cli._consider_rotation", side_effect=rotate),
+                patch("screener.cli.place_best_orders", return_value=([], [])) as place_best_orders,
+            ):
+                with redirect_stdout(StringIO()):
+                    cli._scan_and_arm(client, args, BreakoutSettings())
+
+        self.assertEqual(client.account_calls, 2)
+        place_best_orders.assert_called_once()
+        refreshed_account = place_best_orders.call_args.kwargs["account"]
+        self.assertEqual([pos["symbol"] for pos in refreshed_account["positions"]], ["TONUSDT"])
+
+
 class _FakeClient:
     api_key = "key"
     api_secret = "secret"
@@ -513,6 +555,21 @@ class _FakeClient:
 class _RotationPrecheckClient:
     def exchange_info(self):
         return {}
+
+
+class _AccountSequenceClient:
+    api_key = "key"
+    api_secret = "secret"
+
+    def __init__(self, accounts: list[dict[str, object]]) -> None:
+        self._accounts = list(accounts)
+        self.account_calls = 0
+
+    def account_info(self, recv_window: int = 5000):
+        self.account_calls += 1
+        if len(self._accounts) > 1:
+            return self._accounts.pop(0)
+        return self._accounts[0]
 
 
 class _RetryImmediateTriggerClient:

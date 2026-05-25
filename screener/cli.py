@@ -2034,6 +2034,18 @@ def _scan_and_arm(client: BinanceClient, args: argparse.Namespace, settings: Bre
         if _consider_rotation(client, args, settings, fresh, pending, account):
             pending = _load_pending_entry_plans(args.entry_state_file)
             pending_exits = _load_pending_exit_plans(args.exit_state_file)
+            account = client.account_info(recv_window=args.recv_window)
+            pending_symbols = {str(item.get("symbol", "")) for item in pending}
+            if args.live_orders:
+                pending_symbols.update(str(item.get("symbol", "")) for item in pending_exits if str(item.get("symbol", "")))
+                pending_symbols.update(
+                    str(position.get("symbol", ""))
+                    for position in account.get("positions", [])
+                    if isinstance(position, dict)
+                    and str(position.get("symbol", ""))
+                    and abs(_safe_float(position.get("positionAmt"))) > 0
+                )
+            fresh = [s for s in signals if s.symbol not in pending_symbols]
             active_count = _active_position_count(pending, account, pending_exits)
 
     if cap > 0 and active_count >= cap:
