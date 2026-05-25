@@ -234,6 +234,61 @@ class SmartRetestManagerTests(unittest.TestCase):
 
         self.assertEqual(blocked, {"NEARUSDT", "SAGAUSDT", "DASHUSDT"})
 
+    def test_pending_exit_fill_sends_telegram_entry_notification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            entry_file = Path(directory) / "entries.json"
+            exit_file = Path(directory) / "exits.json"
+            exit_file.write_text(json.dumps([{
+                "symbol": "TESTUSDT",
+                "side": "LONG",
+                "interval": "1h",
+                "hedge_mode": False,
+                "entry_client_order_id": "test_entry",
+                "exit_plans": [
+                    {
+                        "role": "STOP_LOSS",
+                        "client_order_id": "test_sl",
+                        "payload": {
+                            "algoType": "CONDITIONAL",
+                            "symbol": "TESTUSDT",
+                            "side": "SELL",
+                            "type": "STOP_MARKET",
+                            "triggerPrice": "95",
+                            "closePosition": "true",
+                            "clientAlgoId": "test_sl",
+                        },
+                    },
+                    {
+                        "role": "TAKE_PROFIT_1",
+                        "client_order_id": "test_tp",
+                        "payload": {
+                            "algoType": "CONDITIONAL",
+                            "symbol": "TESTUSDT",
+                            "side": "SELL",
+                            "type": "TAKE_PROFIT_MARKET",
+                            "quantity": "1",
+                            "triggerPrice": "105",
+                            "clientAlgoId": "test_tp",
+                        },
+                    },
+                ],
+            }]), encoding="utf-8")
+            args = _args(entry_file, exit_file)
+            bot = _FakeTelegramBot()
+            args._telegram_bot = bot
+            client = _FakeClient(
+                mark_price=100.0,
+                account={"positions": [{"symbol": "TESTUSDT", "positionAmt": "1", "entryPrice": "100"}]},
+            )
+
+            result = _quiet_manage(client, args)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(bot.sent), 1)
+        self.assertIn("<b>Entry Filled</b>", bot.sent[0])
+        self.assertIn("<b>Symbol:</b> <code>TESTUSDT</code>", bot.sent[0])
+        self.assertIn("<b>Side:</b> <b>LONG</b>", bot.sent[0])
+
 
 class DynamicLeverageTests(unittest.TestCase):
     def test_safety_cap_reduces_leverage_on_dangerously_wide_stop(self):
@@ -461,6 +516,17 @@ class _DuplicateClosePositionStopClient:
                 "An open stop or take profit order with GTE and closePosition in the direction is existing."
             )
         return {"algoStatus": "NEW", "algoId": "456"}
+
+
+class _FakeTelegramBot:
+    enabled = True
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    def send(self, text: str, silent: bool = False, reply_markup: dict | None = None) -> bool:
+        self.sent.append(text)
+        return True
 
 
 def _rule_for(signal: BreakoutSignal) -> TradingRule:

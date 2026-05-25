@@ -2226,10 +2226,14 @@ def manage_pending_exits(client: BinanceClient, args: argparse.Namespace) -> int
             symbol = str(item.get("symbol", ""))
             side = str(item.get("side", ""))
             hedge_mode = bool(item.get("hedge_mode", False))
-            if not _has_open_position(account, symbol=symbol, side=side, hedge_mode=hedge_mode):
+            position = _account_position(account, symbol=symbol, side=side, hedge_mode=hedge_mode)
+            if not position:
                 waiting_exit_entry += 1
                 remaining_exits.append(item)
                 continue
+            if not item.get("entry_notified_at"):
+                _notify_entry_filled(args, item, position)
+                item["entry_notified_at"] = time.time()
             placed, item_failed, item_failures = _place_exit_plans_from_item(client, item, args)
             exits_placed += placed
             failures.extend(item_failures)
