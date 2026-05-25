@@ -1630,34 +1630,66 @@ def _consider_rotation(
     return 0
 
 
-def _opportunity_count(pending_entries: list[dict[str, object]]) -> int:
+def _opportunity_count(
+    pending_entries: list[dict[str, object]],
+    pending_exits: list[dict[str, object]] | None = None,
+) -> int:
     """Distinct opportunities in the pending file (a two-sided bracket counts as one)."""
     brackets: set[str] = set()
     singles = 0
+    entry_symbols: set[str] = set()
     for item in pending_entries:
+        symbol = str(item.get("symbol", ""))
+        if symbol:
+            entry_symbols.add(symbol)
         bracket_id = str(item.get("bracket_id", ""))
         if bracket_id:
             brackets.add(bracket_id)
         else:
             singles += 1
-    return len(brackets) + singles
+    exit_symbols = {
+        str(item.get("symbol", ""))
+        for item in (pending_exits or [])
+        if str(item.get("symbol", "")) and str(item.get("symbol", "")) not in entry_symbols
+    }
+    return len(brackets) + singles + len(exit_symbols)
 
 
-def _queue_room(pending_entries: list[dict[str, object]], args: argparse.Namespace) -> int:
+def _queue_room(
+    pending_entries: list[dict[str, object]],
+    args: argparse.Namespace,
+    pending_exits: list[dict[str, object]] | None = None,
+) -> int:
     """How many more coins the bot may arm and watch. Independent of the position cap."""
     limit = args.queue_size if args.queue_size > 0 else 999
-    return limit - _opportunity_count(pending_entries)
+    return limit - _opportunity_count(pending_entries, pending_exits)
 
 
-def _active_position_count(pending_entries: list[dict[str, object]], account: dict[str, object]) -> int:
+def _active_position_count(
+    pending_entries: list[dict[str, object]],
+    account: dict[str, object],
+    pending_exits: list[dict[str, object]] | None = None,
+) -> int:
     """Entries consuming a concurrency slot: live positions plus orders already placed."""
-    count = sum(
-        1
+    symbols = {
+        str(position.get("symbol", ""))
         for position in account.get("positions", [])
-        if isinstance(position, dict) and abs(_safe_float(position.get("positionAmt"))) > 0
+        if isinstance(position, dict)
+        and str(position.get("symbol", ""))
+        and abs(_safe_float(position.get("positionAmt"))) > 0
+    }
+    symbols.update(
+        str(item.get("symbol", ""))
+        for item in pending_entries
+        if str(item.get("symbol", ""))
+        and str(item.get("state", "")) in ("ENTRY_ORDER_PLACED", "MONITORING")
     )
-    count += sum(1 for item in pending_entries if str(item.get("state", "")) == "ENTRY_ORDER_PLACED")
-    return count
+    symbols.update(
+        str(item.get("symbol", ""))
+        for item in (pending_exits or [])
+        if str(item.get("symbol", ""))
+    )
+    return len(symbols)
 
 
 MANAGER_STATE_PRIORITY = {
@@ -1762,6 +1794,7 @@ def _scan_and_arm(client: BinanceClient, args: argparse.Namespace, settings: Bre
         return
 
     pending = _load_pending_entry_plans(args.entry_state_file)
+    pending_exits = _load_pending_exit_plans(args.exit_state_file)
     account = client.account_info(recv_window=args.recv_window)
 
     # Rebuild untriggered and stale triggered entries from scratch every scan:
@@ -1779,6 +1812,15 @@ def _scan_and_arm(client: BinanceClient, args: argparse.Namespace, settings: Bre
     pending = committed
 
     pending_symbols = {str(item.get("symbol", "")) for item in pending}
+    if args.live_orders:
+        pending_symbols.update(str(item.get("symbol", "")) for item in pending_exits if str(item.get("symbol", "")))
+        pending_symbols.update(
+            str(position.get("symbol", ""))
+            for position in account.get("positions", [])
+            if isinstance(position, dict)
+            and str(position.get("symbol", ""))
+            and abs(_safe_float(position.get("positionAmt"))) > 0
+        )
     fresh = [s for s in signals if s.symbol not in pending_symbols]
 
     # Clear stale ENTRY_ORDER_PLACED items whose LIMIT entry has been waiting
@@ -1798,16 +1840,34 @@ def _scan_and_arm(client: BinanceClient, args: argparse.Namespace, settings: Bre
         pending = [it for it in pending if str(it.get("entry_client_order_id", "")) not in stale_ids]
         _write_pending_entry_plans(args.entry_state_file, pending)
         pending_symbols = {str(item.get("symbol", "")) for item in pending}
+        if args.live_orders:
+            pending_symbols.update(str(item.get("symbol", "")) for item in pending_exits if str(item.get("symbol", "")))
+            pending_symbols.update(
+                str(position.get("symbol", ""))
+                for position in account.get("positions", [])
+                if isinstance(position, dict)
+                and str(position.get("symbol", ""))
+                and abs(_safe_float(position.get("positionAmt"))) > 0
+            )
         fresh = [s for s in signals if s.symbol not in pending_symbols]
 
     # Position rotation: when every concurrency slot is taken and an exploding coin is
     # waiting, close a weaker open position to make room for it.
     cap = args.max_concurrent_orders
-    if cap > 0 and fresh and _active_position_count(pending, account) >= cap:
+    active_count = _active_position_count(pending, account, pending_exits)
+    if cap > 0 and fresh and active_count >= cap:
         if _consider_rotation(client, args, settings, fresh, pending, account):
             pending = _load_pending_entry_plans(args.entry_state_file)
+            pending_exits = _load_pending_exit_plans(args.exit_state_file)
+            active_count = _active_position_count(pending, account, pending_exits)
 
-    room = _queue_room(pending, args)
+    if cap > 0 and active_count >= cap:
+        print(f"Auto-trader scan: max concurrent positions full ({active_count}/{cap}); {len(fresh)} candidate(s) waiting.")
+        return
+
+    room = _queue_room(pending, args, pending_exits)
+    if cap > 0:
+        room = min(room, cap - active_count)
     if room <= 0:
         print(f"Auto-trader scan: watch queue full ({args.queue_size}); {len(fresh)} candidate(s) waiting.")
         return

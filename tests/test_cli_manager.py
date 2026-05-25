@@ -13,10 +13,12 @@ import screener.cli as cli
 from screener.binance_client import BinanceClientError
 from screener.breakout import BreakoutSettings, BreakoutSignal
 from screener.cli import (
+    _active_position_count,
     _dynamic_leverage,
     _live_blocked_entry_symbols,
     _nudge_crossed_entry_trigger,
     _place_exit_plans_from_item,
+    _queue_room,
     _submit_entry_order_plan,
     manage_pending_exits,
 )
@@ -233,6 +235,30 @@ class SmartRetestManagerTests(unittest.TestCase):
             blocked = _live_blocked_entry_symbols(args, account)
 
         self.assertEqual(blocked, {"NEARUSDT", "SAGAUSDT", "DASHUSDT"})
+
+    def test_stop_market_pending_exits_consume_capacity_and_queue_room(self):
+        args = Namespace(queue_size=4)
+        pending_entries = [{"symbol": "NEARUSDT", "state": "ENTRY_ORDER_PLACED"}]
+        pending_exits = [{"symbol": "SAGAUSDT"}]
+        account = {"positions": [{"symbol": "DASHUSDT", "positionAmt": "1.2"}]}
+
+        active = _active_position_count(pending_entries, account, pending_exits)
+        room = _queue_room(pending_entries, args, pending_exits)
+
+        self.assertEqual(active, 3)
+        self.assertEqual(room, 2)
+
+    def test_stop_market_pending_exit_for_open_position_counts_once(self):
+        args = Namespace(queue_size=4)
+        pending_entries: list[dict[str, object]] = []
+        pending_exits = [{"symbol": "SAGAUSDT"}]
+        account = {"positions": [{"symbol": "SAGAUSDT", "positionAmt": "1.2"}]}
+
+        active = _active_position_count(pending_entries, account, pending_exits)
+        room = _queue_room(pending_entries, args, pending_exits)
+
+        self.assertEqual(active, 1)
+        self.assertEqual(room, 3)
 
     def test_pending_exit_fill_sends_telegram_entry_notification(self):
         with tempfile.TemporaryDirectory() as directory:
