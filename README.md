@@ -243,7 +243,7 @@ The bot is one long-running process: `python .\breakout_detector.py [flags]`. Al
 | Flag | Default | Purpose |
 |------|---------|---------|
 | `--trailing-stop` | off | Attach `TRAILING_STOP_MARKET` runner. |
-| `--trailing-callback-pct` | 1.2 | Runner callback %. Tuned to match the validated backtest baseline. |
+| `--trailing-callback-pct` | 1.2 | Runner callback %. Binance Futures algo-order range is 0.1-10; tuned to match the validated backtest baseline. |
 | `--trailing-quantity-pct` | 50 | Runner share of position (when `--tp-splits` not set). |
 | `--tp-count` | 1 | Number of partial TP orders. |
 | `--tp-splits 40,30,20` | unset | Explicit TP qty %s. Remainder becomes the trailing runner. |

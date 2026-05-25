@@ -6,6 +6,10 @@ from typing import Any
 
 from .breakout import BreakoutSignal
 
+TRAILING_CALLBACK_MIN_PCT = Decimal("0.1")
+TRAILING_CALLBACK_MAX_PCT = Decimal("10")
+TRAILING_CALLBACK_STEP_PCT = Decimal("0.1")
+
 
 class OrderPlanError(ValueError):
     """Raised when a signal cannot be turned into a valid futures order."""
@@ -345,8 +349,7 @@ def _build_trailing_stop_plan(
     hedge_mode: bool,
     quantity_override: Decimal | None = None,
 ) -> ConditionalOrderPlan:
-    if callback_pct < 0.1 or callback_pct > 10:
-        raise OrderPlanError(f"{signal.symbol}: trailing callback must be between 0.1% and 10%")
+    callback_rate = format_trailing_callback_pct(callback_pct)
     binance_side, activation_price, rounding = _trailing_stop_params(signal)
     if quantity_override is not None and quantity_override > 0:
         # Caller wants the trail to consume an exact remainder (entry - sum(TPs))
@@ -380,7 +383,7 @@ def _build_trailing_stop_plan(
         "side": binance_side,
         "type": "TRAILING_STOP_MARKET",
         "quantity": _format_decimal(quantity),
-        "callbackRate": _format_decimal(_decimal(callback_pct)),
+        "callbackRate": callback_rate,
         "workingType": working_type,
         "newOrderRespType": "ACK",
         "clientAlgoId": client_order_id,
@@ -511,6 +514,21 @@ def _quantity_from_pct(
             f"is below exchange min notional {_format_decimal(rule.min_notional)}"
         )
     return quantity
+
+
+def format_trailing_callback_pct(callback_pct: Any) -> str:
+    """Return a Binance-safe trailing callback percentage string.
+
+    Binance Futures rejects callbacks outside 0.1..10 and is picky about
+    excess decimal precision. Use one-decimal step formatting for both newly
+    built plans and old pending plans before retrying placement.
+    """
+    value = _decimal(callback_pct)
+    if value is None:
+        raise OrderPlanError("trailing callback must be a finite decimal")
+    value = max(TRAILING_CALLBACK_MIN_PCT, min(TRAILING_CALLBACK_MAX_PCT, value))
+    value = (value / TRAILING_CALLBACK_STEP_PCT).to_integral_value(rounding=ROUND_DOWN) * TRAILING_CALLBACK_STEP_PCT
+    return _format_decimal(value)
 
 
 def _exit_order_params(signal: BreakoutSignal, role: str) -> tuple[str, str, float, str]:

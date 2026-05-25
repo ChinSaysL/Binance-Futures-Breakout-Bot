@@ -35,6 +35,7 @@ from .orders import (
     TradingRule,
     build_entry_order_plan,
     build_exit_order_plans,
+    format_trailing_callback_pct,
     trading_rules_from_exchange_info,
     _decimal as _to_decimal,
     _format_decimal as _format_decimal,
@@ -650,7 +651,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tp-count", type=int, default=1, help="Number of partial take-profit orders per entry.")
     parser.add_argument("--tp-splits", help="Comma-separated take-profit quantity percentages, e.g. 40,30,20. With --trailing-stop the remainder becomes the trailing runner.")
     parser.add_argument("--trailing-stop", action="store_true", help="Add a trailing-stop-market algo order for the runner quantity.")
-    parser.add_argument("--trailing-callback-pct", type=float, default=1.2, help="Trailing stop callback rate, percent. Binance allows 0.1 to 10. Default 1.2 matches the backtest's validated +11127%% baseline; 1.0 (the old live default) was 20%% tighter than backtest and silently haircut avg-win.")
+    parser.add_argument("--trailing-callback-pct", type=float, default=1.2, help="Trailing stop callback rate, percent. Binance Futures algo orders accept 0.1 to 10. Default 1.2 matches the backtest's validated +11127%% baseline; 1.0 (the old live default) was 20%% tighter than backtest and silently haircut avg-win.")
     parser.add_argument("--adaptive-trailing-callback", action="store_true", help="Scale the trailing-stop callback by each coin's ATR%% instead of using a fixed --trailing-callback-pct. Validated +46%% sum equity / +33%% worst-case R over fixed 1.2%% in a 3-window backtest.")
     parser.add_argument("--adaptive-trailing-callback-multiplier", type=float, default=0.3, help="With --adaptive-trailing-callback: callback%% = clamp(atr_pct * multiplier, 0.5%%, 5.0%%). Default 0.3 was the worst-case-best multiplier in the 3-window sweep.")
     parser.add_argument("--trailing-quantity-pct", type=float, default=50.0, help="Runner quantity percent reserved for trailing stop when --tp-splits is not set. A 27-run sweep showed a bigger runner (50%%) compounds far better - a breakout's edge is in the few trades that run.")
@@ -2273,16 +2274,17 @@ def _place_exit_plans_from_item(
         client_order_id = str(raw_plan.get("client_order_id", "")) if isinstance(raw_plan, dict) else ""
         if client_order_id and client_order_id in placed_id_set:
             continue
-        if payload.get("type") == "TRAILING_STOP_MARKET":
-            payload.pop("activatePrice", None)
         try:
+            if payload.get("type") == "TRAILING_STOP_MARKET":
+                payload.pop("activatePrice", None)
+                payload["callbackRate"] = format_trailing_callback_pct(payload.get("callbackRate"))
             client.place_algo_order(payload, recv_window=args.recv_window)
             placed += 1
             if client_order_id:
                 placed_id_set.add(client_order_id)
                 placed_ids.append(client_order_id)
                 item["placed_exit_client_order_ids"] = placed_ids
-        except BinanceClientError as exc:
+        except (BinanceClientError, OrderPlanError) as exc:
             # Critical safety net: if the STOP_LOSS would fire immediately, the
             # SL has effectively already triggered - market-close the position
             # instead of leaving it unprotected while we retry indefinitely.

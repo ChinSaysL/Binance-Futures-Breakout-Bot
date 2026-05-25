@@ -140,6 +140,26 @@ class OrderPlanTests(unittest.TestCase):
         self.assertEqual(trailing.payload["callbackRate"], "1.5")
         self.assertEqual(trailing.payload["reduceOnly"], "true")
 
+    def test_trailing_callback_is_clamped_and_rounded_for_binance(self):
+        signal = _signal(side="LONG", trigger=100.0)
+
+        *_, trailing = build_exit_order_plans(
+            signal=signal,
+            rule=_rule(),
+            entry_quantity="1.0",
+            stop_client_order_id="test_sl",
+            target_client_order_ids=["test_tp1"],
+            target_splits_pct=[50],
+            trailing_client_order_id="test_trl",
+            trailing_callback_pct=9.876,
+            trailing_quantity_pct=50,
+            working_type="MARK_PRICE",
+            price_protect=False,
+            hedge_mode=False,
+        )
+
+        self.assertEqual(trailing.payload["callbackRate"], "9.8")
+
     def test_rejects_notional_below_exchange_minimum(self):
         with self.assertRaises(OrderPlanError):
             build_entry_order_plan(

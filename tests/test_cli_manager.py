@@ -136,6 +136,38 @@ class SmartRetestManagerTests(unittest.TestCase):
             self.assertFalse(entry_file.exists())
             self.assertEqual(client.cancelled_algos, [("TESTUSDT", "test_sl"), ("TESTUSDT", "test_tp")])
 
+    def test_normalizes_saved_trailing_callback_before_placing_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            entry_file = Path(directory) / "entries.json"
+            exit_file = Path(directory) / "exits.json"
+            entry = _pending_entry(state="ENTRY_ORDER_PLACED", mark_side="waiting")
+            entry["exit_plans"] = [{
+                "role": "TRAILING_STOP",
+                "client_order_id": "test_trl",
+                "payload": {
+                    "algoType": "CONDITIONAL",
+                    "symbol": "TESTUSDT",
+                    "side": "SELL",
+                    "type": "TRAILING_STOP_MARKET",
+                    "quantity": "1",
+                    "callbackRate": "9.876543",
+                    "activatePrice": "101",
+                    "workingType": "MARK_PRICE",
+                    "clientAlgoId": "test_trl",
+                },
+            }]
+            entry_file.write_text(json.dumps([entry]), encoding="utf-8")
+            client = _FakeClient(
+                mark_price=99.0,
+                account={"positions": [{"symbol": "TESTUSDT", "positionAmt": "1", "entryPrice": "100"}]},
+            )
+
+            result = _quiet_manage(client, _args(entry_file, exit_file))
+
+            self.assertEqual(result, 0)
+            self.assertEqual(client.algo_orders[0]["callbackRate"], "9.8")
+            self.assertNotIn("activatePrice", client.algo_orders[0])
+
 
 class DynamicLeverageTests(unittest.TestCase):
     def test_safety_cap_reduces_leverage_on_dangerously_wide_stop(self):
@@ -231,13 +263,15 @@ class _FakeClient:
     api_key = "key"
     api_secret = "secret"
 
-    def __init__(self, mark_price: float | dict[str, float]) -> None:
+    def __init__(self, mark_price: float | dict[str, float], account: dict | None = None) -> None:
         self._mark_price = mark_price
+        self._account = account or {"positions": []}
         self.orders: list[dict[str, str]] = []
+        self.algo_orders: list[dict[str, str]] = []
         self.cancelled_algos: list[tuple[str, str]] = []
 
     def account_info(self, recv_window: int = 5000):
-        return {"positions": []}
+        return self._account
 
     def mark_price(self, symbol: str) -> float:
         if isinstance(self._mark_price, dict):
@@ -260,6 +294,7 @@ class _FakeClient:
         return {"status": "NEW", "orderId": "123"}
 
     def place_algo_order(self, payload: dict[str, str], recv_window: int = 5000):
+        self.algo_orders.append(payload)
         return {"algoStatus": "NEW", "algoId": "456"}
 
     def cancel_algo_order(self, symbol: str, client_algo_id: str, recv_window: int = 5000):
@@ -361,6 +396,9 @@ def _args(entry_file: Path, exit_file: Path) -> Namespace:
         dynamic_sl=False,
         sl_update_interval_seconds=300.0,
         sl_lookback=20,
+        exhaustion_exit=False,
+        stagnation_after_r=0.0,
+        stagnation_candles=0,
     )
 
 
