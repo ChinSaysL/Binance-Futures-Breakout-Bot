@@ -10,9 +10,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 import screener.cli as cli
+from screener.binance_client import BinanceClientError
 from screener.breakout import BreakoutSettings, BreakoutSignal
-from screener.cli import _dynamic_leverage, manage_pending_exits
-from screener.orders import TradingRule
+from screener.cli import _dynamic_leverage, _nudge_crossed_entry_trigger, _submit_entry_order_plan, manage_pending_exits
+from screener.orders import TradingRule, build_entry_order_plan
 
 
 class SmartRetestManagerTests(unittest.TestCase):
@@ -213,6 +214,67 @@ class DynamicLeverageTests(unittest.TestCase):
         )
 
 
+class ConditionalEntryNudgeTests(unittest.TestCase):
+    def test_nudges_crossed_long_stop_trigger_one_tick_above_mark(self):
+        signal = _breakout_signal()
+        rule = _rule_for(signal)
+        plan = build_entry_order_plan(
+            signal=signal,
+            rule=rule,
+            requested_notional=25,
+            client_order_id="test_entry",
+            working_type="MARK_PRICE",
+            price_protect=False,
+            hedge_mode=False,
+        )
+        args = Namespace(live_orders=True, order_working_type="MARK_PRICE")
+
+        nudged = _nudge_crossed_entry_trigger(_FakeClient(mark_price=0.073), signal, plan, rule, args)
+
+        self.assertEqual(nudged.trigger_price, "0.07301")
+        self.assertEqual(nudged.payload["triggerPrice"], "0.07301")
+        self.assertEqual(nudged.payload["type"], "STOP_MARKET")
+
+    def test_keeps_uncrossed_stop_trigger_unchanged(self):
+        signal = _breakout_signal()
+        rule = _rule_for(signal)
+        plan = build_entry_order_plan(
+            signal=signal,
+            rule=rule,
+            requested_notional=25,
+            client_order_id="test_entry",
+            working_type="MARK_PRICE",
+            price_protect=False,
+            hedge_mode=False,
+        )
+        args = Namespace(live_orders=True, order_working_type="MARK_PRICE")
+
+        nudged = _nudge_crossed_entry_trigger(_FakeClient(mark_price=0.071), signal, plan, rule, args)
+
+        self.assertIs(nudged, plan)
+
+    def test_retries_nudge_when_binance_mark_moves_before_submit(self):
+        signal = _breakout_signal()
+        rule = _rule_for(signal)
+        plan = build_entry_order_plan(
+            signal=signal,
+            rule=rule,
+            requested_notional=25,
+            client_order_id="test_entry",
+            working_type="MARK_PRICE",
+            price_protect=False,
+            hedge_mode=False,
+        )
+        args = Namespace(live_orders=True, order_working_type="MARK_PRICE", recv_window=5000)
+        client = _RetryImmediateTriggerClient([0.073, 0.07302])
+
+        retry_plan, response = _submit_entry_order_plan(client, signal, plan, rule, args)
+
+        self.assertEqual(response["algoStatus"], "NEW")
+        self.assertEqual(retry_plan.trigger_price, "0.07303")
+        self.assertEqual(client.algo_orders[-1]["triggerPrice"], "0.07303")
+
+
 class RotationPrecheckTests(unittest.TestCase):
     def test_auto_sizing_rotation_precheck_uses_account_margin(self):
         signal = _breakout_signal()
@@ -305,6 +367,32 @@ class _FakeClient:
 class _RotationPrecheckClient:
     def exchange_info(self):
         return {}
+
+
+class _RetryImmediateTriggerClient:
+    def __init__(self, marks: list[float]) -> None:
+        self._marks = marks
+        self.algo_orders: list[dict[str, str]] = []
+
+    def mark_price(self, symbol: str) -> float:
+        return self._marks.pop(0)
+
+    def place_algo_order(self, payload: dict[str, str], recv_window: int = 5000):
+        self.algo_orders.append(dict(payload))
+        if len(self.algo_orders) == 1:
+            raise BinanceClientError("Binance HTTP 400 for /algoOrder: Order would immediately trigger.")
+        return {"algoStatus": "NEW", "algoId": "456"}
+
+
+def _rule_for(signal: BreakoutSignal) -> TradingRule:
+    return TradingRule(
+        symbol=signal.symbol,
+        price_tick_size=Decimal("0.00001"),
+        quantity_step_size=Decimal("0.1"),
+        min_qty=Decimal("0.1"),
+        max_qty=Decimal("0"),
+        min_notional=Decimal("5"),
+    )
 
 
 def _breakout_signal() -> BreakoutSignal:

@@ -1071,7 +1071,7 @@ def place_best_orders(
             if args.live_orders and args.entry_mode == "SMART_RETEST":
                 response = {"algoStatus": "WAIT_BREAKOUT"}
             else:
-                response = _submit_order_plan(client, plan.payload, args)
+                plan, response = _submit_entry_order_plan(client, signal, plan, rule, args)
         except (BinanceClientError, OrderPlanError) as exc:
             failures.append(f"{signal.symbol}@{signal.interval}: {exc}")
             continue
@@ -1241,6 +1241,65 @@ def _submit_order_plan(client: BinanceClient, payload: dict[str, str], args: arg
     if args.live_orders:
         return client.place_algo_order(payload, recv_window=args.recv_window)
     return {"algoStatus": "LOCAL_VALIDATED"}
+
+
+def _submit_entry_order_plan(
+    client: BinanceClient,
+    signal: BreakoutSignal,
+    plan: ConditionalOrderPlan,
+    rule: TradingRule,
+    args: argparse.Namespace,
+) -> tuple[ConditionalOrderPlan, dict[str, str]]:
+    plan = _nudge_crossed_entry_trigger(client, signal, plan, rule, args)
+    try:
+        return plan, _submit_order_plan(client, plan.payload, args)
+    except BinanceClientError as exc:
+        if "would immediately trigger" not in str(exc).lower():
+            raise
+        retry_plan = _nudge_crossed_entry_trigger(client, signal, plan, rule, args)
+        if retry_plan.trigger_price == plan.trigger_price:
+            raise
+        return retry_plan, _submit_order_plan(client, retry_plan.payload, args)
+
+
+def _nudge_crossed_entry_trigger(
+    client: BinanceClient,
+    signal: BreakoutSignal,
+    plan: ConditionalOrderPlan,
+    rule: TradingRule,
+    args: argparse.Namespace,
+) -> ConditionalOrderPlan:
+    if not args.live_orders or plan.role != "ENTRY" or plan.order_type not in {"STOP_MARKET", "STOP_LIMIT"}:
+        return plan
+    if str(getattr(args, "order_working_type", "MARK_PRICE")).upper() != "MARK_PRICE":
+        return plan
+    from decimal import ROUND_DOWN, ROUND_UP
+
+    try:
+        mark = client.mark_price(signal.symbol)
+    except BinanceClientError:
+        return plan
+    mark_dec = _to_decimal(mark)
+    trigger_dec = _to_decimal(plan.trigger_price)
+    tick = rule.price_tick_size
+    if mark_dec is None or trigger_dec is None or mark_dec <= 0 or trigger_dec <= 0 or tick <= 0:
+        return plan
+
+    if signal.side == "LONG":
+        if trigger_dec > mark_dec:
+            return plan
+        adjusted = _round_to_step(mark_dec + tick, tick, rounding=ROUND_UP)
+    else:
+        if trigger_dec < mark_dec:
+            return plan
+        adjusted = _round_to_step(mark_dec - tick, tick, rounding=ROUND_DOWN)
+    if adjusted <= 0:
+        return plan
+
+    adjusted_text = _format_decimal(adjusted)
+    payload = dict(plan.payload)
+    payload["triggerPrice"] = adjusted_text
+    return replace(plan, trigger_price=adjusted_text, payload=payload)
 
 
 def _should_auto_manage_exits(args: argparse.Namespace) -> bool:
