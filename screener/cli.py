@@ -976,15 +976,20 @@ def place_best_orders(
             return results, failures + ["Auto-sizing: wallet equity is zero or missing; no orders placed this scan."]
         print(f"Auto-sizing: equity={_current_equity(account or {}):.2f} USDT  margin/trade={auto_margin:.2f} USDT  ({(auto_margin / max(_current_equity(account or {}), 1e-9)) * 100:.1f}% of equity)")
 
-    if args.live_orders and args.entry_mode == "SMART_RETEST":
-        pending_symbols = {
-            str(item.get("symbol", ""))
-            for item in _load_pending_entry_plans(args.entry_state_file)
-        }
-        skipped = [s for s in selected if s.symbol in pending_symbols]
-        selected = [s for s in selected if s.symbol not in pending_symbols]
+    if args.live_orders:
+        pending_symbols = _live_blocked_entry_symbols(args, account or {})
+        filtered_selected: list[BreakoutSignal] = []
+        skipped: list[BreakoutSignal] = []
+        seen_symbols = set(pending_symbols)
+        for signal in selected:
+            if signal.symbol in seen_symbols:
+                skipped.append(signal)
+                continue
+            seen_symbols.add(signal.symbol)
+            filtered_selected.append(signal)
+        selected = filtered_selected
         for s in skipped:
-            failures.append(f"{s.symbol}@{s.interval}: skipped, already has a pending managed entry in {args.entry_state_file}")
+            failures.append(f"{s.symbol}@{s.interval}: skipped, symbol already has a live/pending entry or position")
 
     for index, signal in enumerate(selected, start=1):
         if args.live_orders and not args.skip_pre_order_recheck:
@@ -1241,6 +1246,27 @@ def _submit_order_plan(client: BinanceClient, payload: dict[str, str], args: arg
     if args.live_orders:
         return client.place_algo_order(payload, recv_window=args.recv_window)
     return {"algoStatus": "LOCAL_VALIDATED"}
+
+
+def _live_blocked_entry_symbols(args: argparse.Namespace, account: dict[str, object]) -> set[str]:
+    symbols = {
+        str(item.get("symbol", ""))
+        for item in _load_pending_entry_plans(args.entry_state_file)
+        if str(item.get("symbol", ""))
+    }
+    symbols.update(
+        str(item.get("symbol", ""))
+        for item in _load_pending_exit_plans(args.exit_state_file)
+        if str(item.get("symbol", ""))
+    )
+    symbols.update(
+        str(position.get("symbol", ""))
+        for position in account.get("positions", [])
+        if isinstance(position, dict)
+        and str(position.get("symbol", ""))
+        and abs(_safe_float(position.get("positionAmt"))) > 0
+    )
+    return symbols
 
 
 def _submit_entry_order_plan(

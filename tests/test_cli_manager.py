@@ -14,6 +14,7 @@ from screener.binance_client import BinanceClientError
 from screener.breakout import BreakoutSettings, BreakoutSignal
 from screener.cli import (
     _dynamic_leverage,
+    _live_blocked_entry_symbols,
     _nudge_crossed_entry_trigger,
     _place_exit_plans_from_item,
     _submit_entry_order_plan,
@@ -219,6 +220,19 @@ class SmartRetestManagerTests(unittest.TestCase):
         self.assertTrue(item["sl_existing_close_position"])
         self.assertEqual(item["placed_exit_client_order_ids"], ["test_sl", "test_tp"])
         self.assertEqual(client.algo_orders[-1]["type"], "TAKE_PROFIT_MARKET")
+
+    def test_live_blocked_symbols_include_pending_exits_and_positions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            entry_file = Path(directory) / "entries.json"
+            exit_file = Path(directory) / "exits.json"
+            entry_file.write_text(json.dumps([{"symbol": "NEARUSDT"}]), encoding="utf-8")
+            exit_file.write_text(json.dumps([{"symbol": "SAGAUSDT"}]), encoding="utf-8")
+            args = _args(entry_file, exit_file)
+            account = {"positions": [{"symbol": "DASHUSDT", "positionAmt": "1.2"}]}
+
+            blocked = _live_blocked_entry_symbols(args, account)
+
+        self.assertEqual(blocked, {"NEARUSDT", "SAGAUSDT", "DASHUSDT"})
 
 
 class DynamicLeverageTests(unittest.TestCase):
