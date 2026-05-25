@@ -1327,6 +1327,137 @@ def _has_pending_trade_work(args: argparse.Namespace) -> bool:
     return bool(_load_pending_entry_plans(args.entry_state_file) or _load_pending_exit_plans(args.exit_state_file))
 
 
+def _detect_and_adopt_orphans(client: BinanceClient, args: argparse.Namespace) -> int:
+    """Scan Binance for open positions that have no corresponding pending-entry
+    record and adopt them so the bot is aware of them.
+
+    An orphan position has its exits (SL/TP/trail) already placed on Binance
+    but the bot lost the local link to them (lost pending file, /cancel_all
+    bug, restart race, etc.). Adopted entries are tagged `adopted_orphan=True`
+    so the bot's exit-management paths leave them alone - Binance keeps
+    enforcing the existing exits. The bot still reports them via /positions,
+    counts them against the concurrency cap, and can close them via /cancel.
+    """
+    try:
+        account = client.account_info(recv_window=args.recv_window)
+    except BinanceClientError:
+        return 0
+
+    pending = _load_pending_entry_plans(args.entry_state_file)
+    tracked = {str(it.get("symbol", "")) for it in pending if str(it.get("symbol", ""))}
+
+    new_adopted: list[dict[str, object]] = []
+    for pos in account.get("positions", []) or []:
+        if not isinstance(pos, dict):
+            continue
+        amt = _safe_float(pos.get("positionAmt"))
+        if abs(amt) <= 0:
+            continue
+        sym = str(pos.get("symbol", ""))
+        if not sym or sym in tracked:
+            continue
+
+        entry_price = _safe_float(pos.get("entryPrice"))
+        side = "LONG" if amt > 0 else "SHORT"
+        leverage = int(_safe_float(pos.get("leverage")) or args.leverage or 10)
+
+        # Best-effort lookup of the existing exits placed on Binance.
+        # If they appear via /openOrders we link their IDs so the bot can
+        # cancel them cleanly via /cancel later. If not (algo orders that
+        # don't surface here), we still adopt - Binance enforces them.
+        existing_sl_client_id = ""
+        existing_sl_trigger = 0.0
+        try:
+            oo = client._signed_get(
+                "/openOrders", {"symbol": sym, "recvWindow": args.recv_window}
+            )
+        except BinanceClientError:
+            oo = []
+        for o in oo or []:
+            if not isinstance(o, dict):
+                continue
+            otype = str(o.get("type", ""))
+            close_pos = str(o.get("closePosition", "")).lower() == "true"
+            if otype == "STOP_MARKET" and close_pos:
+                existing_sl_client_id = str(
+                    o.get("clientOrderId") or o.get("origClientOrderId") or ""
+                )
+                existing_sl_trigger = _safe_float(o.get("stopPrice"))
+                break
+
+        synthetic = {
+            "created_at": int(time.time()),
+            "state": "MONITORING",
+            "symbol": sym,
+            "side": side,
+            "interval": "1h",  # unknown; default for display only
+            "hedge_mode": False,
+            "binance_side": "BUY" if amt > 0 else "SELL",
+            "quantity": str(abs(amt)),
+            "trigger_price": str(entry_price),
+            "limit_price": str(entry_price),
+            "entry_client_order_id": f"adopted_{sym}_{int(time.time())}",
+            "leverage": leverage,
+            "max_concurrent_orders": args.max_concurrent_orders,
+            "max_market_deviation_pct": args.max_market_deviation_pct,
+            "entry_regime": "ADOPTED",
+            "momentum_score": 0.0,
+            "exit_plans": [],
+            "placed_exit_client_order_ids": [],
+            "entry_order_type": "ADOPTED",
+            "entry_order_status": "FILLED",
+            "entry_order_id": "",
+            "entry_submitted_at": int(time.time()),
+            "entry_filled_at": time.time(),
+            "triggered_at": time.time(),
+            "live_entry_price": entry_price,
+            "live_initial_stop": existing_sl_trigger,
+            "sl_client_order_id": existing_sl_client_id,
+            "sl_trigger_price": str(existing_sl_trigger) if existing_sl_trigger > 0 else "0",
+            "last_sl_update": time.time(),  # block dynamic-SL ratchet
+            "adopted_orphan": True,
+            "adopted_at": int(time.time()),
+        }
+        new_adopted.append(synthetic)
+
+    if not new_adopted:
+        return 0
+
+    pending.extend(new_adopted)
+    _write_pending_entry_plans(args.entry_state_file, pending)
+
+    bot = getattr(args, "_telegram_bot", None)
+    for item in new_adopted:
+        sym = item.get("symbol")
+        amt = item.get("quantity")
+        entry = item.get("live_entry_price")
+        sl = item.get("live_initial_stop")
+        sl_text = f"{sl:g} (existing)" if sl else "not detected — Binance manages"
+        print(
+            f"Adopted orphan position: {sym} {item.get('side')} qty={amt} "
+            f"entry≈{entry:g} sl={sl_text}"
+        )
+        if bot and bot.enabled:
+            try:
+                from screener.telegram import format_warning, format_kv
+                bot.send(
+                    "\n".join([
+                        format_warning(
+                            "Orphan Position Adopted",
+                            f"Found an untracked open position. Bot now manages it.",
+                        ),
+                        format_kv("Symbol", str(sym)),
+                        format_kv("Side", str(item.get("side"))),
+                        format_kv("Qty", str(amt)),
+                        format_kv("Entry", f"{entry:g}"),
+                        format_kv("Existing exits", "kept (Binance enforces)"),
+                    ])
+                )
+            except Exception:
+                pass
+    return len(new_adopted)
+
+
 def _heartbeat_due(last_status_time: float, args: argparse.Namespace) -> bool:
     heartbeat = max(args.exit_heartbeat_seconds, 0.0)
     return heartbeat > 0 and time.time() - last_status_time >= heartbeat
@@ -1965,6 +2096,14 @@ def run_auto_trader(client: BinanceClient, args: argparse.Namespace, settings: B
             _print_monitored_coins(_load_pending_entry_plans(args.entry_state_file))
             last_scan = time.time()
 
+        # Orphan adoption: pick up any open Binance position the bot lost
+        # track of (e.g. after a /cancel_all bug or a restart race). Runs
+        # every tick so a newly-orphaned position is captured within seconds.
+        try:
+            _detect_and_adopt_orphans(client, args)
+        except BinanceClientError as exc:
+            print(f"Orphan-adoption pass failed, will retry: {exc}")
+
         if _has_pending_trade_work(args):
             try:
                 manage_pending_exits(client, args)
@@ -2132,6 +2271,14 @@ def manage_pending_exits(client: BinanceClient, args: argparse.Namespace) -> int
                     _notify_entry_filled(args, item, position)
                 item["live_entry_price"] = _safe_float(position.get("entryPrice"))
                 item["live_initial_stop"] = item.get("live_initial_stop") or _initial_stop_from_item(item)
+                # Adopted-orphan positions skip exit management entirely: their
+                # SL/TP/trail were placed before the bot started tracking them
+                # so we don't know their clientAlgoIds. Binance keeps enforcing
+                # those exits; the bot just monitors PnL and lets the user
+                # /cancel manually if needed.
+                if item.get("adopted_orphan"):
+                    remaining_entries.append(item)
+                    continue
                 # Dust sweep: when TP1 + trail floor-round independently they can
                 # leave a sub-lot remainder (e.g. 12.7 entry / 50-50 split / 0.1
                 # step -> 6.3 + 6.3 = 12.6, 0.1 dust). Once the remainder falls
