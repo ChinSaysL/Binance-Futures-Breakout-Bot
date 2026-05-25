@@ -1327,6 +1327,54 @@ def _has_pending_trade_work(args: argparse.Namespace) -> bool:
     return bool(_load_pending_entry_plans(args.entry_state_file) or _load_pending_exit_plans(args.exit_state_file))
 
 
+def _pending_exit_is_zombie(
+    client: BinanceClient,
+    item: dict[str, object],
+    args: argparse.Namespace,
+) -> bool:
+    """Return True if this pending-exit item should be dropped: no live
+    position AND the entry order is no longer on Binance.
+
+    Two conditions both required so we don't accidentally drop a legitimate
+    deferred plan whose entry just hasn't filled yet:
+      1. The item is at least `entry_stale_minutes` old (default 30 min).
+      2. The entry order's clientOrderId is no longer in /openOrders for
+         the symbol.
+
+    The 30-min minimum prevents a transient API hiccup from dropping a
+    fresh entry. Past that, the order is either filled (in which case a
+    position should exist - but we already checked it doesn't) or gone
+    from the books entirely.
+    """
+    age_seconds = time.time() - _safe_float(item.get("created_at"))
+    threshold_min = _safe_float(getattr(args, "entry_stale_minutes", 30.0))
+    if threshold_min <= 0 or age_seconds < threshold_min * 60.0:
+        return False
+    symbol = str(item.get("symbol", ""))
+    entry_id = str(item.get("entry_client_order_id", ""))
+    if not symbol or not entry_id:
+        # Without an order id we can't safely confirm zombie state.
+        return age_seconds >= 2 * threshold_min * 60.0
+    try:
+        open_orders = client._signed_get(
+            "/openOrders", {"symbol": symbol, "recvWindow": args.recv_window}
+        )
+    except BinanceClientError:
+        return False  # transient API failure, leave alone
+    if not isinstance(open_orders, list):
+        return False
+    for o in open_orders:
+        if not isinstance(o, dict):
+            continue
+        # Match either of the order's own ids against what we placed.
+        if (
+            str(o.get("clientOrderId", "")) == entry_id
+            or str(o.get("origClientOrderId", "")) == entry_id
+        ):
+            return False  # entry order is still alive on Binance
+    return True
+
+
 def _detect_and_adopt_orphans(client: BinanceClient, args: argparse.Namespace) -> int:
     """Scan Binance for open positions that have no corresponding pending-entry
     record and adopt them so the bot is aware of them.
@@ -2472,6 +2520,17 @@ def manage_pending_exits(client: BinanceClient, args: argparse.Namespace) -> int
             hedge_mode = bool(item.get("hedge_mode", False))
             position = _account_position(account, symbol=symbol, side=side, hedge_mode=hedge_mode)
             if not position:
+                # Staleness check: a deferred exit plan with no live position
+                # AND no live entry order on Binance is a zombie - the entry
+                # order got cancelled / expired / rejected, but the local
+                # pending-exit record was never cleaned up. Without this
+                # check the bot reserves a concurrency slot for it forever.
+                if _pending_exit_is_zombie(client, item, args):
+                    print(
+                        f"{symbol}@{item.get('interval', '?')}: dropping stale pending-exit "
+                        f"(entry order no longer on Binance, no position)."
+                    )
+                    continue  # drop from pending_exits
                 waiting_exit_entry += 1
                 remaining_exits.append(item)
                 continue
