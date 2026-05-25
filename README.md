@@ -103,6 +103,7 @@ python -u .\breakout_detector.py `
   --manage-exits `
   --sizing-mode auto --leverage 10 `
   --max-concurrent-orders 2 `
+  --entry-mode STOP_MARKET `
   --skip-entry-regimes TRAILING_RETEST `
   --trailing-stop --adaptive-trailing-callback `
   --dynamic-sl --sl-update-interval-seconds 300 --sl-lookback 20 `
@@ -110,10 +111,10 @@ python -u .\breakout_detector.py `
   --stagnation-after-r 0.5 --stagnation-candles 12 `
   --max-sl-loss-pct 35 `
   --equity-peak-reset-pct 15 `
-  --scan-interval-minutes 3
+  --scan-interval-minutes 1
 ```
 
-**Why these exact flags** — they mirror the validated backtest defaults that produced the +19831% W3 result. The backtester skips `TRAILING_RETEST` by default. A 4-cell sweep then showed `--dynamic-sl` is a *marginal net positive* on top of the baseline (+0.3% sum equity, +0.004 worst-case R, slightly lower drawdown), so it's kept ON.
+**Why these exact flags** — they mirror the validated backtest defaults that produced the +19831% W3 result. The backtester skips `TRAILING_RETEST` by default. A 4-cell sweep showed `--dynamic-sl` is a *marginal net positive* on top of the baseline (+0.3% sum equity, +0.004 worst-case R, slightly lower drawdown), so it's kept ON. `--entry-mode STOP_MARKET` pre-places the entry order on Binance at the trigger price (instead of the default `SMART_RETEST` which polls and fires MARKET on detection) — the backtest's "+29086% W3" baseline assumes trigger-price fills, and `STOP_MARKET` is the only way to actually get them live. `--scan-interval-minutes 1` cuts fresh-signal detection latency 3× over the previous default of 3 min.
 
 **What's deliberately NOT in the recommended config:**
 
