@@ -389,10 +389,9 @@ def _register_telegram_commands(bot, args: argparse.Namespace, client: BinanceCl
                     client._signed_request("DELETE", "/allOpenOrders", {"symbol": target, "recvWindow": args.recv_window})
                 except BinanceClientError:
                     pass
+                _cancel_all_algo_orders_for_symbol(client, target, args)
                 # Drop from pending if present.
-                pending = _load_pending_entry_plans(args.entry_state_file)
-                kept = [it for it in pending if it.get("symbol") != target]
-                _write_pending_entry_plans(args.entry_state_file, kept)
+                _drop_symbol_from_pending_files(args, target)
                 return format_success(
                     "Position Closed",
                     "\n".join([
@@ -404,8 +403,15 @@ def _register_telegram_commands(bot, args: argparse.Namespace, client: BinanceCl
         # No open position - check pending file.
         pending = _load_pending_entry_plans(args.entry_state_file)
         match = next((it for it in pending if it.get("symbol") == target), None)
+        pending_exits = _load_pending_exit_plans(args.exit_state_file)
+        exit_match = next((it for it in pending_exits if it.get("symbol") == target), None)
         if not match:
-            return format_empty("Nothing To Cancel", f"No open position or pending entry for {fmt_code(target)}.")
+            if not exit_match:
+                return format_empty("Nothing To Cancel", f"No open position or pending entry for {fmt_code(target)}.")
+            _cancel_pending_exit_entry_order(client, exit_match, args)
+            kept_exits = [it for it in pending_exits if it.get("symbol") != target]
+            _write_pending_exit_plans(args.exit_state_file, kept_exits)
+            return format_success("Pending Entry Dropped", f"{fmt_code(target)} was removed from the queue.")
         # If it has an ENTRY_ORDER_PLACED, cancel the order on Binance too.
         if str(match.get("state", "")) == "ENTRY_ORDER_PLACED":
             cid = str(match.get("entry_client_order_id", ""))
@@ -418,6 +424,12 @@ def _register_telegram_commands(bot, args: argparse.Namespace, client: BinanceCl
                     pass
         kept = [it for it in pending if it.get("symbol") != target]
         _write_pending_entry_plans(args.entry_state_file, kept)
+        if exit_match:
+            _cancel_pending_exit_entry_order(client, exit_match, args)
+            _write_pending_exit_plans(
+                args.exit_state_file,
+                [it for it in pending_exits if it.get("symbol") != target],
+            )
         return format_success("Pending Entry Dropped", f"{fmt_code(target)} was removed from the queue.")
 
     def cmd_cancel_all(ctx: CommandContext, parts: list[str]) -> str:
@@ -445,8 +457,11 @@ def _register_telegram_commands(bot, args: argparse.Namespace, client: BinanceCl
                 client._signed_request("DELETE", "/allOpenOrders", {"symbol": sym, "recvWindow": args.recv_window})
             except BinanceClientError:
                 pass
+            _cancel_all_algo_orders_for_symbol(client, sym, args)
+        _cancel_all_pending_entry_orders(client, args)
         # Wipe the pending queue.
         _write_pending_entry_plans(args.entry_state_file, [])
+        _write_pending_exit_plans(args.exit_state_file, [])
         if closed:
             closed_list = ", ".join(closed)
             return format_warning(
@@ -1147,6 +1162,8 @@ def place_best_orders(
                 entry_plan=plan,
                 exit_plans=exit_plans,
                 args=args,
+                leverage=effective_leverage,
+                entry_regime=entry_regime,
             )
             for exit_plan in exit_plans:
                 results.append(_order_execution_from_plan(exit_plan, {"algoStatus": "DEFERRED_UNTIL_ENTRY_FILLS"}, mode, effective_margin, args, leverage=effective_leverage))
@@ -1327,6 +1344,47 @@ def _has_pending_trade_work(args: argparse.Namespace) -> bool:
     return bool(_load_pending_entry_plans(args.entry_state_file) or _load_pending_exit_plans(args.exit_state_file))
 
 
+def _drop_symbol_from_pending_files(args: argparse.Namespace, symbol: str) -> None:
+    pending = _load_pending_entry_plans(args.entry_state_file)
+    _write_pending_entry_plans(args.entry_state_file, [it for it in pending if it.get("symbol") != symbol])
+    pending_exits = _load_pending_exit_plans(args.exit_state_file)
+    _write_pending_exit_plans(args.exit_state_file, [it for it in pending_exits if it.get("symbol") != symbol])
+
+
+def _cancel_all_algo_orders_for_symbol(client: BinanceClient, symbol: str, args: argparse.Namespace) -> None:
+    try:
+        client.cancel_all_algo_orders(symbol, recv_window=args.recv_window)
+    except (AttributeError, BinanceClientError):
+        pass
+
+
+def _cancel_pending_exit_entry_order(
+    client: BinanceClient,
+    item: dict[str, object],
+    args: argparse.Namespace,
+) -> bool:
+    symbol = str(item.get("symbol", ""))
+    client_order_id = str(item.get("entry_client_order_id", ""))
+    if not symbol or not client_order_id:
+        return False
+    try:
+        client.cancel_algo_order(symbol, client_order_id, recv_window=args.recv_window)
+        return True
+    except BinanceClientError as exc:
+        msg = str(exc)
+        if "Unknown order" in msg or "Order does not exist" in msg or "-2011" in msg:
+            return True
+        return False
+
+
+def _cancel_all_pending_entry_orders(client: BinanceClient, args: argparse.Namespace) -> None:
+    for item in _load_pending_entry_plans(args.entry_state_file):
+        if str(item.get("state", "")) == "ENTRY_ORDER_PLACED":
+            _cancel_entry_order(client, item, args)
+    for item in _load_pending_exit_plans(args.exit_state_file):
+        _cancel_pending_exit_entry_order(client, item, args)
+
+
 def _pending_exit_is_zombie(
     client: BinanceClient,
     item: dict[str, object],
@@ -1372,6 +1430,19 @@ def _pending_exit_is_zombie(
             or str(o.get("origClientOrderId", "")) == entry_id
         ):
             return False  # entry order is still alive on Binance
+    try:
+        open_algos = client.open_algo_orders(symbol, recv_window=args.recv_window)
+    except (AttributeError, BinanceClientError):
+        return False  # algo status unknown; keep the deferred exit plan
+    for o in open_algos:
+        if not isinstance(o, dict):
+            continue
+        if (
+            str(o.get("clientAlgoId", "")) == entry_id
+            or str(o.get("clientOrderId", "")) == entry_id
+            or str(o.get("origClientOrderId", "")) == entry_id
+        ):
+            return False  # algo entry order is still alive on Binance
     return True
 
 
@@ -3520,6 +3591,8 @@ def _save_pending_exit_plans(
     entry_plan: ConditionalOrderPlan,
     exit_plans: list[ConditionalOrderPlan],
     args: argparse.Namespace,
+    leverage: int = 0,
+    entry_regime: str = "STOP_MARKET",
 ) -> None:
     pending = _load_pending_exit_plans(path)
     pending.append(
@@ -3529,7 +3602,31 @@ def _save_pending_exit_plans(
             "side": signal.side,
             "interval": signal.interval,
             "hedge_mode": args.hedge_mode,
+            "binance_side": entry_plan.binance_side,
+            "quantity": entry_plan.quantity,
+            "trigger_price": entry_plan.trigger_price,
+            "limit_price": entry_plan.limit_price,
             "entry_client_order_id": entry_plan.client_order_id,
+            "leverage": leverage or args.leverage,
+            "margin_type": args.margin_type or "",
+            "max_concurrent_orders": args.max_concurrent_orders,
+            "entry_regime": entry_regime,
+            "momentum_score": round(_momentum_score(signal), 4),
+            "ml_rank_score": round(_live_ml_rank_score(signal, args), 6) if getattr(args, "ml_rank_model_data", None) else 0.0,
+            "ml_rank_score_name": args.ml_rank_score if getattr(args, "ml_rank_model_data", None) else "",
+            "dynamic_sl": args.dynamic_sl,
+            "sl_update_interval_seconds": args.sl_update_interval_seconds,
+            "sl_lookback": args.sl_lookback,
+            "exhaustion_exit": args.exhaustion_exit,
+            "exhaustion_lookback": args.exhaustion_lookback,
+            "stagnation_after_r": args.stagnation_after_r,
+            "stagnation_candles": args.stagnation_candles,
+            "stagnation_lookback": args.stagnation_lookback,
+            "max_sl_loss_pct": args.max_sl_loss_pct,
+            "smart_tp": args.smart_tp,
+            "smart_tp_max_target_multiplier": args.smart_tp_max_target_multiplier,
+            "smart_tp_min_runner_pct": args.smart_tp_min_runner_pct,
+            "smart_tp_max_runner_pct": args.smart_tp_max_runner_pct,
             "exit_plans": _serialize_exit_plans(exit_plans),
         }
     )
@@ -4736,7 +4833,7 @@ def _maybe_reposition_sl(
     stop_buffer = args.stop_buffer_pct / 100
     max_loss_pct = _safe_float(item.get("max_sl_loss_pct")) or args.max_sl_loss_pct
     leverage = int(_safe_float(item.get("leverage")) or args.leverage or 1)
-    entry_ref = _safe_float(item.get("trigger_price"))
+    entry_ref = _safe_float(item.get("trigger_price")) or _safe_float(item.get("live_entry_price"))
 
     # Breakeven ratchet: once unrealized profit reaches breakeven_trigger_r x
     # initial_risk, pull the stop to entry + a tiny profit lock. Validated by a

@@ -163,6 +163,13 @@ class BinanceClient:
         payload["recvWindow"] = recv_window
         return self._signed_post("/algoOrder", payload)
 
+    def open_algo_orders(self, symbol: str | None = None, recv_window: int = 5000) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"recvWindow": recv_window}
+        if symbol:
+            params["symbol"] = symbol
+        payload = self._signed_get("/algoOpenOrders", params)
+        return payload if isinstance(payload, list) else []
+
     def cancel_algo_order(self, symbol: str, client_algo_id: str, recv_window: int = 5000) -> dict[str, Any]:
         return self._signed_request(
             "DELETE",
@@ -170,6 +177,16 @@ class BinanceClient:
             {
                 "symbol": symbol,
                 "clientAlgoId": client_algo_id,
+                "recvWindow": recv_window,
+            },
+        )
+
+    def cancel_all_algo_orders(self, symbol: str, recv_window: int = 5000) -> dict[str, Any]:
+        return self._signed_request(
+            "DELETE",
+            "/algoOpenOrders",
+            {
+                "symbol": symbol,
                 "recvWindow": recv_window,
             },
         )

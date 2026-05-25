@@ -104,6 +104,47 @@ class TelegramCommandTests(unittest.TestCase):
         self.assertTrue(bot.state["_stop_requested"])
         self.assertIn(42, bot.api.requested_offsets)
 
+    def test_cancel_command_drops_pending_exit_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = _command_args(directory)
+            args.exit_state_file.write_text(json.dumps([{
+                "symbol": "PHAUSDT",
+                "entry_client_order_id": "pha_entry",
+            }]), encoding="utf-8")
+            bot = TelegramBot("token", "123")
+            bot._min_send_interval = 0
+            bot.api = _FakeTelegramAPI([_message_update("/cancel PHAUSDT", chat_id="123")], chat_id="123")
+            client = _FakeClient()
+            cli._register_telegram_commands(bot, args, client)
+
+            handled = bot.poll_commands(CommandContext(args=args, client=client))
+
+        self.assertEqual(handled, 1)
+        self.assertFalse(args.exit_state_file.exists())
+        self.assertEqual(client.cancelled_algos, [("PHAUSDT", "pha_entry")])
+        self.assertIn("Pending Entry Dropped", bot.api.sent[0][0])
+
+    def test_cancel_all_clears_pending_exit_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = _command_args(directory)
+            args.entry_state_file.write_text(json.dumps([{"symbol": "TONUSDT"}]), encoding="utf-8")
+            args.exit_state_file.write_text(json.dumps([{
+                "symbol": "PHAUSDT",
+                "entry_client_order_id": "pha_entry",
+            }]), encoding="utf-8")
+            bot = TelegramBot("token", "123")
+            bot._min_send_interval = 0
+            bot.api = _FakeTelegramAPI([_message_update("/cancel_all", chat_id="123")], chat_id="123")
+            client = _FakeClient()
+            cli._register_telegram_commands(bot, args, client)
+
+            handled = bot.poll_commands(CommandContext(args=args, client=client))
+
+        self.assertEqual(handled, 1)
+        self.assertFalse(args.entry_state_file.exists())
+        self.assertFalse(args.exit_state_file.exists())
+        self.assertEqual(client.cancelled_algos, [("PHAUSDT", "pha_entry")])
+
     def test_trade_notifications_use_rich_layout(self):
         entry = format_entry_filled("BTCUSDT", "LONG", 100.0, 0.25, 95.0, 110.0)
         closed = format_position_closed("BTCUSDT", "LONG", "Take Profit", 110.0, 12.5, 5.2, 45)
@@ -158,6 +199,9 @@ class _FakeClient:
     def __init__(self, account: dict | None = None, marks: dict[str, float] | None = None) -> None:
         self._account = account or {"totalWalletBalance": "100", "positions": []}
         self._marks = marks or {}
+        self.orders: list[dict[str, str]] = []
+        self.cancelled_algos: list[tuple[str, str]] = []
+        self.signed_requests: list[tuple[str, str, dict[str, object]]] = []
 
     def account_info(self, recv_window: int = 5000):
         return self._account
@@ -167,6 +211,22 @@ class _FakeClient:
 
     def mark_price(self, symbol: str):
         return self._marks.get(symbol, 0.0)
+
+    def place_order(self, payload: dict[str, str], test: bool, recv_window: int = 5000):
+        self.orders.append(payload)
+        return {"status": "NEW"}
+
+    def cancel_algo_order(self, symbol: str, client_algo_id: str, recv_window: int = 5000):
+        self.cancelled_algos.append((symbol, client_algo_id))
+        return {"status": "CANCELED"}
+
+    def cancel_all_algo_orders(self, symbol: str, recv_window: int = 5000):
+        self.cancelled_algos.append((symbol, "*"))
+        return {"status": "CANCELED"}
+
+    def _signed_request(self, method: str, path: str, params: dict[str, object]):
+        self.signed_requests.append((method, path, dict(params)))
+        return {"status": "OK"}
 
 
 def _message_update(text: str, chat_id: str = "123", update_id: int = 1) -> dict:
@@ -184,6 +244,7 @@ def _command_args(directory: str) -> Namespace:
     return Namespace(
         recv_window=5000,
         entry_state_file=root / "entries.json",
+        exit_state_file=root / "exits.json",
         equity_peak_file=root / "equity_peak.json",
         max_concurrent_orders=2,
     )

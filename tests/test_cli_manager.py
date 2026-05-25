@@ -383,6 +383,67 @@ class SmartRetestManagerTests(unittest.TestCase):
         self.assertIn("<b>Symbol:</b> <code>TESTUSDT</code>", bot.sent[0])
         self.assertIn("<b>Side:</b> <b>LONG</b>", bot.sent[0])
 
+    def test_pending_exit_zombie_check_keeps_live_algo_entry(self):
+        args = _args(Path("entries.json"), Path("exits.json"))
+        item = {
+            "created_at": int(time.time() - 31 * 60),
+            "symbol": "TESTUSDT",
+            "entry_client_order_id": "test_entry",
+        }
+        client = _FakeClient(mark_price=100.0)
+        client.open_algo_orders_payload = [{"symbol": "TESTUSDT", "clientAlgoId": "test_entry"}]
+
+        self.assertFalse(cli._pending_exit_is_zombie(client, item, args))
+
+    def test_pending_exit_zombie_check_drops_when_regular_and_algo_orders_are_gone(self):
+        args = _args(Path("entries.json"), Path("exits.json"))
+        item = {
+            "created_at": int(time.time() - 31 * 60),
+            "symbol": "TESTUSDT",
+            "entry_client_order_id": "test_entry",
+        }
+        client = _FakeClient(mark_price=100.0)
+        client.open_algo_orders_payload = []
+
+        self.assertTrue(cli._pending_exit_is_zombie(client, item, args))
+
+    def test_saved_pending_exit_preserves_management_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            exit_file = Path(directory) / "exits.json"
+            signal = _breakout_signal()
+            rule = _rule_for(signal)
+            args = _rich_order_args(Path(directory) / "entries.json", exit_file)
+            entry_plan = build_entry_order_plan(
+                signal=signal,
+                rule=rule,
+                requested_notional=25,
+                client_order_id="test_entry",
+                working_type="MARK_PRICE",
+                price_protect=False,
+                hedge_mode=False,
+            )
+            exit_plans = []
+
+            cli._save_pending_exit_plans(
+                exit_file,
+                signal,
+                entry_plan,
+                exit_plans,
+                args,
+                leverage=13,
+                entry_regime="INSTANT",
+            )
+
+            saved = json.loads(exit_file.read_text(encoding="utf-8"))[0]
+
+        self.assertEqual(saved["entry_client_order_id"], "test_entry")
+        self.assertEqual(saved["leverage"], 13)
+        self.assertEqual(saved["entry_regime"], "INSTANT")
+        self.assertGreater(saved["momentum_score"], 0)
+        self.assertEqual(saved["trigger_price"], entry_plan.trigger_price)
+        self.assertTrue(saved["dynamic_sl"])
+        self.assertEqual(saved["max_sl_loss_pct"], 35.0)
+
 
 class DynamicLeverageTests(unittest.TestCase):
     def test_safety_cap_reduces_leverage_on_dangerously_wide_stop(self):
@@ -587,6 +648,7 @@ class _FakeClient:
         self.orders: list[dict[str, str]] = []
         self.algo_orders: list[dict[str, str]] = []
         self.cancelled_algos: list[tuple[str, str]] = []
+        self.open_algo_orders_payload: list[dict[str, str]] = []
 
     def account_info(self, recv_window: int = 5000):
         return self._account
@@ -618,6 +680,14 @@ class _FakeClient:
     def cancel_algo_order(self, symbol: str, client_algo_id: str, recv_window: int = 5000):
         self.cancelled_algos.append((symbol, client_algo_id))
         return {"status": "CANCELED"}
+
+    def open_algo_orders(self, symbol: str | None = None, recv_window: int = 5000):
+        return list(self.open_algo_orders_payload)
+
+    def _signed_get(self, path: str, params: dict[str, object]):
+        if path == "/openOrders":
+            return []
+        return {}
 
 
 class _RotationPrecheckClient:
@@ -798,6 +868,24 @@ def _scan_args(entry_file: Path, exit_file: Path) -> Namespace:
     args.order_count = 1
     args.interval = None
     args.timeframes = "15m"
+    return args
+
+
+def _rich_order_args(entry_file: Path, exit_file: Path) -> Namespace:
+    args = _scan_args(entry_file, exit_file)
+    args.margin_type = ""
+    args.ml_rank_score = "tail"
+    args.dynamic_sl = True
+    args.sl_update_interval_seconds = 300.0
+    args.sl_lookback = 20
+    args.exhaustion_lookback = 80
+    args.stagnation_lookback = 80
+    args.max_sl_loss_pct = 35.0
+    args.smart_tp = False
+    args.smart_tp_max_target_multiplier = 2.5
+    args.smart_tp_min_runner_pct = 20.0
+    args.smart_tp_max_runner_pct = 55.0
+    args.hedge_mode = False
     return args
 
 
