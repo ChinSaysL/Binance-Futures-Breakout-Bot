@@ -1989,7 +1989,24 @@ def _scan_and_arm(client: BinanceClient, args: argparse.Namespace, settings: Bre
             active_count = _active_position_count(pending, account, pending_exits)
 
     if cap > 0 and active_count >= cap:
-        _capacity_full_heartbeat(active_count, cap, len(fresh))
+        # Build a human-readable breakdown of what's occupying each slot.
+        slot_symbols: list[str] = []
+        for pos in account.get("positions", []) or []:
+            if isinstance(pos, dict) and abs(_safe_float(pos.get("positionAmt"))) > 0:
+                slot_symbols.append(f"{pos.get('symbol')} (open)")
+        live_symbols = {s.split()[0] for s in slot_symbols}
+        for it in pending:
+            sym = str(it.get("symbol", ""))
+            state = str(it.get("state", ""))
+            if sym and sym not in live_symbols and state in ("ENTRY_ORDER_PLACED", "MONITORING"):
+                slot_symbols.append(f"{sym} ({state.lower()})")
+                live_symbols.add(sym)
+        for it in pending_exits:
+            sym = str(it.get("symbol", ""))
+            if sym and sym not in live_symbols:
+                slot_symbols.append(f"{sym} (awaiting fill)")
+                live_symbols.add(sym)
+        _capacity_full_heartbeat(active_count, cap, len(fresh), slot_symbols)
         return
 
     room = _queue_room(pending, args, pending_exits)
@@ -2027,12 +2044,17 @@ def _quiet_scan_heartbeat() -> None:
     _LAST_QUIET_HEARTBEAT_TS = now
 
 
-def _capacity_full_heartbeat(active: int, cap: int, candidates: int) -> None:
+def _capacity_full_heartbeat(active: int, cap: int, candidates: int, slot_symbols: list[str] | None = None) -> None:
     """Print a low-rate notice when every concurrency slot is full.
 
     Without throttling this line spams the log every 1-3 minutes for as long
     as positions are open - which is most of the time on an active account.
     Heartbeat at the same one-per-hour rate as the quiet-scan notice.
+
+    slot_symbols (if provided) explains what's occupying each slot - live
+    positions, ENTRY_ORDER_PLACED orders, and STOP_MARKET orders awaiting
+    fill. This makes the count audit-able from the log without having to
+    run a separate diagnostic.
     """
     global _LAST_CAPACITY_FULL_TS
     now = time.time()
@@ -2040,8 +2062,11 @@ def _capacity_full_heartbeat(active: int, cap: int, candidates: int) -> None:
         return
     import datetime as _dt
     ts = _dt.datetime.now(_dt.timezone.utc).strftime("%H:%M UTC")
+    breakdown = ""
+    if slot_symbols:
+        breakdown = " [" + ", ".join(slot_symbols) + "]"
     print(
-        f"[{ts}] Auto-trader: capacity full ({active}/{cap}); "
+        f"[{ts}] Auto-trader: capacity full ({active}/{cap}){breakdown}; "
         f"{candidates} candidate(s) waiting; will arm on the next free slot."
     )
     _LAST_CAPACITY_FULL_TS = now
