@@ -11,8 +11,8 @@ from unittest.mock import patch
 
 import screener.cli as cli
 from screener.breakout import BreakoutSettings, BreakoutSignal
-from screener.cli import _dynamic_leverage, manage_pending_exits
-from screener.orders import TradingRule
+from screener.cli import _dynamic_leverage, _entry_trigger_crossed_reason, manage_pending_exits
+from screener.orders import TradingRule, build_entry_order_plan
 
 
 class SmartRetestManagerTests(unittest.TestCase):
@@ -211,6 +211,59 @@ class DynamicLeverageTests(unittest.TestCase):
             _dynamic_leverage(atr_pct=0.03, risk_pct=0.02, base=20, conviction=1.7),
             25,
         )
+
+
+class EntryTriggerGuardTests(unittest.TestCase):
+    def test_skips_stop_entry_when_live_mark_already_crossed_trigger(self):
+        signal = _breakout_signal()
+        rule = TradingRule(
+            symbol=signal.symbol,
+            price_tick_size=Decimal("0.00001"),
+            quantity_step_size=Decimal("0.1"),
+            min_qty=Decimal("0.1"),
+            max_qty=Decimal("0"),
+            min_notional=Decimal("5"),
+        )
+        plan = build_entry_order_plan(
+            signal=signal,
+            rule=rule,
+            requested_notional=25,
+            client_order_id="test_entry",
+            working_type="MARK_PRICE",
+            price_protect=False,
+            hedge_mode=False,
+        )
+        args = Namespace(live_orders=True, order_working_type="MARK_PRICE")
+
+        reason = _entry_trigger_crossed_reason(_FakeClient(mark_price=0.073), signal, plan, args)
+
+        self.assertIn("already crossed", reason)
+        self.assertIn("would immediately trigger", reason)
+
+    def test_allows_stop_entry_when_live_mark_has_not_crossed_trigger(self):
+        signal = _breakout_signal()
+        rule = TradingRule(
+            symbol=signal.symbol,
+            price_tick_size=Decimal("0.00001"),
+            quantity_step_size=Decimal("0.1"),
+            min_qty=Decimal("0.1"),
+            max_qty=Decimal("0"),
+            min_notional=Decimal("5"),
+        )
+        plan = build_entry_order_plan(
+            signal=signal,
+            rule=rule,
+            requested_notional=25,
+            client_order_id="test_entry",
+            working_type="MARK_PRICE",
+            price_protect=False,
+            hedge_mode=False,
+        )
+        args = Namespace(live_orders=True, order_working_type="MARK_PRICE")
+
+        reason = _entry_trigger_crossed_reason(_FakeClient(mark_price=0.071), signal, plan, args)
+
+        self.assertEqual(reason, "")
 
 
 class RotationPrecheckTests(unittest.TestCase):
