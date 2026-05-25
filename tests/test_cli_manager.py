@@ -12,7 +12,13 @@ from unittest.mock import patch
 import screener.cli as cli
 from screener.binance_client import BinanceClientError
 from screener.breakout import BreakoutSettings, BreakoutSignal
-from screener.cli import _dynamic_leverage, _nudge_crossed_entry_trigger, _submit_entry_order_plan, manage_pending_exits
+from screener.cli import (
+    _dynamic_leverage,
+    _nudge_crossed_entry_trigger,
+    _place_exit_plans_from_item,
+    _submit_entry_order_plan,
+    manage_pending_exits,
+)
 from screener.orders import TradingRule, build_entry_order_plan
 
 
@@ -168,6 +174,51 @@ class SmartRetestManagerTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertEqual(client.algo_orders[0]["callbackRate"], "9.8")
             self.assertNotIn("activatePrice", client.algo_orders[0])
+
+    def test_existing_close_position_stop_is_treated_as_protected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = _args(Path(directory) / "entries.json", Path(directory) / "exits.json")
+            item = {
+                "symbol": "TESTUSDT",
+                "exit_plans": [
+                    {
+                        "role": "STOP_LOSS",
+                        "client_order_id": "test_sl",
+                        "payload": {
+                            "algoType": "CONDITIONAL",
+                            "symbol": "TESTUSDT",
+                            "side": "SELL",
+                            "type": "STOP_MARKET",
+                            "triggerPrice": "95",
+                            "closePosition": "true",
+                            "clientAlgoId": "test_sl",
+                        },
+                    },
+                    {
+                        "role": "TAKE_PROFIT_1",
+                        "client_order_id": "test_tp",
+                        "payload": {
+                            "algoType": "CONDITIONAL",
+                            "symbol": "TESTUSDT",
+                            "side": "SELL",
+                            "type": "TAKE_PROFIT_MARKET",
+                            "quantity": "1",
+                            "triggerPrice": "105",
+                            "clientAlgoId": "test_tp",
+                        },
+                    },
+                ],
+            }
+            client = _DuplicateClosePositionStopClient()
+
+            placed, failed, failures = _place_exit_plans_from_item(client, item, args)
+
+        self.assertEqual(placed, 1)
+        self.assertFalse(failed)
+        self.assertEqual(failures, [])
+        self.assertTrue(item["sl_existing_close_position"])
+        self.assertEqual(item["placed_exit_client_order_ids"], ["test_sl", "test_tp"])
+        self.assertEqual(client.algo_orders[-1]["type"], "TAKE_PROFIT_MARKET")
 
 
 class DynamicLeverageTests(unittest.TestCase):
@@ -381,6 +432,20 @@ class _RetryImmediateTriggerClient:
         self.algo_orders.append(dict(payload))
         if len(self.algo_orders) == 1:
             raise BinanceClientError("Binance HTTP 400 for /algoOrder: Order would immediately trigger.")
+        return {"algoStatus": "NEW", "algoId": "456"}
+
+
+class _DuplicateClosePositionStopClient:
+    def __init__(self) -> None:
+        self.algo_orders: list[dict[str, str]] = []
+
+    def place_algo_order(self, payload: dict[str, str], recv_window: int = 5000):
+        self.algo_orders.append(dict(payload))
+        if payload.get("type") == "STOP_MARKET" and payload.get("closePosition") == "true":
+            raise BinanceClientError(
+                "Binance HTTP 400 for /algoOrder: "
+                "An open stop or take profit order with GTE and closePosition in the direction is existing."
+            )
         return {"algoStatus": "NEW", "algoId": "456"}
 
 

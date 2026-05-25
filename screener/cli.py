@@ -2348,6 +2348,13 @@ def _place_exit_plans_from_item(
             # SL has effectively already triggered - market-close the position
             # instead of leaving it unprotected while we retry indefinitely.
             exc_msg = str(exc)
+            if role == "STOP_LOSS" and _is_existing_close_position_stop_error(exc_msg):
+                if client_order_id:
+                    placed_id_set.add(client_order_id)
+                    placed_ids.append(client_order_id)
+                    item["placed_exit_client_order_ids"] = placed_ids
+                item["sl_existing_close_position"] = True
+                continue
             if role == "STOP_LOSS" and "would immediately trigger" in exc_msg.lower():
                 _emergency_close_position(
                     client, item, args,
@@ -2361,6 +2368,15 @@ def _place_exit_plans_from_item(
             failures.append(f"{symbol} {role}: {exc}")
             return placed, True, failures
     return placed, False, failures
+
+
+def _is_existing_close_position_stop_error(message: str) -> bool:
+    lower = message.lower()
+    return (
+        "closeposition" in lower
+        and "existing" in lower
+        and ("open stop" in lower or "take profit order" in lower)
+    )
 
 
 def _is_dust_position(
