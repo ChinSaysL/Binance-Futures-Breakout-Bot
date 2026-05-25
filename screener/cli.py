@@ -2440,6 +2440,7 @@ def manage_pending_exits(client: BinanceClient, args: argparse.Namespace) -> int
             failures.append(f"{symbol}@{item.get('interval', '')}: unknown pending entry state {state}")
             remaining_entries.append(item)
 
+        promoted_entries: list[dict[str, object]] = []
         for item in pending_exits:
             symbol = str(item.get("symbol", ""))
             side = str(item.get("side", ""))
@@ -2457,6 +2458,59 @@ def manage_pending_exits(client: BinanceClient, args: argparse.Namespace) -> int
             failures.extend(item_failures)
             if item_failed:
                 remaining_exits.append(item)
+                continue
+            # Promote the pending-exit item to a real MONITORING entry in
+            # pending_entries. Without this, STOP_MARKET / RETEST_LIMIT fills
+            # are tracked NOWHERE in pending_entries after their deferred
+            # exits attach - which makes them invisible to monitoring code
+            # paths (stagnation, breakeven, dynamic-SL, dust-sweep, position-
+            # close detection) AND triggers the orphan-adoption false
+            # positive next tick.
+            existing_match = next(
+                (
+                    existing for existing in remaining_entries
+                    if str(existing.get("symbol", "")) == symbol
+                    and str(existing.get("side", "")) == side
+                ),
+                None,
+            )
+            promoted = dict(item)
+            promoted["state"] = "MONITORING"
+            promoted["entry_filled_at"] = (
+                _safe_float(promoted.get("entry_filled_at")) or time.time()
+            )
+            promoted["live_entry_price"] = _safe_float(position.get("entryPrice"))
+            promoted["live_initial_stop"] = (
+                promoted.get("live_initial_stop") or _initial_stop_from_item(promoted)
+            )
+            promoted.setdefault("entry_regime", "STOP_MARKET")
+            promoted.setdefault("momentum_score", 0.0)
+            promoted.setdefault("last_sl_update", 0.0)
+            # adopted_orphan flag is cleared - the bot has the proper exit
+            # plans now and should manage normally.
+            promoted.pop("adopted_orphan", None)
+            promoted.pop("adopted_at", None)
+            if existing_match is not None:
+                # Replace the stale tracking entry (probably an adopted_orphan
+                # placeholder) with the properly-promoted record so the bot
+                # has the exit_plans + client_order_ids it needs.
+                idx = remaining_entries.index(existing_match)
+                was_adopted = bool(existing_match.get("adopted_orphan"))
+                remaining_entries[idx] = promoted
+                if was_adopted:
+                    print(
+                        f"{symbol}@{promoted.get('interval', '?')}: upgraded adopted_orphan to "
+                        f"fully-managed MONITORING (exits attached)."
+                    )
+            else:
+                promoted_entries.append(promoted)
+        if promoted_entries:
+            remaining_entries.extend(promoted_entries)
+            for pe in promoted_entries:
+                print(
+                    f"{pe.get('symbol')}@{pe.get('interval', '?')}: STOP_MARKET fill promoted to MONITORING; "
+                    f"exits attached, bot now manages."
+                )
 
         # OCO: once one side of a bracket has entered, drop the un-triggered opposite side.
         if committed_brackets:
