@@ -623,9 +623,9 @@ def _rule_for(signal: BreakoutSignal) -> TradingRule:
     )
 
 
-def _breakout_signal() -> BreakoutSignal:
+def _breakout_signal(symbol: str = "NILUSDT") -> BreakoutSignal:
     return BreakoutSignal(
-        symbol="NILUSDT",
+        symbol=symbol,
         interval="15m",
         side="LONG",
         status="BREAKOUT",
@@ -716,6 +716,21 @@ def _args(entry_file: Path, exit_file: Path) -> Namespace:
         stagnation_after_r=0.0,
         stagnation_candles=0,
     )
+
+
+def _scan_args(entry_file: Path, exit_file: Path) -> Namespace:
+    args = _args(entry_file, exit_file)
+    args.live_orders = True
+    args.queue_size = 8
+    args.max_concurrent_orders = 2
+    args.ml_context_file = Path(entry_file.parent) / "ml_context.json"
+    args.ml_rank_model_data = None
+    args.min_rr = 1.2
+    args.min_score = 0.0
+    args.order_count = 1
+    args.interval = None
+    args.timeframes = "15m"
+    return args
 
 
 def _quiet_manage(client: _FakeClient, args: Namespace) -> int:
