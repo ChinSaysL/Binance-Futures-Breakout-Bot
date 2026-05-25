@@ -1344,7 +1344,17 @@ def _detect_and_adopt_orphans(client: BinanceClient, args: argparse.Namespace) -
         return 0
 
     pending = _load_pending_entry_plans(args.entry_state_file)
+    pending_exits = _load_pending_exit_plans(args.exit_state_file)
+    # IMPORTANT: STOP_MARKET / RETEST_LIMIT entries save their deferred exit
+    # plans into the pending-exits file, not the pending-entries file. A
+    # position that JUST filled from a STOP_MARKET order will show up on
+    # Binance before the bot's manage loop has time to promote it to a
+    # MONITORING entry. If we only check pending_entries, those freshly-
+    # filled positions get falsely flagged as orphans. Track BOTH files.
     tracked = {str(it.get("symbol", "")) for it in pending if str(it.get("symbol", ""))}
+    tracked.update(
+        str(it.get("symbol", "")) for it in pending_exits if str(it.get("symbol", ""))
+    )
 
     new_adopted: list[dict[str, object]] = []
     for pos in account.get("positions", []) or []:
