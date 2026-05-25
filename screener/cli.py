@@ -1872,11 +1872,6 @@ def _scan_and_arm(client: BinanceClient, args: argparse.Namespace, settings: Bre
         print(f"Auto-trader scan: watch queue full ({args.queue_size}); {len(fresh)} candidate(s) waiting.")
         return
 
-    # Reserve the last queue slot if no fresh candidate is a loaded coil ready to fire.
-    if room == 1 and fresh and not _is_high_conviction(fresh[0]):
-        print("Auto-trader scan: holding the last queue slot open for a high-conviction breakout.")
-        return
-
     args.order_count = room
     results, order_failures = place_best_orders(client, signals, args, settings, account=account)
     armed = sum(1 for result in results if result.role == "ENTRY")
