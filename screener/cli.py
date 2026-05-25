@@ -1071,10 +1071,6 @@ def place_best_orders(
             if args.live_orders and args.entry_mode == "SMART_RETEST":
                 response = {"algoStatus": "WAIT_BREAKOUT"}
             else:
-                crossed_reason = _entry_trigger_crossed_reason(client, signal, plan, args)
-                if crossed_reason:
-                    failures.append(crossed_reason)
-                    continue
                 response = _submit_order_plan(client, plan.payload, args)
         except (BinanceClientError, OrderPlanError) as exc:
             failures.append(f"{signal.symbol}@{signal.interval}: {exc}")
@@ -1245,32 +1241,6 @@ def _submit_order_plan(client: BinanceClient, payload: dict[str, str], args: arg
     if args.live_orders:
         return client.place_algo_order(payload, recv_window=args.recv_window)
     return {"algoStatus": "LOCAL_VALIDATED"}
-
-
-def _entry_trigger_crossed_reason(
-    client: BinanceClient,
-    signal: BreakoutSignal,
-    plan: ConditionalOrderPlan,
-    args: argparse.Namespace,
-) -> str:
-    if not args.live_orders or plan.role != "ENTRY" or plan.order_type not in {"STOP_MARKET", "STOP_LIMIT"}:
-        return ""
-    if str(getattr(args, "order_working_type", "MARK_PRICE")).upper() != "MARK_PRICE":
-        return ""
-    try:
-        mark = client.mark_price(signal.symbol)
-    except BinanceClientError:
-        return ""
-    trigger = _safe_float(plan.trigger_price)
-    if mark <= 0 or trigger <= 0:
-        return ""
-    crossed = (signal.side == "LONG" and mark >= trigger) or (signal.side == "SHORT" and mark <= trigger)
-    if not crossed:
-        return ""
-    return (
-        f"{signal.symbol}@{signal.interval}: skipped, live mark {mark:g} already crossed "
-        f"{plan.order_type} trigger {trigger:g}; Binance would immediately trigger it"
-    )
 
 
 def _should_auto_manage_exits(args: argparse.Namespace) -> bool:
