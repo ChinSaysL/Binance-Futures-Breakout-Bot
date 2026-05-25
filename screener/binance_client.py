@@ -150,13 +150,86 @@ class BinanceClient:
         return prices
 
     def account_info(self, recv_window: int = 5000) -> dict[str, Any]:
-        return self._signed_get("/fapi/v3/account", {"recvWindow": recv_window})
+        payload = self._signed_get("/fapi/v3/account", {"recvWindow": recv_window})
+        self._enrich_account_positions(payload, recv_window=recv_window)
+        return payload
+
+    def position_risk(self, symbol: str | None = None, recv_window: int = 5000) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"recvWindow": recv_window}
+        if symbol:
+            params["symbol"] = symbol
+        try:
+            payload = self._signed_get("/fapi/v3/positionRisk", params)
+        except BinanceClientError:
+            payload = self._signed_get("/fapi/v2/positionRisk", params)
+        return payload if isinstance(payload, list) else []
 
     def place_order(self, params: dict[str, Any], test: bool, recv_window: int = 5000) -> dict[str, Any]:
         path = "/order/test" if test else "/order"
         payload = dict(params)
         payload["recvWindow"] = recv_window
         return self._signed_post(path, payload)
+
+    def _enrich_account_positions(self, account: dict[str, Any], recv_window: int = 5000) -> None:
+        positions = account.get("positions")
+        if not isinstance(positions, list):
+            return
+        needs_risk = False
+        for position in positions:
+            if not isinstance(position, dict):
+                continue
+            amount = _as_float(position.get("positionAmt"))
+            if abs(amount) <= 0:
+                continue
+            if (
+                _as_float(position.get("entryPrice")) <= 0
+                or _as_float(position.get("breakEvenPrice")) <= 0
+                or _as_float(position.get("leverage")) <= 0
+            ):
+                needs_risk = True
+                break
+        if not needs_risk:
+            return
+        try:
+            risk_positions = self.position_risk(recv_window=recv_window)
+        except BinanceClientError:
+            return
+        risk_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        risk_by_symbol: dict[str, dict[str, Any]] = {}
+        for risk in risk_positions:
+            if not isinstance(risk, dict):
+                continue
+            symbol = str(risk.get("symbol", ""))
+            if not symbol:
+                continue
+            side = str(risk.get("positionSide", "BOTH"))
+            risk_by_key[(symbol, side)] = risk
+            if abs(_as_float(risk.get("positionAmt"))) > 0:
+                risk_by_symbol[symbol] = risk
+        for position in positions:
+            if not isinstance(position, dict):
+                continue
+            symbol = str(position.get("symbol", ""))
+            if not symbol or abs(_as_float(position.get("positionAmt"))) <= 0:
+                continue
+            side = str(position.get("positionSide", "BOTH"))
+            risk = risk_by_key.get((symbol, side)) or risk_by_symbol.get(symbol)
+            if not risk:
+                continue
+            for key in (
+                "entryPrice",
+                "breakEvenPrice",
+                "leverage",
+                "markPrice",
+                "unRealizedProfit",
+                "unrealizedProfit",
+                "liquidationPrice",
+                "marginType",
+                "isolatedMargin",
+            ):
+                value = risk.get(key)
+                if value is not None and value != "":
+                    position[key] = value
 
     def place_algo_order(self, params: dict[str, Any], recv_window: int = 5000) -> dict[str, Any]:
         payload = dict(params)

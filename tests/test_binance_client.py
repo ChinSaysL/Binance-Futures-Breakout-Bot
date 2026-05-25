@@ -1,6 +1,6 @@
 import unittest
 
-from screener.binance_client import discover_symbols, filter_by_open_interest, filter_by_order_book, order_book_metrics
+from screener.binance_client import BinanceClient, discover_symbols, filter_by_open_interest, filter_by_order_book, order_book_metrics
 
 
 class DiscoverSymbolsTests(unittest.TestCase):
@@ -82,6 +82,18 @@ class DiscoverSymbolsTests(unittest.TestCase):
         self.assertEqual(filtered.symbols[0].open_interest_notional, 10_200_000)
         self.assertEqual(filtered.stats.filtered_low_open_interest, 3)
 
+    def test_account_info_enriches_null_position_fields_from_position_risk(self):
+        client = EnrichingClient()
+
+        account = client.account_info()
+        position = account["positions"][0]
+
+        self.assertEqual(position["entryPrice"], "0.321")
+        self.assertEqual(position["breakEvenPrice"], "0.3215")
+        self.assertEqual(position["leverage"], "10")
+        self.assertEqual(position["markPrice"], "0.323")
+        self.assertIn("/fapi/v3/positionRisk", client.paths)
+
 
 class FakeClient:
     market = "futures"
@@ -135,6 +147,39 @@ class FakeClient:
             "FLATUSDT": 1_000,
         }
         return {"openInterest": str(values[symbol])}
+
+
+class EnrichingClient(BinanceClient):
+    def __init__(self):
+        super().__init__(api_key="key", api_secret="secret")
+        self.paths: list[str] = []
+
+    def _signed_get(self, path, params):
+        self.paths.append(path)
+        if path == "/fapi/v3/account":
+            return {
+                "positions": [{
+                    "symbol": "WLDUSDT",
+                    "positionAmt": "377",
+                    "positionSide": "BOTH",
+                    "entryPrice": None,
+                    "breakEvenPrice": None,
+                    "leverage": None,
+                    "unrealizedProfit": "0.8294",
+                }]
+            }
+        if path == "/fapi/v3/positionRisk":
+            return [{
+                "symbol": "WLDUSDT",
+                "positionAmt": "377",
+                "positionSide": "BOTH",
+                "entryPrice": "0.321",
+                "breakEvenPrice": "0.3215",
+                "leverage": "10",
+                "markPrice": "0.323",
+                "unRealizedProfit": "0.8294",
+            }]
+        raise AssertionError(path)
 
 
 def _symbol(symbol):
