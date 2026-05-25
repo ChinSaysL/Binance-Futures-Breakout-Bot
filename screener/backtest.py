@@ -215,6 +215,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--trailing-callback-pct", type=float, default=1.2, help="Trailing-stop callback percent.")
     parser.add_argument("--adaptive-trailing-callback", action="store_true", help="Scale the trailing-stop callback by the signal's ATR%% instead of using a fixed --trailing-callback-pct. Tight-ATR coins get a tighter trail; volatile coins get more breathing room. Backtested against fixed 1.2%% baseline.")
     parser.add_argument("--adaptive-trailing-callback-multiplier", type=float, default=0.3, help="When --adaptive-trailing-callback is set: callback = clamp(atr_pct * multiplier, 0.5%%, 5.0%%). Default 0.3 was the worst-case-best in a 3-window sweep (+46%% sum, +33%% worst-R over fixed 1.2%%).")
+    parser.add_argument("--instant-max-deviation-pct", type=float, default=5.0, help="Skip INSTANT-regime signals where the current close has moved more than this percent past the trigger - models the live deviation cap that filters late-chase entries. Default 5.0 matches the previous live constant; tighter values (2-3%%) filter more late chases.")
+    parser.add_argument("--instant-entry-slippage-pct", type=float, default=0.0, help="Models live chase slippage on INSTANT entries: the fill happens at entry_price * (1 + slippage_pct/100) for LONGs (mirror for SHORTs). Backtest is otherwise 'perfect' at trigger; in live the bot scans every 3min and fills MARKET at current mark, which is usually 0.5-2%% past trigger. Default 0 = no slippage (legacy backtest).")
+    parser.add_argument("--instant-max-sl-loss-pct", type=float, default=0.0, help="Override --max-sl-loss-pct for INSTANT regime only. Tighter SL on chase entries limits drawdown when the post-impulse retrace overshoots. 0 = inherit --max-sl-loss-pct (no INSTANT-specific tightening).")
     parser.add_argument("--trail-activation-r", type=float, default=0.0, help="Gate the trailing stop behind this R-multiple of unrealized profit. 0 = trail is live the moment the position fills (current behaviour). 0.5 = trail only starts tracking once the trade reaches +0.5R. Prevents wick-out losses on entry pullbacks at the cost of letting losing trades fall further before the trail catches them.")
     parser.add_argument("--runner-pct", type=float, default=50.0, help="Percent of position left for the trailing runner when --trailing-stop is used.")
     parser.add_argument("--smart-tp", action="store_true", help="Adapt the target, TP splits, and runner size from each signal's conviction.")
@@ -1041,6 +1044,20 @@ def _backtest_symbol(
         ):
             index += 1
             continue
+        # Live-parity deviation cap on INSTANT entries: when the signal close
+        # is already too far past the trigger, skip - the live bot's deviation
+        # check would have abandoned this trade at scan time. Without this
+        # model the backtest enters at trigger price (perfect fill) but live
+        # would fill at the runaway mark price several percent worse.
+        if regime == "INSTANT" and getattr(args, "instant_max_deviation_pct", 0.0) > 0:
+            sig_close = window[-1].close
+            if signal.side == "LONG":
+                deviation = (sig_close - signal.trigger_price) / signal.trigger_price if signal.trigger_price > 0 else 0.0
+            else:
+                deviation = (signal.trigger_price - sig_close) / signal.trigger_price if signal.trigger_price > 0 else 0.0
+            if deviation > args.instant_max_deviation_pct / 100.0:
+                index += 1
+                continue
         context_features = _signal_context_features(window, market_trend, args, symbol_r_history)
         ml_scores = _ml_scores_signal(
             signal,
@@ -1266,12 +1283,25 @@ def _simulate_trade(
     if resolved is None:
         return None
     entry, triggered_index = resolved
+    # INSTANT entry slippage model: live's market-fill catches up to mark
+    # which is typically 0.5-2% past the trigger. Backtest entry is "perfect"
+    # at trigger or candle-open; bump it by --instant-entry-slippage-pct to
+    # simulate what the live bot would actually fill at.
+    if regime == "INSTANT" and getattr(args, "instant_entry_slippage_pct", 0.0) > 0:
+        slip = args.instant_entry_slippage_pct / 100.0
+        entry = entry * (1.0 + slip) if side == "LONG" else entry * (1.0 - slip)
     if (side == "LONG" and stop >= entry) or (side == "SHORT" and stop <= entry):
         return None
     trigger_candle = candles[triggered_index]
 
     leverage = _dynamic_leverage(signal.atr_pct, signal.risk_pct, args.leverage, conviction=_momentum_score(signal)) if args.dynamic_leverage else args.leverage
-    stop = _leverage_capped_stop(side, entry, stop, int(leverage), args.max_sl_loss_pct)
+    # INSTANT-specific SL cap: chase entries get a tighter loss limit because
+    # the entry is already late and a wide stop just bleeds longer when the
+    # impulse retraces.
+    sl_cap = args.max_sl_loss_pct
+    if regime == "INSTANT" and getattr(args, "instant_max_sl_loss_pct", 0.0) > 0:
+        sl_cap = args.instant_max_sl_loss_pct
+    stop = _leverage_capped_stop(side, entry, stop, int(leverage), sl_cap)
     profile = (
         smart_take_profit_profile(
             signal,

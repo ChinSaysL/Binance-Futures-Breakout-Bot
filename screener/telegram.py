@@ -160,10 +160,10 @@ class TelegramBot:
         self._commands[command.lower()] = handler
 
     def prepare_for_polling(self) -> bool:
-        """Make long-polling usable even if a webhook was configured earlier."""
+        """Make long-polling usable and discard stale offline commands."""
         if not self.enabled:
             return False
-        return self.api.delete_webhook(drop_pending_updates=False)
+        return self.api.delete_webhook(drop_pending_updates=True)
 
     def set_commands(self, commands: list[dict[str, str]]) -> bool:
         if not self.enabled:
@@ -231,6 +231,16 @@ class TelegramBot:
                 self.send(reply)
             handled += 1
         return handled
+
+    def acknowledge_processed_updates(self) -> None:
+        """Confirm already-handled updates with Telegram.
+
+        Telegram only marks an update as consumed after a getUpdates call with
+        an offset greater than that update_id. /stop exits the process before
+        the next normal poll, so confirm the advanced offset before shutdown.
+        """
+        if self.enabled and self._next_offset > 0:
+            self.api.get_updates(self._next_offset, long_poll_timeout=0)
 
     # ---- shared state helpers ----
 

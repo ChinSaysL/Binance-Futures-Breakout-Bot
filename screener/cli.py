@@ -1805,6 +1805,7 @@ def run_auto_trader(client: BinanceClient, args: argparse.Namespace, settings: B
             except Exception as exc:  # noqa: BLE001 - never crash the trader on a TG hiccup
                 print(f"Telegram poll failed: {exc}")
             if tg_bot.state.get("_stop_requested"):
+                tg_bot.acknowledge_processed_updates()
                 print("Telegram /stop received. Exiting.")
                 return 0
 

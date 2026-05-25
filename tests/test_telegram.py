@@ -24,7 +24,7 @@ class TelegramCommandTests(unittest.TestCase):
 
         self.assertTrue(bot.enabled)
         self.assertEqual(post.call_args_list[0].args[0], "deleteWebhook")
-        self.assertEqual(post.call_args_list[0].args[1], {"drop_pending_updates": "false"})
+        self.assertEqual(post.call_args_list[0].args[1], {"drop_pending_updates": "true"})
         methods = [call.args[0] for call in post.call_args_list]
         self.assertIn("setMyCommands", methods)
         self.assertIn("sendMessage", methods)
@@ -89,6 +89,21 @@ class TelegramCommandTests(unittest.TestCase):
         self.assertTrue(sent)
         self.assertEqual([call[1] for call in bot.api.sent], ["HTML", ""])
 
+    def test_stop_update_can_be_acknowledged_before_shutdown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = _command_args(directory)
+            bot = TelegramBot("token", "123")
+            bot._min_send_interval = 0
+            bot.api = _FakeTelegramAPI([_message_update("/stop", chat_id="123", update_id=41)], chat_id="123")
+            cli._register_telegram_commands(bot, args, _FakeClient())
+
+            handled = bot.poll_commands(CommandContext(args=args, client=_FakeClient()))
+            bot.acknowledge_processed_updates()
+
+        self.assertEqual(handled, 1)
+        self.assertTrue(bot.state["_stop_requested"])
+        self.assertIn(42, bot.api.requested_offsets)
+
     def test_trade_notifications_use_rich_layout(self):
         entry = format_entry_filled("BTCUSDT", "LONG", 100.0, 0.25, 95.0, 110.0)
         closed = format_position_closed("BTCUSDT", "LONG", "Take Profit", 110.0, 12.5, 5.2, 45)
@@ -110,8 +125,10 @@ class _FakeTelegramAPI:
         self.last_error = ""
         self.sent: list[tuple[str, str]] = []
         self.deleted_webhooks: list[bool] = []
+        self.requested_offsets: list[int] = []
 
     def get_updates(self, offset: int, long_poll_timeout: int = 0) -> list[dict]:
+        self.requested_offsets.append(offset)
         updates = [update for update in self._updates if int(update["update_id"]) >= offset]
         self._updates = []
         return updates
