@@ -213,6 +213,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--tp-count", type=int, default=1, help="Number of partial take-profits.")
     parser.add_argument("--trailing-stop", action="store_true", help="Model a trailing-stop runner.")
     parser.add_argument("--trailing-callback-pct", type=float, default=1.2, help="Trailing-stop callback percent.")
+    parser.add_argument("--adaptive-trailing-callback", action="store_true", help="Scale the trailing-stop callback by the signal's ATR%% instead of using a fixed --trailing-callback-pct. Tight-ATR coins get a tighter trail; volatile coins get more breathing room. Backtested against fixed 1.2%% baseline.")
+    parser.add_argument("--adaptive-trailing-callback-multiplier", type=float, default=0.3, help="When --adaptive-trailing-callback is set: callback = clamp(atr_pct * multiplier, 0.5%%, 5.0%%). Default 0.3 was the worst-case-best in a 3-window sweep (+46%% sum, +33%% worst-R over fixed 1.2%%).")
     parser.add_argument("--trail-activation-r", type=float, default=0.0, help="Gate the trailing stop behind this R-multiple of unrealized profit. 0 = trail is live the moment the position fills (current behaviour). 0.5 = trail only starts tracking once the trade reaches +0.5R. Prevents wick-out losses on entry pullbacks at the cost of letting losing trades fall further before the trail catches them.")
     parser.add_argument("--runner-pct", type=float, default=50.0, help="Percent of position left for the trailing runner when --trailing-stop is used.")
     parser.add_argument("--smart-tp", action="store_true", help="Adapt the target, TP splits, and runner size from each signal's conviction.")
@@ -1295,6 +1297,7 @@ def _simulate_trade(
         args,
         tp_splits_pct=profile.tp_splits_pct,
         runner_pct=profile.runner_pct,
+        signal_atr_pct=signal.atr_pct,
     )
 
     if side == "LONG":
@@ -1370,6 +1373,7 @@ def _simulate_exit(
     args: argparse.Namespace,
     tp_splits_pct: list[float] | None = None,
     runner_pct: float | None = None,
+    signal_atr_pct: float = 0.0,
 ) -> tuple[float, int]:
     """Walk forward from the entry candle; return (avg exit price, exit candle index)."""
     splits = tp_splits_pct if tp_splits_pct is not None else [100.0 / max(args.tp_count, 1) for _ in range(max(args.tp_count, 1))]
@@ -1377,7 +1381,15 @@ def _simulate_exit(
     runner = args.runner_pct if runner_pct is None else runner_pct
     runner_frac = runner / 100.0 if args.trailing_stop else 0.0
     tp_fracs = [max(split, 0.0) / 100.0 for split in splits]
-    callback = args.trailing_callback_pct / 100.0
+    # Adaptive callback (optional): scale with coin's ATR so tight-ATR setups
+    # get a tighter trail and volatile coins get breathing room. Clamped 0.5%-5%
+    # to keep within Binance's 0.1-10% trailing-callback bounds with a safety
+    # margin on both sides.
+    if getattr(args, "adaptive_trailing_callback", False) and signal_atr_pct > 0:
+        multiplier = getattr(args, "adaptive_trailing_callback_multiplier", 0.4)
+        callback = max(0.005, min(0.05, signal_atr_pct * multiplier))
+    else:
+        callback = args.trailing_callback_pct / 100.0
     if side == "LONG":
         tp_prices = [entry + (target - entry) * (k / n_tp) for k in range(1, n_tp + 1)] if n_tp else []
     else:

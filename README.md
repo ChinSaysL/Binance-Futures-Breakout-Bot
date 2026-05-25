@@ -104,7 +104,7 @@ python -u .\breakout_detector.py `
   --sizing-mode auto --leverage 10 `
   --max-concurrent-orders 2 `
   --skip-entry-regimes TRAILING_RETEST `
-  --trailing-stop `
+  --trailing-stop --adaptive-trailing-callback `
   --dynamic-sl --sl-update-interval-seconds 300 --sl-lookback 20 `
   --breakeven-trigger-r 1.5 --breakeven-offset-pct 0.1 `
   --stagnation-after-r 0.5 --stagnation-candles 12 `

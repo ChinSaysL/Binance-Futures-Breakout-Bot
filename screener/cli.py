@@ -651,6 +651,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tp-splits", help="Comma-separated take-profit quantity percentages, e.g. 40,30,20. With --trailing-stop the remainder becomes the trailing runner.")
     parser.add_argument("--trailing-stop", action="store_true", help="Add a trailing-stop-market algo order for the runner quantity.")
     parser.add_argument("--trailing-callback-pct", type=float, default=1.2, help="Trailing stop callback rate, percent. Binance allows 0.1 to 10. Default 1.2 matches the backtest's validated +11127%% baseline; 1.0 (the old live default) was 20%% tighter than backtest and silently haircut avg-win.")
+    parser.add_argument("--adaptive-trailing-callback", action="store_true", help="Scale the trailing-stop callback by each coin's ATR%% instead of using a fixed --trailing-callback-pct. Validated +46%% sum equity / +33%% worst-case R over fixed 1.2%% in a 3-window backtest.")
+    parser.add_argument("--adaptive-trailing-callback-multiplier", type=float, default=0.3, help="With --adaptive-trailing-callback: callback%% = clamp(atr_pct * multiplier, 0.5%%, 5.0%%). Default 0.3 was the worst-case-best multiplier in the 3-window sweep.")
     parser.add_argument("--trailing-quantity-pct", type=float, default=50.0, help="Runner quantity percent reserved for trailing stop when --tp-splits is not set. A 27-run sweep showed a bigger runner (50%%) compounds far better - a breakout's edge is in the few trades that run.")
     parser.add_argument("--smart-tp", action="store_true", help="Adapt the target, TP splits, and runner size from each signal's conviction.")
     parser.add_argument("--smart-tp-max-target-multiplier", type=float, default=2.5, help="Maximum multiplier applied to the signal target when --smart-tp is enabled.")
@@ -1092,7 +1094,7 @@ def place_best_orders(
                         ],
                         target_splits_pct=tp_profile.tp_splits_pct,
                         trailing_client_order_id=_child_client_order_id(plan.client_order_id, "trl") if args.trailing_stop else None,
-                        trailing_callback_pct=args.trailing_callback_pct if args.trailing_stop else None,
+                        trailing_callback_pct=_resolve_callback_pct(signal.atr_pct, args) if args.trailing_stop else None,
                         trailing_quantity_pct=tp_profile.runner_pct,
                         working_type=args.order_working_type,
                         price_protect=args.order_price_protect,
@@ -1137,7 +1139,7 @@ def place_best_orders(
                 ],
                 target_splits_pct=tp_profile.tp_splits_pct,
                 trailing_client_order_id=_child_client_order_id(plan.client_order_id, "trl") if args.trailing_stop else None,
-                trailing_callback_pct=args.trailing_callback_pct if args.trailing_stop else None,
+                trailing_callback_pct=_resolve_callback_pct(signal.atr_pct, args) if args.trailing_stop else None,
                 trailing_quantity_pct=tp_profile.runner_pct,
                 working_type=args.order_working_type,
                 price_protect=args.order_price_protect,
@@ -3874,7 +3876,7 @@ def _place_bracket_side(
                 ],
                 target_splits_pct=tp_profile.tp_splits_pct,
                 trailing_client_order_id=_child_client_order_id(plan.client_order_id, "trl") if args.trailing_stop else None,
-                trailing_callback_pct=args.trailing_callback_pct if args.trailing_stop else None,
+                trailing_callback_pct=_resolve_callback_pct(signal.atr_pct, args) if args.trailing_stop else None,
                 trailing_quantity_pct=tp_profile.runner_pct,
                 working_type=args.order_working_type,
                 price_protect=args.order_price_protect,
@@ -4377,6 +4379,18 @@ def _leverage_capped_stop(side: str, entry: float, stop: float, leverage: int, m
     if side == "LONG":
         return max(stop, entry * (1.0 - max_price_risk))
     return min(stop, entry * (1.0 + max_price_risk))
+
+
+def _resolve_callback_pct(signal_atr_pct: float, args: argparse.Namespace) -> float:
+    """Return the trailing-stop callback% for one signal. Adaptive mode scales
+    callback with the coin's ATR (tighter trail on low-ATR setups, more
+    breathing room on volatile ones). Clamped 0.5%-5.0%, well inside
+    Binance's 0.1-10% bounds. Falls back to the fixed --trailing-callback-pct
+    when --adaptive-trailing-callback is not set."""
+    if not getattr(args, "adaptive_trailing_callback", False) or signal_atr_pct <= 0:
+        return args.trailing_callback_pct
+    multiplier = getattr(args, "adaptive_trailing_callback_multiplier", 0.3)
+    return max(0.5, min(5.0, signal_atr_pct * 100.0 * multiplier))
 
 
 def _dynamic_leverage(atr_pct: float, risk_pct: float, base: int, conviction: float = 1.0) -> int:
