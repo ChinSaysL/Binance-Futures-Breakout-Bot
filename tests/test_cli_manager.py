@@ -221,7 +221,75 @@ class SmartRetestManagerTests(unittest.TestCase):
         self.assertEqual(failures, [])
         self.assertTrue(item["sl_existing_close_position"])
         self.assertEqual(item["placed_exit_client_order_ids"], ["test_sl", "test_tp"])
+        self.assertEqual(item["sl_client_order_id"], "test_sl")
+        self.assertEqual(item["sl_trigger_price"], "95")
         self.assertEqual(client.algo_orders[-1]["type"], "TAKE_PROFIT_MARKET")
+
+    def test_exit_placement_records_stop_metadata_for_breakeven(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = _args(Path(directory) / "entries.json", Path(directory) / "exits.json")
+            item = _pending_entry(state="ENTRY_ORDER_PLACED", mark_side="waiting")
+            item["exit_plans"] = [
+                {
+                    "role": "STOP_LOSS",
+                    "client_order_id": "test_sl",
+                    "payload": {
+                        "algoType": "CONDITIONAL",
+                        "symbol": "TESTUSDT",
+                        "side": "SELL",
+                        "type": "STOP_MARKET",
+                        "triggerPrice": "95",
+                        "closePosition": "true",
+                        "clientAlgoId": "test_sl",
+                    },
+                }
+            ]
+            client = _FakeClient(mark_price=100.0)
+
+            placed, failed, failures = _place_exit_plans_from_item(client, item, args)
+
+        self.assertEqual(placed, 1)
+        self.assertFalse(failed)
+        self.assertEqual(failures, [])
+        self.assertEqual(item["sl_client_order_id"], "test_sl")
+        self.assertEqual(item["sl_trigger_price"], "95")
+
+    def test_pending_exit_promotion_backfills_stop_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            entry_file = Path(directory) / "entries.json"
+            exit_file = Path(directory) / "exits.json"
+            entry_file.write_text("[]", encoding="utf-8")
+            pending_exit = _pending_entry(state="ENTRY_ORDER_PLACED", mark_side="waiting")
+            pending_exit["exit_plans"] = [
+                {
+                    "role": "STOP_LOSS",
+                    "client_order_id": "test_sl",
+                    "payload": {
+                        "algoType": "CONDITIONAL",
+                        "symbol": "TESTUSDT",
+                        "side": "SELL",
+                        "type": "STOP_MARKET",
+                        "triggerPrice": "95",
+                        "closePosition": "true",
+                        "clientAlgoId": "test_sl",
+                    },
+                }
+            ]
+            exit_file.write_text(json.dumps([pending_exit]), encoding="utf-8")
+            client = _FakeClient(
+                mark_price=100.0,
+                account={"positions": [{"symbol": "TESTUSDT", "positionAmt": "1", "entryPrice": "100"}]},
+            )
+
+            result = _quiet_manage(client, _args(entry_file, exit_file))
+
+            promoted = json.loads(entry_file.read_text(encoding="utf-8"))[0]
+
+        self.assertEqual(result, 0)
+        self.assertEqual(promoted["state"], "MONITORING")
+        self.assertEqual(promoted["live_entry_price"], 100.0)
+        self.assertEqual(promoted["sl_client_order_id"], "test_sl")
+        self.assertEqual(promoted["sl_trigger_price"], "95")
 
     def test_live_blocked_symbols_include_pending_exits_and_positions(self):
         with tempfile.TemporaryDirectory() as directory:

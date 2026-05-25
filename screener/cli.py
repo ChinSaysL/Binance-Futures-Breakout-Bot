@@ -2364,6 +2364,7 @@ def manage_pending_exits(client: BinanceClient, args: argparse.Namespace) -> int
                     item["last_sl_update"] = 0.0
                     item["entry_filled_at"] = time.time()
                     _notify_entry_filled(args, item, position)
+                _ensure_stop_metadata_from_plans(item)
                 item["live_entry_price"] = _safe_float(position.get("entryPrice"))
                 item["live_initial_stop"] = item.get("live_initial_stop") or _initial_stop_from_item(item)
                 # Adopted-orphan positions skip exit management entirely: their
@@ -2579,6 +2580,7 @@ def manage_pending_exits(client: BinanceClient, args: argparse.Namespace) -> int
             promoted["live_initial_stop"] = (
                 promoted.get("live_initial_stop") or _initial_stop_from_item(promoted)
             )
+            _ensure_stop_metadata_from_plans(promoted)
             promoted.setdefault("entry_regime", "STOP_MARKET")
             promoted.setdefault("momentum_score", 0.0)
             promoted.setdefault("last_sl_update", 0.0)
@@ -2741,6 +2743,9 @@ def _place_exit_plans_from_item(
                 placed_id_set.add(client_order_id)
                 placed_ids.append(client_order_id)
                 item["placed_exit_client_order_ids"] = placed_ids
+            if role == "STOP_LOSS":
+                item["sl_client_order_id"] = client_order_id
+                item["sl_trigger_price"] = str(payload.get("triggerPrice", "0"))
         except (BinanceClientError, OrderPlanError) as exc:
             # Critical safety net: if the STOP_LOSS would fire immediately, the
             # SL has effectively already triggered - market-close the position
@@ -2751,6 +2756,8 @@ def _place_exit_plans_from_item(
                     placed_id_set.add(client_order_id)
                     placed_ids.append(client_order_id)
                     item["placed_exit_client_order_ids"] = placed_ids
+                    item["sl_client_order_id"] = client_order_id
+                    item["sl_trigger_price"] = str(payload.get("triggerPrice", "0"))
                 item["sl_existing_close_position"] = True
                 continue
             if role == "STOP_LOSS" and "would immediately trigger" in exc_msg.lower():
@@ -2775,6 +2782,32 @@ def _is_existing_close_position_stop_error(message: str) -> bool:
         and "existing" in lower
         and ("open stop" in lower or "take profit order" in lower)
     )
+
+
+def _ensure_stop_metadata_from_plans(item: dict[str, object]) -> None:
+    """Backfill the active stop id/trigger from saved exit plans.
+
+    STOP_MARKET/RETEST_LIMIT fills are promoted from the pending-exits file. The
+    exit placement helper records these fields for new fills; this backfill keeps
+    older state files and duplicate-stop recoveries eligible for dynamic SL and
+    breakeven management.
+    """
+    if item.get("sl_client_order_id") and _safe_float(item.get("sl_trigger_price")) > 0:
+        return
+    placed = item.get("placed_exit_client_order_ids", [])
+    placed_ids = {str(client_id) for client_id in placed} if isinstance(placed, list) else set()
+    for plan in item.get("exit_plans", []) or []:
+        if not isinstance(plan, dict) or plan.get("role") != "STOP_LOSS":
+            continue
+        client_order_id = str(plan.get("client_order_id", ""))
+        if placed_ids and client_order_id not in placed_ids:
+            continue
+        payload = plan.get("payload", {})
+        trigger = str(payload.get("triggerPrice", "0")) if isinstance(payload, dict) else "0"
+        if client_order_id and _safe_float(trigger) > 0:
+            item["sl_client_order_id"] = client_order_id
+            item["sl_trigger_price"] = trigger
+        return
 
 
 def _is_dust_position(
