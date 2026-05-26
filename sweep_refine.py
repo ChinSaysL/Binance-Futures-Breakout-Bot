@@ -88,7 +88,7 @@ def make_cfg(mult, stag_r, stag_c, chop_args, runner=50, be=1.5):
         "--trailing-stop",
         "--adaptive-trailing-callback",
         "--adaptive-trailing-callback-multiplier", str(mult),
-        "--trail-activation-r", "0.5",
+        "--trail-activation-r", "0.0",
         "--runner-pct", str(runner),
         "--breakeven-trigger-r", str(be),
     ] + chop_args
