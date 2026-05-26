@@ -1,7 +1,0 @@
-config,window,equity,expectancy_r,win_rate,max_dd,elapsed_s
-OLD_no_dynsl_W1_down,W1_down,,,,,0.8080897331237793
-OLD_no_dynsl_W2_chop,W2_chop,,,,,0.545464038848877
-OLD_no_dynsl_W3_up,W3_up,,,,,0.5194406509399414
-NEW_fixed_W1_down,W1_down,,,,,0.49233508110046387
-NEW_fixed_W2_chop,W2_chop,,,,,0.5042343139648438
-NEW_fixed_W3_up,W3_up,,,,,0.5236468315124512
