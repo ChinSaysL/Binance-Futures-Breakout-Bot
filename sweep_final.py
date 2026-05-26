@@ -34,6 +34,7 @@ BASE = [
     "--trail-activation-r", "0.0",
     "--breakeven-trigger-r", "1.5",
     "--btc-chop-guards",
+    "--dynamic-sl",
 ]
 
 PATTERNS = {

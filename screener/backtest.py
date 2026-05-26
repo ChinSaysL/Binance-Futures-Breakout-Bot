@@ -10,7 +10,7 @@ Modeling choices (v1) - read these before trusting the numbers:
     retest window is shorter than one candle so most live entries fall back to
     market anyway. Slightly conservative on entry price.
   * Exits: a static stop loss, optional smart/even partial take-profits, and a
-    trailing runner. Dynamic SL repositioning is NOT modeled.
+    trailing runner. Dynamic SL repositioning is modeled (opt-in with --dynamic-sl).
   * Intrabar: if a candle's range covers both the stop and a take-profit, the
     stop is assumed to hit first (worst case).
   * One position per symbol at a time. Portfolio concurrency, the queue and
@@ -1460,7 +1460,7 @@ def _simulate_exit(
     # to keep within Binance's 0.1-10% trailing-callback bounds with a safety
     # margin on both sides.
     if getattr(args, "adaptive_trailing_callback", False) and signal_atr_pct > 0:
-        multiplier = getattr(args, "adaptive_trailing_callback_multiplier", 0.4)
+        multiplier = getattr(args, "adaptive_trailing_callback_multiplier", 0.3)
         callback = max(0.005, min(0.05, signal_atr_pct * multiplier))
     else:
         callback = args.trailing_callback_pct / 100.0
@@ -2403,7 +2403,7 @@ def _print_report(
     _print_grouped(taken, key=lambda t: t.regime)
 
     print()
-    print("NOTE: v1 model - market entry on breakout, static stop, no dynamic-SL.")
+    print("NOTE: v2 model - market entry on breakout, dynamic-SL supported (opt-in).")
     print("Drawdown is on realized equity only. Over ONE window/regime - not a guarantee.")
 
 

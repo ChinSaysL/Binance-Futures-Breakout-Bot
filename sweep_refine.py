@@ -25,6 +25,7 @@ BASE = [
     "--capital", "10", "--compound",
     "--sizing-mode", "auto", "--max-concurrent", "2",
     "--simulate-rotation",
+    "--dynamic-sl",
 ]
 
 
