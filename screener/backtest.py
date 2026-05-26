@@ -219,6 +219,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--instant-entry-slippage-pct", type=float, default=0.0, help="Models live chase slippage on INSTANT entries: the fill happens at entry_price * (1 + slippage_pct/100) for LONGs (mirror for SHORTs). Backtest is otherwise 'perfect' at trigger; in live the bot scans every 3min and fills MARKET at current mark, which is usually 0.5-2%% past trigger. Default 0 = no slippage (legacy backtest).")
     parser.add_argument("--instant-max-sl-loss-pct", type=float, default=0.0, help="Override --max-sl-loss-pct for INSTANT regime only. Tighter SL on chase entries limits drawdown when the post-impulse retrace overshoots. 0 = inherit --max-sl-loss-pct (no INSTANT-specific tightening).")
     parser.add_argument("--trail-activation-r", type=float, default=0.0, help="Gate the trailing stop behind this R-multiple of unrealized profit. 0 = trail is live the moment the position fills (current behaviour). 0.5 = trail only starts tracking once the trade reaches +0.5R. Prevents wick-out losses on entry pullbacks at the cost of letting losing trades fall further before the trail catches them.")
+    parser.add_argument("--trail-after-all-tps", action="store_true", help="Activate the trailing stop only AFTER every take-profit has filled. Sequential exit: TPs hit in order, then the remaining runner trails from there. Eliminates the parallel-trail wick-out behaviour at the cost of letting some runners SL out if the price reverses before the final TP.")
     parser.add_argument("--runner-pct", type=float, default=50.0, help="Percent of position left for the trailing runner when --trailing-stop is used.")
     parser.add_argument("--smart-tp", action="store_true", help="Adapt the target, TP splits, and runner size from each signal's conviction.")
     parser.add_argument("--smart-tp-max-target-multiplier", type=float, default=1.0, help="Extra multiplier on the detector target for top-conviction signals. The detector target is already ATR-scaled, so keep this near 1.0; high values push the target out of reach and clog slots.")
@@ -1480,7 +1481,10 @@ def _simulate_exit(
     # (or entry - activation_r*risk for shorts) before the trail starts tracking.
     activation_r = getattr(args, "trail_activation_r", 0.0) or 0.0
     activation_buffer = activation_r * initial_risk if activation_r > 0 else 0.0
-    runner_active = runner_open and activation_buffer <= 0
+    trail_after_all_tps = bool(getattr(args, "trail_after_all_tps", False)) and n_tp > 0
+    # If sequential mode is on, runner starts inactive regardless of activation_r;
+    # it activates once every TP is filled.
+    runner_active = runner_open and activation_buffer <= 0 and not trail_after_all_tps
     # Track the bar where peak/trough last updated for the exhaustion-exit stall check.
     peak_idx = start_index
     trough_idx = start_index
@@ -1545,6 +1549,21 @@ def _simulate_exit(
                     candidate = max(c.high for c in window) * (1.0 + _DYN_SL_BUFFER)
                     if candle.open < candidate < stop:
                         stop = candidate  # ratchet down to recent resistance
+        # Path-conservative exit checks. OHLC alone cannot say whether high or
+        # low came first in a bar; the live tick path is unknown. Pre-fix, the
+        # trail was computed with peak *already updated to this bar's high*,
+        # then matched against the same bar's low -- implicitly assuming up-
+        # then-down within every candle, which is favourable to the trader
+        # and produced phantom trail wins that don't exist in live (entry bar
+        # often goes down 5% then up 5%; live trail fires at -1.2%, old sim
+        # booked +3.7%).
+        #
+        # Conservative rule: the trail compares the WORST-CASE post-update low
+        # against the trail computed from the PRIOR peak (the trail level that
+        # existed at the start of the bar). The just-activated case uses an
+        # effective peak of max(prior_peak, activation_level) -- in live the
+        # peak at activation moment is at least the activation threshold.
+        prior_runner_active = runner_active
         if side == "LONG":
             if candle.low <= stop:
                 realized += remaining * stop
@@ -1555,10 +1574,23 @@ def _simulate_exit(
                     realized += tp_fracs[k] * tp_prices[k]
                     remaining -= tp_fracs[k]
             if runner_open:
-                if not runner_active and candle.high >= entry + activation_buffer:
+                activated_this_bar = False
+                gate_open = (
+                    (not trail_after_all_tps or all(tp_taken))
+                    and candle.high >= entry + activation_buffer
+                )
+                if not runner_active and gate_open:
                     runner_active = True
+                    activated_this_bar = True
                 if runner_active:
-                    trail = peak * (1.0 - callback)
+                    if prior_runner_active:
+                        effective_peak = prior_peak
+                    elif activated_this_bar:
+                        # In live, peak at activation moment >= activation level.
+                        effective_peak = max(prior_peak, entry + activation_buffer)
+                    else:
+                        effective_peak = prior_peak
+                    trail = effective_peak * (1.0 - callback)
                     if candle.low <= trail and trail > stop:
                         realized += runner_frac * trail
                         remaining -= runner_frac
@@ -1573,10 +1605,22 @@ def _simulate_exit(
                     realized += tp_fracs[k] * tp_prices[k]
                     remaining -= tp_fracs[k]
             if runner_open:
-                if not runner_active and candle.low <= entry - activation_buffer:
+                activated_this_bar = False
+                gate_open = (
+                    (not trail_after_all_tps or all(tp_taken))
+                    and candle.low <= entry - activation_buffer
+                )
+                if not runner_active and gate_open:
                     runner_active = True
+                    activated_this_bar = True
                 if runner_active:
-                    trail = trough * (1.0 + callback)
+                    if prior_runner_active:
+                        effective_trough = prior_trough
+                    elif activated_this_bar:
+                        effective_trough = min(prior_trough, entry - activation_buffer)
+                    else:
+                        effective_trough = prior_trough
+                    trail = effective_trough * (1.0 + callback)
                     if candle.high >= trail and trail < stop:
                         realized += runner_frac * trail
                         remaining -= runner_frac
