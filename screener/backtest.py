@@ -254,6 +254,11 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.set_defaults(hostile_market_strict_only=True)
     parser.add_argument("--hostile-momentum-pct", type=float, default=0.0, help="BTC momentum below this percent is hostile for regime selection.")
     parser.add_argument("--hostile-ema-slack-pct", type=float, default=0.0, help="BTC close this far below EMA is hostile for regime selection, percent.")
+    parser.add_argument("--btc-chop-guards", action="store_true", help="Apply BTC flat/choppy-regime guards without changing normal/uptrend market behavior.")
+    parser.add_argument("--btc-chop-momentum-abs-pct", type=float, default=2.0, help="BTC is choppy when absolute BTC momentum is at or below this percent.")
+    parser.add_argument("--btc-chop-ema-abs-pct", type=float, default=1.0, help="BTC is choppy when absolute BTC close-vs-EMA distance is at or below this percent.")
+    parser.add_argument("--btc-chop-skip-entry-regimes", default="", help="Comma-separated regimes skipped only while BTC is choppy, e.g. INSTANT.")
+    parser.add_argument("--btc-chop-instant-min-rel-strength-pct", type=float, default=None, help="When BTC is choppy, require INSTANT signals to beat BTC momentum by this percent. Unset = off.")
     parser.add_argument("--no-short-market-guard", dest="short_market_guard", action="store_false", help="Allow shorts even when BTC is not bearish.")
     parser.set_defaults(short_market_guard=True)
     parser.add_argument("--short-guard-momentum-pct", type=float, default=0.0, help="Allow SHORT signals only when BTC momentum is at or below this percent.")
@@ -311,6 +316,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     if args.instant_size_multiplier < 0 or args.retest_size_multiplier < 0 or args.trailing_retest_size_multiplier < 0:
         parser.error("size multipliers must be zero or greater")
     args.skip_entry_regimes = _parse_regime_set(args.skip_entry_regimes)
+    args.btc_chop_skip_entry_regimes = _parse_regime_set(args.btc_chop_skip_entry_regimes)
     args.profit_lock_pairs = _parse_profit_lock_ladder(args.profit_lock_ladder, parser)
     if args.stagnation_after_r < 0:
         parser.error("--stagnation-after-r must be zero or greater")
@@ -767,6 +773,36 @@ def _regime_allowed_in_market(
     return not hostile or regime == "STRICT_RETEST"
 
 
+def _market_point_is_choppy(point: MarketTrendPoint, args: argparse.Namespace) -> bool:
+    ema_distance_pct = (point.close / max(point.ema, 1e-9) - 1.0) * 100.0
+    return (
+        abs(point.momentum_pct) <= max(args.btc_chop_momentum_abs_pct, 0.0)
+        and abs(ema_distance_pct) <= max(args.btc_chop_ema_abs_pct, 0.0)
+    )
+
+
+def _chop_guard_allows(
+    regime: str,
+    timestamp: int,
+    market_trend: MarketTrend | None,
+    context_features: dict[str, float],
+    args: argparse.Namespace,
+) -> bool:
+    if not args.btc_chop_guards:
+        return True
+    if market_trend is None:
+        return True
+    point = market_trend.at_or_before(timestamp)
+    if point is None or not _market_point_is_choppy(point, args):
+        return True
+    if regime in args.btc_chop_skip_entry_regimes:
+        return False
+    min_rel = getattr(args, "btc_chop_instant_min_rel_strength_pct", None)
+    if regime == "INSTANT" and min_rel is not None:
+        return context_features.get("feat_rel_momentum_pct", 0.0) >= min_rel
+    return True
+
+
 def _side_allowed_in_market(
     side: str,
     timestamp: int,
@@ -1033,11 +1069,13 @@ def _backtest_symbol(
             index += 1
             continue
         regime = _classify_entry_regime(signal)
+        context_features = _signal_context_features(window, market_trend, args, symbol_r_history)
         if (
             regime in args.skip_entry_regimes
             or not _market_allows_signal(signal, window[-1].close_time, market_trend, args)
             or not _instant_market_allows(regime, window[-1].close_time, market_trend, args)
             or not _regime_allowed_in_market(regime, window[-1].close_time, market_trend, args)
+            or not _chop_guard_allows(regime, window[-1].close_time, market_trend, context_features, args)
             or not _side_allowed_in_market(signal.side, window[-1].close_time, market_trend, args)
             or not _rel_strength_allows(signal, window, args, market_trend)
             or not _mtf_aligned(mtf_align, window[-1].close_time, signal.side)
@@ -1058,7 +1096,6 @@ def _backtest_symbol(
             if deviation > args.instant_max_deviation_pct / 100.0:
                 index += 1
                 continue
-        context_features = _signal_context_features(window, market_trend, args, symbol_r_history)
         ml_scores = _ml_scores_signal(
             signal,
             regime,
@@ -2189,6 +2226,15 @@ def _print_report(
         print(
             f"Filter      hostile BTC -> STRICT_RETEST only "
             f"(mom < {args.hostile_momentum_pct:.1f}% or EMA slack {args.hostile_ema_slack_pct:.1f}%)"
+        )
+    if args.btc_chop_guards:
+        skip = ", ".join(sorted(args.btc_chop_skip_entry_regimes)) or "none"
+        rel = args.btc_chop_instant_min_rel_strength_pct
+        rel_text = "off" if rel is None else f"{rel:.1f}%"
+        print(
+            f"Filter      BTC chop guard: abs mom <= {args.btc_chop_momentum_abs_pct:.1f}%, "
+            f"abs EMA <= {args.btc_chop_ema_abs_pct:.1f}%, skip {skip}, "
+            f"INSTANT rel >= {rel_text}"
         )
     if args.short_market_guard:
         print(

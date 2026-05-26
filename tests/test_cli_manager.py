@@ -552,6 +552,45 @@ class DynamicLeverageTests(unittest.TestCase):
         )
 
 
+class BtcChopGuardTests(unittest.TestCase):
+    def test_chop_guard_blocks_weak_instant_relative_strength(self):
+        signal = _breakout_signal()
+        args = _args(Path("entries.json"), Path("exits.json"))
+        args.btc_chop_guards = True
+        args.btc_chop_momentum_abs_pct = 1.0
+        args.btc_chop_ema_abs_pct = 0.5
+        args.btc_chop_skip_entry_regimes = set()
+        args.btc_chop_instant_min_rel_strength_pct = 4.0
+        args._live_ml_signal_contexts = {(signal.symbol, signal.interval): {"feat_rel_momentum_pct": 2.5}}
+
+        reason = cli._btc_chop_guard_reject_reason(
+            signal,
+            "INSTANT",
+            (100.0, 100.2, 0.4),
+            args,
+        )
+
+        self.assertIn("BTC chop guard blocked INSTANT", reason)
+
+    def test_chop_guard_leaves_non_choppy_market_unchanged(self):
+        signal = _breakout_signal()
+        args = _args(Path("entries.json"), Path("exits.json"))
+        args.btc_chop_guards = True
+        args.btc_chop_momentum_abs_pct = 1.0
+        args.btc_chop_ema_abs_pct = 0.5
+        args.btc_chop_skip_entry_regimes = {"INSTANT"}
+        args.btc_chop_instant_min_rel_strength_pct = 4.0
+
+        reason = cli._btc_chop_guard_reject_reason(
+            signal,
+            "INSTANT",
+            (103.0, 100.0, 3.0),
+            args,
+        )
+
+        self.assertEqual(reason, "")
+
+
 class ConditionalEntryNudgeTests(unittest.TestCase):
     def test_nudges_crossed_long_stop_trigger_one_tick_above_mark(self):
         signal = _breakout_signal()

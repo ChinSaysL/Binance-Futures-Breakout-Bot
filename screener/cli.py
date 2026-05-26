@@ -627,6 +627,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--instant-guard-ema-slack-pct", type=float, default=1.5, help="Allowed BTC close distance below EMA for INSTANT entries when --btc-market-guards is enabled. Default: 1.5.")
     parser.add_argument("--hostile-momentum-pct", type=float, default=0.0, help="BTC momentum below this is hostile when --btc-market-guards is enabled. Default: 0.")
     parser.add_argument("--hostile-ema-slack-pct", type=float, default=0.0, help="BTC close below EMA by this slack is hostile when --btc-market-guards is enabled. Default: 0.")
+    parser.add_argument("--btc-chop-guards", action="store_true", help="Apply BTC flat/choppy-regime guards without changing normal/uptrend market behavior.")
+    parser.add_argument("--btc-chop-momentum-abs-pct", type=float, default=2.0, help="BTC is choppy when absolute BTC momentum is at or below this percent.")
+    parser.add_argument("--btc-chop-ema-abs-pct", type=float, default=1.0, help="BTC is choppy when absolute BTC close-vs-EMA distance is at or below this percent.")
+    parser.add_argument("--btc-chop-skip-entry-regimes", default="", help="Comma-separated regimes skipped only while BTC is choppy, e.g. INSTANT.")
+    parser.add_argument("--btc-chop-instant-min-rel-strength-pct", type=float, help="When BTC is choppy, require INSTANT signals to beat BTC momentum by this percent. Omit to disable.")
     parser.add_argument("--two-sided-entry", action="store_true", help="For coiling coins with no clear direction, arm a breakout bracket on BOTH sides. Whichever side breaks out first enters; the opposite side is cancelled. SMART_RETEST live mode only.")
     parser.add_argument("--detector", choices=["simple", "squeeze"], default="simple", help="simple = high-recall long-only breakout detector (default); squeeze = the original pre-breakout/short detector.")
     parser.add_argument("--dynamic-sl", action="store_true", help="Reposition the stop loss on open positions as new support/resistance levels form.")
@@ -740,6 +745,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.exhaustion_lookback < 10:
         parser.error("--exhaustion-lookback must be at least 10")
     args.skip_entry_regimes = _parse_entry_regime_set(args.skip_entry_regimes, parser)
+    args.btc_chop_skip_entry_regimes = _parse_entry_regime_set(args.btc_chop_skip_entry_regimes, parser)
     args.tp_splits_pct = []
     args.trailing_runner_pct = 0.0
     if not args.no_exits:
@@ -795,7 +801,10 @@ def scan_symbols(
                 include_rejected=args.include_rejected,
                 now_ms=now_ms,
             )
-        if signal is not None and getattr(args, "ml_rank_model_data", None):
+        if signal is not None and (
+            getattr(args, "ml_rank_model_data", None)
+            or getattr(args, "btc_chop_guards", False)
+        ):
             context = _live_market_signal_context(signal, candles, args)
             with context_lock:
                 signal_contexts[(signal.symbol, signal.interval)] = context
@@ -940,11 +949,14 @@ def place_best_orders(
                 live_signals.append(candidate)
         signals = live_signals
 
-    btc_guard_point = _current_btc_guard_point(client, args) if args.btc_market_guards else None
+    needs_btc_context = args.btc_market_guards or getattr(args, "btc_chop_guards", False)
+    if needs_btc_context and not getattr(args, "_live_ml_btc_context", None):
+        args._live_ml_btc_context = _current_btc_ml_context(client, args)
+    btc_guard_point = _current_btc_guard_point(client, args) if needs_btc_context else None
     if args.btc_market_guards and btc_guard_point is None:
         failures.append("BTC market guard: BTCUSDT trend unavailable; treating market as hostile")
 
-    if args.skip_entry_regimes or args.btc_market_guards:
+    if args.skip_entry_regimes or args.btc_market_guards or getattr(args, "btc_chop_guards", False):
         tradable_signals: list[BreakoutSignal] = []
         for candidate in signals:
             entry_regime = _classify_entry_regime(candidate)
@@ -952,6 +964,8 @@ def place_best_orders(
                 failures.append(f"{candidate.symbol}@{candidate.interval}: skipped, entry regime {entry_regime}")
             elif btc_reason := _btc_guard_reject_reason(entry_regime, btc_guard_point, args):
                 failures.append(f"{candidate.symbol}@{candidate.interval}: skipped, {btc_reason}")
+            elif chop_reason := _btc_chop_guard_reject_reason(candidate, entry_regime, btc_guard_point, args):
+                failures.append(f"{candidate.symbol}@{candidate.interval}: skipped, {chop_reason}")
             else:
                 tradable_signals.append(candidate)
         signals = tradable_signals
@@ -1028,6 +1042,9 @@ def place_best_orders(
             continue
         if btc_reason := _btc_guard_reject_reason(entry_regime, btc_guard_point, args):
             failures.append(f"{signal.symbol}@{signal.interval}: skipped after recheck, {btc_reason}")
+            continue
+        if chop_reason := _btc_chop_guard_reject_reason(signal, entry_regime, btc_guard_point, args):
+            failures.append(f"{signal.symbol}@{signal.interval}: skipped after recheck, {chop_reason}")
             continue
 
         if (
@@ -2023,7 +2040,11 @@ def _drop_stale_waiting_entries(
 def _scan_and_arm(client: BinanceClient, args: argparse.Namespace, settings: BreakoutSettings) -> None:
     """Scan the market, re-rank the queue, and arm the strongest fresh opportunities."""
     args._live_ml_symbol_context = _load_ml_symbol_context(args.ml_context_file)
-    args._live_ml_btc_context = _current_btc_ml_context(client, args) if getattr(args, "ml_rank_model_data", None) else {}
+    args._live_ml_btc_context = (
+        _current_btc_ml_context(client, args)
+        if getattr(args, "ml_rank_model_data", None) or getattr(args, "btc_chop_guards", False)
+        else {}
+    )
     universe = _resolve_symbols(client, args)
     universe = _filter_order_books(client, universe, args)
     universe = _filter_open_interest(client, universe, args)
@@ -4321,6 +4342,42 @@ def _btc_guard_reject_reason(
             f"BTC hostile; only STRICT_RETEST allowed "
             f"(momentum {momentum_pct:.2f}%, close/EMA {(close / max(ema, 1e-9) - 1.0) * 100:.2f}%)"
         )
+    return ""
+
+
+def _btc_point_is_choppy(close: float, ema: float, momentum_pct: float, args: argparse.Namespace) -> bool:
+    ema_distance_pct = (close / max(ema, 1e-9) - 1.0) * 100.0
+    return (
+        abs(momentum_pct) <= max(args.btc_chop_momentum_abs_pct, 0.0)
+        and abs(ema_distance_pct) <= max(args.btc_chop_ema_abs_pct, 0.0)
+    )
+
+
+def _btc_chop_guard_reject_reason(
+    signal: BreakoutSignal,
+    entry_regime: str,
+    guard_point: tuple[float, float, float] | None,
+    args: argparse.Namespace,
+) -> str:
+    if not getattr(args, "btc_chop_guards", False):
+        return ""
+    if guard_point is None:
+        return ""
+    close, ema, momentum_pct = guard_point
+    if not _btc_point_is_choppy(close, ema, momentum_pct, args):
+        return ""
+    if entry_regime in args.btc_chop_skip_entry_regimes:
+        return f"BTC chop guard blocked {entry_regime}"
+    min_rel = getattr(args, "btc_chop_instant_min_rel_strength_pct", None)
+    if entry_regime == "INSTANT" and min_rel is not None:
+        context = getattr(args, "_live_ml_signal_contexts", {}) or {}
+        key = (signal.symbol, signal.interval)
+        signal_context = context.get(key, {}) if isinstance(context, dict) else {}
+        rel_strength = _safe_float(signal_context.get("feat_rel_momentum_pct")) if isinstance(signal_context, dict) else 0.0
+        if not signal_context:
+            rel_strength = signal.price_change_pct_24h - momentum_pct
+        if rel_strength < min_rel:
+            return f"BTC chop guard blocked INSTANT rel strength {rel_strength:.2f}% < {min_rel:.2f}%"
     return ""
 
 

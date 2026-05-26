@@ -1,0 +1,6 @@
+name,mom,ema,skip,rel,generated,taken,equity,expectancy,pf,dd
+idx14_skip_instant_retest,1.0,1.0,"INSTANT,RETEST",,184,94,2508.97,+0.894,2.29,43.3
+idx13_skip_instant,1.0,1.0,INSTANT,,187,96,2516.44,+0.875,2.30,43.3
+idx18_rel4,1.0,1.5,none,4.0,193,101,3190.81,+0.902,2.17,43.3
+idx10_rel2,1.0,1.0,none,2.0,195,103,2903.59,+0.874,2.11,43.3
+idx6_skip_instant_narrow,1.0,0.5,INSTANT,,193,101,1919.72,+0.818,1.90,43.3
