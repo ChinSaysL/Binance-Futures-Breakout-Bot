@@ -3427,44 +3427,82 @@ def _maybe_software_trail(
     mark_price: float,
     failures: list[str],
 ) -> bool:
-    """Software trailing stop: mirror the backtest's path-conservative peak-based
-    trail logic in the live bot. Instead of relying on Binance's TRAILING_STOP_MARKET
-    algo (which fires on every intra-candle tick), track the peak mark price and
-    market-close the runner when the trail level is crossed.
+    """Software trailing stop: mirrors the backtest's candle-close peak tracking.
 
-    Matches backtest._simulate_exit trail behavior:
-      - Trail = peak × (1 - callback)
-      - Uses PRIOR peak (path-conservative)
-      - Only fires after trail activation R (if set)
+    Unlike Binance's TRAILING_STOP_MARKET (which fires on every tick), this:
+      - Tracks the peak within the CURRENT candle period
+      - Only commits the peak as "prior peak" when a new candle period starts
+      - Uses the PRIOR candle's peak for trail computation (path-conservative)
+      - Checks continuously so a crash below trail is caught immediately
+
+    Candle period boundaries are determined by the entry interval (e.g., 1h
+    candles start at :00, 15m at :00/:15/:30/:45). No API calls needed.
     """
     trail_cfg = item.get("software_trail")
     if not isinstance(trail_cfg, dict):
         return False
     callback = float(trail_cfg.get("callback_pct", 1.2)) / 100.0
-    runner_qty = str(trail_cfg.get("runner_quantity", ""))
+    entry_qty_str = str(trail_cfg.get("entry_quantity", ""))
+    runner_pct = float(trail_cfg.get("runner_pct", 50.0))
     side = str(item.get("side", "LONG"))
     entry_price = _safe_float(item.get("live_entry_price")) or _safe_float(position.get("entryPrice"))
     initial_stop = _safe_float(item.get("live_initial_stop")) or _initial_stop_from_item(item)
     trail_activation_r = float(trail_cfg.get("trail_activation_r", 0.0))
+    interval = str(item.get("interval", "1h"))
 
-    if not runner_qty or entry_price <= 0 or callback <= 0:
+    if not entry_qty_str or entry_price <= 0 or callback <= 0:
         return False
 
-    # Track peak
-    prior_peak = _safe_float(item.get("sw_trail_peak")) or entry_price
-    peak = max(prior_peak, mark_price)
-    item["sw_trail_peak"] = peak
+    # Compute runner quantity from entry quantity and runner percentage
+    entry_qty = _safe_float(entry_qty_str)
+    if entry_qty <= 0:
+        return False
+    runner_qty = entry_qty * (runner_pct / 100.0)
+    if runner_qty <= 0:
+        return False
+    # Format to 8 decimal places for the order
+    runner_qty_str = f"{runner_qty:.8f}".rstrip("0").rstrip(".")
 
-    # Activation gate
+    # ── candle-aligned peak tracking ──
+    # Determine the candle period in seconds from the interval string
+    _interval_map = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+                     "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600,
+                     "8h": 28800, "12h": 43200, "1d": 86400}
+    candle_s = _interval_map.get(interval, 3600)
+    now = time.time()
+    current_period_start = (int(now) // candle_s) * candle_s
+
+    # Track the running peak for the current candle period
+    running_peak = _safe_float(item.get("sw_trail_running_peak")) or entry_price
+    running_peak = max(running_peak, mark_price)
+    item["sw_trail_running_peak"] = running_peak
+
+    # The "prior peak" used for trail computation: last closed candle's peak
+    prior_peak = _safe_float(item.get("sw_trail_peak")) or entry_price
+    last_period = _safe_float(item.get("sw_trail_last_period"))
+
+    # When a new candle period starts, commit the running peak as prior peak
+    if last_period > 0 and current_period_start > last_period:
+        prior_peak = running_peak
+        item["sw_trail_peak"] = prior_peak
+        running_peak = mark_price  # Reset for new candle
+        item["sw_trail_running_peak"] = running_peak
+    elif last_period <= 0:
+        # First check: initialize
+        item["sw_trail_peak"] = entry_price
+        prior_peak = entry_price
+
+    item["sw_trail_last_period"] = current_period_start
+
+    # ── activation gate ──
     if trail_activation_r > 0:
         initial_risk = abs(entry_price - initial_stop) if initial_stop > 0 else 0
-        if initial_risk > 0 and peak < entry_price + trail_activation_r * initial_risk:
-            return False  # Not activated yet
+        if initial_risk > 0 and prior_peak < entry_price + trail_activation_r * initial_risk:
+            return False
 
-    # Path-conservative: use prior peak for trail computation
+    # ── trail check using prior candle's peak ──
     trail_price = prior_peak * (1.0 - callback) if side == "LONG" else prior_peak * (1.0 + callback)
 
-    # Check if trail is crossed
     triggered = (side == "LONG" and mark_price <= trail_price) or (side == "SHORT" and mark_price >= trail_price)
     if not triggered:
         return False
@@ -3477,7 +3515,7 @@ def _maybe_software_trail(
             "symbol": symbol,
             "side": binance_side,
             "type": "MARKET",
-            "quantity": runner_qty,
+            "quantity": runner_qty_str,
             "reduceOnly": "true",
             "newOrderRespType": "ACK",
         }
@@ -3486,7 +3524,7 @@ def _maybe_software_trail(
         client.place_order(order_params, test=False, recv_window=args.recv_window)
         print(
             f"Software trail: {symbol}@{item.get('interval', '')} runner closed at ~{mark_price:.4f} "
-            f"(trail={trail_price:.4f}, peak={peak:.4f}, callback={callback*100:.1f}%)"
+            f"(trail={trail_price:.4f}, prior_peak={prior_peak:.4f}, callback={callback*100:.1f}%)"
         )
         item["software_trail"] = None
         return True
@@ -3793,10 +3831,13 @@ def _software_trail_metadata(args: argparse.Namespace, signal: BreakoutSignal, e
         return None
     callback = _resolve_callback_pct(signal.atr_pct, args)
     gate_r = getattr(args, "trail_activation_r", 0.0)
+    # Store the runner quantity from the trailing-quantity-pct
+    # This will be computed properly when exit plans are built
     return {
         "callback_pct": callback,
         "trail_activation_r": gate_r,
         "entry_quantity": entry_quantity,
+        "runner_pct": args.trailing_quantity_pct,
     }
 
 
