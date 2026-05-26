@@ -5274,13 +5274,14 @@ def _leverage_capped_stop(side: str, entry: float, stop: float, leverage: int, m
 def _resolve_callback_pct(signal_atr_pct: float, args: argparse.Namespace) -> float:
     """Return the trailing-stop callback% for one signal. Adaptive mode scales
     callback with the coin's ATR (tighter trail on low-ATR setups, more
-    breathing room on volatile ones). Clamped 0.5%-5.0%, well inside
-    Binance's 0.1-10% bounds. Falls back to the fixed --trailing-callback-pct
-    when --adaptive-trailing-callback is not set."""
+    breathing room on volatile ones). Clamped 1.0%-5.0% — the 1.0% floor
+    prevents intra-candle noise from triggering the trail on every 1-min scan
+    (backtest only checks at hourly close, so it can use a tighter 0.5% floor).
+    Binance accepts 0.1-10%."""
     if not getattr(args, "adaptive_trailing_callback", False) or signal_atr_pct <= 0:
         return args.trailing_callback_pct
     multiplier = getattr(args, "adaptive_trailing_callback_multiplier", 0.3)
-    return max(0.5, min(5.0, signal_atr_pct * 100.0 * multiplier))
+    return max(1.0, min(5.0, signal_atr_pct * 100.0 * multiplier))
 
 
 def _dynamic_leverage(atr_pct: float, risk_pct: float, base: int, conviction: float = 1.0) -> int:
