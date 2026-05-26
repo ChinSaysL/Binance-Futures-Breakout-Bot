@@ -236,6 +236,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--funding-pct-per-8h", type=float, default=0.01, help="Assumed funding rate percent per 8h. Longs pay it, shorts receive it. Set 0 to disable.")
     parser.add_argument("--longs-only", dest="longs_only", action="store_true", default=True, help="Skip SHORT signals entirely.")
     parser.add_argument("--include-shorts", dest="longs_only", action="store_false", help="Also test SHORT breakdown signals.")
+    parser.add_argument("--shorts-only", action="store_true", help="Skip LONG signals entirely and test only SHORT breakdown signals.")
     parser.add_argument("--capital", type=float, default=1000.0, help="Starting account balance.")
     parser.add_argument("--compound", action="store_true", help="Scale each position's margin with the running equity (compounding).")
     parser.add_argument("--max-concurrent", type=int, default=2, help="Max positions open at once. 0 = dynamic cap by current equity.")
@@ -281,6 +282,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     )
     parser.add_argument("--offline-cache-dir", type=Path, default=None, help="Run offline: read klines from {symbol}_{interval}.json and exchange_info.json in this directory. Skips ALL Binance API calls.")
     args = parser.parse_args(argv)
+    if args.shorts_only:
+        args.longs_only = False
     if args.tp_count <= 0:
         parser.error("--tp-count must be greater than 0")
     if not 0 <= args.runner_pct < 100:
@@ -1129,6 +1132,7 @@ def _backtest_symbol(
             or signal.reward_risk < args.min_rr
             or signal.score < args.min_score
             or (args.longs_only and signal.side == "SHORT")
+            or (args.shorts_only and signal.side == "LONG")
             or (args.detector == "squeeze" and _dead_coin_reason(signal))
         ):
             index += 1
@@ -1262,6 +1266,17 @@ def _detect_simple_signal(
     range_pct_24h: float,
 ) -> BreakoutSignal | None:
     now_ms = window[-1].close_time + 1
+    if args.shorts_only:
+        return detect_short_breakdown(
+            symbol,
+            window,
+            quote_volume_24h,
+            interval_ms,
+            interval=args.interval,
+            range_pct_24h=range_pct_24h,
+            settings=settings,
+            now_ms=now_ms,
+        )
     long_signal = detect_long_breakout(
         symbol,
         window,
@@ -2341,7 +2356,8 @@ def _print_report(
     )
     concurrency = f"max {args.max_concurrent} concurrent" if args.max_concurrent > 0 else "dynamic concurrency"
     print(f"Account     {args.capital:.2f} USDT start, {sizing}, {concurrency}")
-    print(f"Direction   {'longs only' if args.longs_only else 'longs + shorts'}")
+    direction = "shorts only" if args.shorts_only else "longs only" if args.longs_only else "longs + shorts"
+    print(f"Direction   {direction}")
     if args.skip_entry_regimes:
         print(f"Filter      skip regimes: {', '.join(sorted(args.skip_entry_regimes))}")
     if args.btc_trend_filter:

@@ -1,6 +1,12 @@
 import unittest
 
-from screener.breakout import BreakoutSettings, Candle, evaluate_breakout, interval_to_ms
+from screener.breakout import (
+    BreakoutSettings,
+    Candle,
+    detect_short_breakdown,
+    evaluate_breakout,
+    interval_to_ms,
+)
 
 
 class BreakoutEvaluationTests(unittest.TestCase):
@@ -155,6 +161,39 @@ class BreakoutEvaluationTests(unittest.TestCase):
         self.assertEqual(signal.status, "PRE_BREAKDOWN")
         self.assertLess(signal.trigger_price, signal.close)
 
+    def test_short_candidate_scores_bearish_trend_as_strong(self):
+        candles = []
+        for index in range(80):
+            price = 120.0 - index * 0.2
+            candles.append(
+                _candle(
+                    index,
+                    open_=price + 0.1,
+                    high=price + 0.6,
+                    low=price - 0.6,
+                    close=price,
+                    volume=1_000.0,
+                )
+            )
+        candles.append(_candle(80, open_=104.2, high=104.8, low=103.7, close=103.8, volume=1_400.0))
+
+        signal = evaluate_breakout(
+            "BEARTRENDUSDT",
+            candles,
+            quote_volume_24h=10_000_000,
+            interval_ms=interval_to_ms("15m"),
+            settings=BreakoutSettings(
+                min_avg_quote_volume=0,
+                max_pre_trigger_move_pct=0.1,
+                trigger_reject_lookback=0,
+            ),
+            now_ms=10**12,
+        )
+
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.side, "SHORT")
+        self.assertGreaterEqual(signal.trend_score, 0.85)
+
     def test_detects_resistance_sweep_as_short_upthrust(self):
         candles = _flat_candles(count=70, price=100.0, high=102.0, low=99.0, volume=1_000.0)
         candles.append(_candle(70, open_=101.4, high=103.2, low=101.0, close=101.3, volume=1_600.0))
@@ -172,6 +211,36 @@ class BreakoutEvaluationTests(unittest.TestCase):
         self.assertEqual(signal.side, "SHORT")
         self.assertEqual(signal.status, "UPTHRUST")
         self.assertLess(signal.trigger_price, signal.close)
+
+    def test_simple_short_rejects_late_extended_breakdown(self):
+        candles = _flat_candles(count=70, price=100.0, high=102.0, low=99.0, volume=1_000.0)
+        candles.append(_candle(70, open_=98.8, high=99.0, low=89.5, close=90.0, volume=3_000.0))
+
+        signal = detect_short_breakdown(
+            "LATESHORTUSDT",
+            candles,
+            quote_volume_24h=10_000_000,
+            interval_ms=interval_to_ms("15m"),
+            settings=_settings(),
+            now_ms=10**12,
+        )
+
+        self.assertIsNone(signal)
+
+    def test_simple_short_rejects_weak_range_breakdown_candle(self):
+        candles = _flat_candles(count=70, price=100.0, high=102.0, low=99.0, volume=1_000.0)
+        candles.append(_candle(70, open_=99.1, high=99.2, low=98.0, close=98.1, volume=3_000.0))
+
+        signal = detect_short_breakdown(
+            "WEAKSHORTUSDT",
+            candles,
+            quote_volume_24h=10_000_000,
+            interval_ms=interval_to_ms("15m"),
+            settings=_settings(),
+            now_ms=10**12,
+        )
+
+        self.assertIsNone(signal)
 
 
 def _flat_candles(count: int, price: float, high: float, low: float, volume: float) -> list[Candle]:

@@ -205,7 +205,8 @@ def evaluate_breakout(
     avg_quote_volume = _average_quote_volume(volume_window)
     min_required_quote_volume = settings.min_avg_quote_volume * interval_ms / BASE_FLOW_INTERVAL_MS
     has_enough_flow = avg_quote_volume >= min_required_quote_volume
-    trend_score = _trend_score(candles)
+    long_trend_score = _trend_score(candles, side="LONG")
+    short_trend_score = _trend_score(candles, side="SHORT")
 
     long_is_fresh = prior_break_pct <= settings.prior_break_tolerance_pct
     short_is_fresh = prior_breakdown_pct <= settings.prior_break_tolerance_pct
@@ -250,7 +251,7 @@ def evaluate_breakout(
                 compression_pct=compression_pct,
                 atr_pct=atr_pct,
                 close_position=close_position,
-                trend_score=trend_score,
+                trend_score=long_trend_score,
                 quote_volume_24h=quote_volume_24h,
                 trade_count_24h=trade_count_24h,
                 range_pct_24h=range_pct_24h,
@@ -295,7 +296,7 @@ def evaluate_breakout(
                 compression_pct=compression_pct,
                 atr_pct=atr_pct,
                 close_position=close_position,
-                trend_score=trend_score,
+                trend_score=long_trend_score,
                 quote_volume_24h=quote_volume_24h,
                 trade_count_24h=trade_count_24h,
                 range_pct_24h=range_pct_24h,
@@ -339,7 +340,7 @@ def evaluate_breakout(
                 compression_pct=compression_pct,
                 atr_pct=atr_pct,
                 close_position=close_position,
-                trend_score=trend_score,
+                trend_score=long_trend_score,
                 quote_volume_24h=quote_volume_24h,
                 trade_count_24h=trade_count_24h,
                 range_pct_24h=range_pct_24h,
@@ -385,7 +386,7 @@ def evaluate_breakout(
                 compression_pct=compression_pct,
                 atr_pct=atr_pct,
                 close_position=bearish_close_position,
-                trend_score=trend_score,
+                trend_score=short_trend_score,
                 quote_volume_24h=quote_volume_24h,
                 trade_count_24h=trade_count_24h,
                 range_pct_24h=range_pct_24h,
@@ -429,7 +430,7 @@ def evaluate_breakout(
                 compression_pct=compression_pct,
                 atr_pct=atr_pct,
                 close_position=bearish_close_position,
-                trend_score=trend_score,
+                trend_score=short_trend_score,
                 quote_volume_24h=quote_volume_24h,
                 trade_count_24h=trade_count_24h,
                 range_pct_24h=range_pct_24h,
@@ -473,7 +474,7 @@ def evaluate_breakout(
                 compression_pct=compression_pct,
                 atr_pct=atr_pct,
                 close_position=bearish_close_position,
-                trend_score=trend_score,
+                trend_score=short_trend_score,
                 quote_volume_24h=quote_volume_24h,
                 trade_count_24h=trade_count_24h,
                 range_pct_24h=range_pct_24h,
@@ -639,7 +640,7 @@ def detect_long_breakout(
         compression_pct=0.0,
         atr_pct=atr_pct,
         close_position=close_position,
-        trend_score=_trend_score(candles),
+        trend_score=_trend_score(candles, side="LONG"),
         quote_volume_24h=quote_volume_24h,
         trade_count_24h=0,
         range_pct_24h=range_pct_24h,
@@ -671,9 +672,23 @@ def detect_short_breakdown(
     if prior_low <= 0 or latest.close >= prior_low:
         return None
 
+    if (
+        settings.breakout_max_extension_pct > 0
+        and prior_low / max(latest.close, EPSILON) - 1.0 > settings.breakout_max_extension_pct
+    ):
+        return None  # already too far below the level - entering here is chasing
+    if settings.breakout_max_base_range_pct > 0:
+        prior_high = max(candle.high for candle in prior_window)
+        if prior_high <= 0 or (prior_high - prior_low) / prior_low > settings.breakout_max_base_range_pct:
+            return None  # base too wide/sloppy - not a tight coil
+
     atr_pct = _atr_pct(candles[-settings.atr_lookback - 1 :], latest.close)
     if atr_pct < settings.min_breakout_atr_pct:
         return None
+    if settings.breakout_min_candle_range_mult > 0:
+        atr_abs = atr_pct * latest.close
+        if atr_abs <= 0 or (latest.high - latest.low) < settings.breakout_min_candle_range_mult * atr_abs:
+            return None  # breakdown candle is not a wide-range ignition bar
     volume_window = candles[-settings.volume_lookback - 1 : -1]
     volume_ratio, open_candle = _volume_ratio(latest, volume_window, interval_ms, now_ms)
     if volume_ratio < settings.min_breakout_volume_ratio:
@@ -742,7 +757,7 @@ def detect_short_breakdown(
         compression_pct=0.0,
         atr_pct=atr_pct,
         close_position=1.0 - close_position,
-        trend_score=_trend_score(candles),
+        trend_score=_trend_score(candles, side="SHORT"),
         quote_volume_24h=quote_volume_24h,
         trade_count_24h=0,
         range_pct_24h=range_pct_24h,
@@ -946,7 +961,7 @@ def _atr_pct(candles: list[Candle], price: float) -> float:
     return (sum(true_ranges) / len(true_ranges)) / max(price, EPSILON)
 
 
-def _trend_score(candles: list[Candle]) -> float:
+def _trend_score(candles: list[Candle], side: str = "LONG") -> float:
     closes = [candle.close for candle in candles]
     ema20 = _ema(closes[-60:], 20)
     ema50 = _ema(closes[-80:], 50)
@@ -955,12 +970,20 @@ def _trend_score(candles: list[Candle]) -> float:
 
     latest_close = closes[-1]
     score = 0.2
-    if latest_close > ema20:
-        score += 0.35
-    if ema20 >= ema50:
-        score += 0.3
-    if latest_close >= max(closes[-8:]):
-        score += 0.15
+    if side == "SHORT":
+        if latest_close < ema20:
+            score += 0.35
+        if ema20 <= ema50:
+            score += 0.3
+        if latest_close <= min(closes[-8:]):
+            score += 0.15
+    else:
+        if latest_close > ema20:
+            score += 0.35
+        if ema20 >= ema50:
+            score += 0.3
+        if latest_close >= max(closes[-8:]):
+            score += 0.15
     return min(score, 1.0)
 
 
