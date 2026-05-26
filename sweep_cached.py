@@ -66,7 +66,6 @@ def run_backtest(name: str, window: str, start: str, end: str, extra: list[str])
         "--start-date", start, "--end-date", end,
         "--trade-log", f"_sweep/{name}_{window}.csv",
         "--rate-limit-rpm", "600",
-        "--offline-cache-dir", "_kline_cache",
     ] + extra
 
     t0 = time.time()
