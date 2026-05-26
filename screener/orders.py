@@ -173,6 +173,7 @@ def build_exit_order_plans(
     price_protect: bool,
     hedge_mode: bool,
     trail_activation_price: float = 0.0,
+    software_trail: bool = False,
 ) -> list[ConditionalOrderPlan]:
     plans = [
         _build_close_position_plan(
@@ -223,7 +224,7 @@ def build_exit_order_plans(
         plans.append(tp_plan)
         placed_tp_qty += _decimal(tp_plan.quantity) or Decimal("0")
 
-    if trailing_on and fitted_runner_pct > 0:
+    if trailing_on and fitted_runner_pct > 0 and not software_trail:
         # The trail consumes whatever the TPs didn't take. Computing it as a
         # percentage with independent floor-rounding leaves lot-step dust
         # (e.g. 12.7 split 50/50 with step 0.1 produces TP1=6.3 + trail=6.3,

@@ -664,6 +664,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tp-count", type=int, default=1, help="Number of partial take-profit orders per entry.")
     parser.add_argument("--tp-splits", help="Comma-separated take-profit quantity percentages, e.g. 40,30,20. With --trailing-stop the remainder becomes the trailing runner.")
     parser.add_argument("--trailing-stop", action="store_true", help="Add a trailing-stop-market algo order for the runner quantity.")
+    parser.add_argument("--software-trail", action="store_true", help="Instead of placing a Binance TRAILING_STOP_MARKET algo order (which fires on every intra-candle tick), track the trailing stop in the bot using the backtest's path-conservative peak-based logic. The trail only fires when the mark price crosses the trail level, matching backtest behavior. Eliminates the live-vs-backtest trail gap.")
     parser.add_argument("--trailing-callback-pct", type=float, default=1.2, help="Trailing stop callback rate, percent. Binance Futures algo orders accept 0.1 to 10. Default 1.2 matches the backtest's validated +11127%% baseline; 1.0 (the old live default) was 20%% tighter than backtest and silently haircut avg-win.")
     parser.add_argument("--adaptive-trailing-callback", action="store_true", help="Scale the trailing-stop callback by each coin's ATR%% instead of using a fixed --trailing-callback-pct. Validated +46%% sum equity / +33%% worst-case R over fixed 1.2%% in a 3-window backtest.")
     parser.add_argument("--adaptive-trailing-callback-multiplier", type=float, default=0.3, help="With --adaptive-trailing-callback: callback%% = clamp(atr_pct * multiplier, 0.5%%, 5.0%%). Default 0.3 was the worst-case-best multiplier in the 3-window sweep.")
@@ -1149,6 +1150,7 @@ def place_best_orders(
                         price_protect=args.order_price_protect,
                         hedge_mode=args.hedge_mode,
                         trail_activation_price=_trail_activation,
+                        software_trail=getattr(args, "software_trail", False),
                     )
                 except OrderPlanError as exc:
                     failures.append(f"{signal.symbol}@{signal.interval} exits: {exc}")
@@ -1195,6 +1197,7 @@ def place_best_orders(
                 price_protect=args.order_price_protect,
                 hedge_mode=args.hedge_mode,
                 trail_activation_price=_trail_activation,
+                software_trail=getattr(args, "software_trail", False),
             )
         except OrderPlanError as exc:
             failures.append(f"{signal.symbol}@{signal.interval} exits: {exc}")
@@ -2570,6 +2573,10 @@ def manage_pending_exits(client: BinanceClient, args: argparse.Namespace) -> int
                 if _maybe_stagnation_exit(client, item, args, account, position, failures):
                     closed_positions += 1
                     continue
+                mark = mark_prices.get(symbol, 0.0)
+                if mark > 0 and _maybe_software_trail(client, item, args, position, mark, failures):
+                    closed_positions += 1
+                    continue
                 if args.dynamic_sl:
                     rule = trading_rules.get(symbol)
                     if rule:
@@ -3412,6 +3419,82 @@ def _short_exhausted(candle: object, trough: float, bars_since_trough: int) -> b
     return rejection or bars_since_trough >= 4
 
 
+def _maybe_software_trail(
+    client: BinanceClient,
+    item: dict[str, object],
+    args: argparse.Namespace,
+    position: dict[str, object],
+    mark_price: float,
+    failures: list[str],
+) -> bool:
+    """Software trailing stop: mirror the backtest's path-conservative peak-based
+    trail logic in the live bot. Instead of relying on Binance's TRAILING_STOP_MARKET
+    algo (which fires on every intra-candle tick), track the peak mark price and
+    market-close the runner when the trail level is crossed.
+
+    Matches backtest._simulate_exit trail behavior:
+      - Trail = peak × (1 - callback)
+      - Uses PRIOR peak (path-conservative)
+      - Only fires after trail activation R (if set)
+    """
+    trail_cfg = item.get("software_trail")
+    if not isinstance(trail_cfg, dict):
+        return False
+    callback = float(trail_cfg.get("callback_pct", 1.2)) / 100.0
+    runner_qty = str(trail_cfg.get("runner_quantity", ""))
+    side = str(item.get("side", "LONG"))
+    entry_price = _safe_float(item.get("live_entry_price")) or _safe_float(position.get("entryPrice"))
+    initial_stop = _safe_float(item.get("live_initial_stop")) or _initial_stop_from_item(item)
+    trail_activation_r = float(trail_cfg.get("trail_activation_r", 0.0))
+
+    if not runner_qty or entry_price <= 0 or callback <= 0:
+        return False
+
+    # Track peak
+    prior_peak = _safe_float(item.get("sw_trail_peak")) or entry_price
+    peak = max(prior_peak, mark_price)
+    item["sw_trail_peak"] = peak
+
+    # Activation gate
+    if trail_activation_r > 0:
+        initial_risk = abs(entry_price - initial_stop) if initial_stop > 0 else 0
+        if initial_risk > 0 and peak < entry_price + trail_activation_r * initial_risk:
+            return False  # Not activated yet
+
+    # Path-conservative: use prior peak for trail computation
+    trail_price = prior_peak * (1.0 - callback) if side == "LONG" else prior_peak * (1.0 + callback)
+
+    # Check if trail is crossed
+    triggered = (side == "LONG" and mark_price <= trail_price) or (side == "SHORT" and mark_price >= trail_price)
+    if not triggered:
+        return False
+
+    # Close the runner portion via reduce-only market order
+    symbol = str(item.get("symbol", ""))
+    try:
+        binance_side = "SELL" if side == "LONG" else "BUY"
+        order_params: dict[str, object] = {
+            "symbol": symbol,
+            "side": binance_side,
+            "type": "MARKET",
+            "quantity": runner_qty,
+            "reduceOnly": "true",
+            "newOrderRespType": "ACK",
+        }
+        if bool(item.get("hedge_mode", False)):
+            order_params["positionSide"] = side
+        client.place_order(order_params, test=False, recv_window=args.recv_window)
+        print(
+            f"Software trail: {symbol}@{item.get('interval', '')} runner closed at ~{mark_price:.4f} "
+            f"(trail={trail_price:.4f}, peak={peak:.4f}, callback={callback*100:.1f}%)"
+        )
+        item["software_trail"] = None
+        return True
+    except BinanceClientError as exc:
+        failures.append(f"{symbol} software trail: {exc}")
+        return False
+
+
 def _maybe_stagnation_exit(
     client: BinanceClient,
     item: dict[str, object],
@@ -3703,6 +3786,20 @@ def _place_entry_order(
     return response, f"margin tight; resized {order_kind} entry to maximum affordable qty {new_qty}", ""
 
 
+def _software_trail_metadata(args: argparse.Namespace, signal: BreakoutSignal, entry_quantity: str) -> dict[str, object] | None:
+    """Build software trail config to store with the pending entry. The bot
+    tracks the trail itself instead of placing a Binance TRAILING_STOP_MARKET."""
+    if not args.trailing_stop or not getattr(args, "software_trail", False):
+        return None
+    callback = _resolve_callback_pct(signal.atr_pct, args)
+    gate_r = getattr(args, "trail_activation_r", 0.0)
+    return {
+        "callback_pct": callback,
+        "trail_activation_r": gate_r,
+        "entry_quantity": entry_quantity,
+    }
+
+
 def _save_pending_entry_plan(
     path: Path,
     signal: BreakoutSignal,
@@ -3749,6 +3846,7 @@ def _save_pending_entry_plan(
             "stagnation_candles": args.stagnation_candles,
             "stagnation_lookback": args.stagnation_lookback,
             "max_sl_loss_pct": args.max_sl_loss_pct,
+            "software_trail": _software_trail_metadata(args, signal, entry_plan.quantity) if args.trailing_stop and getattr(args, "software_trail", False) else None,
             "smart_tp": args.smart_tp,
             "smart_tp_max_target_multiplier": args.smart_tp_max_target_multiplier,
             "smart_tp_min_runner_pct": args.smart_tp_min_runner_pct,
