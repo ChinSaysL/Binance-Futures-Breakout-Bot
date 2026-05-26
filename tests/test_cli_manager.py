@@ -407,6 +407,37 @@ class SmartRetestManagerTests(unittest.TestCase):
 
         self.assertTrue(cli._pending_exit_is_zombie(client, item, args))
 
+    def test_pending_exit_zombie_keeps_item_when_algo_lookup_fails_within_2x_window(self):
+        # /algoOpenOrders raising should NOT drop a young zombie - the regular
+        # 30min threshold isn't enough confidence on its own.
+        args = _args(Path("entries.json"), Path("exits.json"))
+        item = {
+            "created_at": int(time.time() - 45 * 60),  # 45min: past 30, under 60
+            "symbol": "TESTUSDT",
+            "entry_client_order_id": "test_entry",
+        }
+        client = _FakeClient(mark_price=100.0)
+        client.open_algo_orders_error = BinanceClientError("algo API down")
+
+        self.assertFalse(cli._pending_exit_is_zombie(client, item, args))
+
+    def test_pending_exit_zombie_drops_on_age_fallback_when_algo_lookup_fails(self):
+        # Past 2x the staleness threshold (60min), an algo lookup failure must
+        # not trap the zombie forever - the age-only fallback kicks in.
+        args = _args(Path("entries.json"), Path("exits.json"))
+        item = {
+            "created_at": int(time.time() - 61 * 60),
+            "symbol": "TESTUSDT",
+            "entry_client_order_id": "test_entry",
+        }
+        client = _FakeClient(mark_price=100.0)
+        client.open_algo_orders_error = BinanceClientError("algo API down")
+
+        with redirect_stdout(StringIO()) as captured:
+            result = cli._pending_exit_is_zombie(client, item, args)
+        self.assertTrue(result)
+        self.assertIn("age-fallback", captured.getvalue())
+
     def test_stale_pending_exit_entry_cancels_for_higher_scoring_signal(self):
         args = _args(Path("entries.json"), Path("exits.json"))
         item = {
@@ -784,6 +815,8 @@ class _FakeClient:
         return {"status": "CANCELED"}
 
     def open_algo_orders(self, symbol: str | None = None, recv_window: int = 5000):
+        if getattr(self, "open_algo_orders_error", None) is not None:
+            raise self.open_algo_orders_error
         return list(self.open_algo_orders_payload)
 
     def _signed_get(self, path: str, params: dict[str, object]):

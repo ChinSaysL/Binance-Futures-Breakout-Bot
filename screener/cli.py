@@ -628,10 +628,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hostile-momentum-pct", type=float, default=0.0, help="BTC momentum below this is hostile when --btc-market-guards is enabled. Default: 0.")
     parser.add_argument("--hostile-ema-slack-pct", type=float, default=0.0, help="BTC close below EMA by this slack is hostile when --btc-market-guards is enabled. Default: 0.")
     parser.add_argument("--btc-chop-guards", action="store_true", help="Apply BTC flat/choppy-regime guards without changing normal/uptrend market behavior.")
-    parser.add_argument("--btc-chop-momentum-abs-pct", type=float, default=2.0, help="BTC is choppy when absolute BTC momentum is at or below this percent.")
-    parser.add_argument("--btc-chop-ema-abs-pct", type=float, default=1.0, help="BTC is choppy when absolute BTC close-vs-EMA distance is at or below this percent.")
+    parser.add_argument("--btc-chop-momentum-abs-pct", type=float, default=1.0, help="BTC is choppy when absolute BTC momentum is at or below this percent. Default 1.0 (3-window-validated idx18 config).")
+    parser.add_argument("--btc-chop-ema-abs-pct", type=float, default=1.5, help="BTC is choppy when absolute BTC close-vs-EMA distance is at or below this percent. Default 1.5 (3-window-validated idx18 config).")
     parser.add_argument("--btc-chop-skip-entry-regimes", default="", help="Comma-separated regimes skipped only while BTC is choppy, e.g. INSTANT.")
-    parser.add_argument("--btc-chop-instant-min-rel-strength-pct", type=float, help="When BTC is choppy, require INSTANT signals to beat BTC momentum by this percent. Omit to disable.")
+    parser.add_argument("--btc-chop-instant-min-rel-strength-pct", type=float, default=4.0, help="When BTC is choppy, require INSTANT signals to beat BTC momentum by this percent. Default 4.0 (3-window-validated idx18 config); pass 0 to disable the relative-strength gate.")
     parser.add_argument("--two-sided-entry", action="store_true", help="For coiling coins with no clear direction, arm a breakout bracket on BOTH sides. Whichever side breaks out first enters; the opposite side is cancelled. SMART_RETEST live mode only.")
     parser.add_argument("--detector", choices=["simple", "squeeze"], default="simple", help="simple = high-recall long-only breakout detector (default); squeeze = the original pre-breakout/short detector.")
     parser.add_argument("--dynamic-sl", action="store_true", help="Reposition the stop loss on open positions as new support/resistance levels form.")
@@ -1430,14 +1430,23 @@ def _pending_exit_is_zombie(
     if not symbol or not entry_id:
         # Without an order id we can't safely confirm zombie state.
         return age_seconds >= 2 * threshold_min * 60.0
+    age_fallback_seconds = 2 * threshold_min * 60.0
     try:
         open_orders = client._signed_get(
             "/openOrders", {"symbol": symbol, "recvWindow": args.recv_window}
         )
-    except BinanceClientError:
-        return False  # transient API failure, leave alone
-    if not isinstance(open_orders, list):
+    except BinanceClientError as exc:
+        # /openOrders unavailable - fall back to age-only verdict at 2x
+        # threshold so a persistent API failure cannot trap a zombie forever.
+        if age_seconds >= age_fallback_seconds:
+            print(
+                f"{symbol}: /openOrders lookup failed ({exc}); dropping pending-exit "
+                f"on age-fallback ({age_seconds/60:.1f}min >= {age_fallback_seconds/60:.0f}min)."
+            )
+            return True
         return False
+    if not isinstance(open_orders, list):
+        return age_seconds >= age_fallback_seconds
     for o in open_orders:
         if not isinstance(o, dict):
             continue
@@ -1449,8 +1458,18 @@ def _pending_exit_is_zombie(
             return False  # entry order is still alive on Binance
     try:
         open_algos = client.open_algo_orders(symbol, recv_window=args.recv_window)
-    except (AttributeError, BinanceClientError):
-        return False  # algo status unknown; keep the deferred exit plan
+    except (AttributeError, BinanceClientError) as exc:
+        # Algo endpoint unavailable - same age-only fallback. Without this a
+        # single /algoOpenOrders failure (perms, rate, recvWindow drift) leaves
+        # zombies stuck forever, since algo-placed entries never appear in the
+        # regular /openOrders feed checked above.
+        if age_seconds >= age_fallback_seconds:
+            print(
+                f"{symbol}: /algoOpenOrders lookup failed ({exc}); dropping pending-exit "
+                f"on age-fallback ({age_seconds/60:.1f}min >= {age_fallback_seconds/60:.0f}min)."
+            )
+            return True
+        return False
     for o in open_algos:
         if not isinstance(o, dict):
             continue
