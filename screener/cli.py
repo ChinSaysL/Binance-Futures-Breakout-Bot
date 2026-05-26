@@ -613,6 +613,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-market-fallback", action="store_true", help="For SMART_RETEST, never place a market order after timeout. Keep watching for the retest limit entry indefinitely.")
     parser.add_argument("--entry-stale-minutes", type=float, default=30.0, help="Drop unplaced triggered entries, or cancel LIMIT entries, after this many minutes. Prevents old queued signals and never-filling orders from blocking later opportunities. 0 = off.")
     parser.add_argument("--rotation-auto-cut-loss", action="store_true", help="Auto-approve cutting a losing position to make room for an exploder, instead of waiting on the interactive Windows popup. Required for headless / VPS deployments. Profitable rotations are always automatic regardless of this flag.")
+    parser.add_argument("--rotation-min-hold-minutes", type=float, default=90.0, help="Minimum minutes a position must be open before it can be rotated out. Default 90 (backtest-validated). Prevents rotation from churning freshly-opened positions.")
+    parser.add_argument("--loss-cooldown-after", type=int, default=1, help="Pause new entries on a symbol after this many consecutive realized losses on that symbol. Default 1.")
+    parser.add_argument("--loss-cooldown-minutes", type=float, default=2880.0, help="Cooldown in minutes (48h = 2880) before a symbol can be re-entered after hitting --loss-cooldown-after consecutive losses. Default 2880 matches the backtest's 48-candle pause on 1h. 0 = disabled.")
+    parser.add_argument("--win-cooldown-after", type=int, default=1, help="Pause new entries on a symbol after this many consecutive realized wins. Default 1 prevents over-trading a hot coin.")
+    parser.add_argument("--win-cooldown-minutes", type=float, default=0.0, help="Cooldown in minutes before re-entering a winning symbol. Default 0 = disabled (backtest default).")
+    parser.add_argument("--cooldown-state-file", type=Path, default=Path(".symbol_cooldown.json"), help="JSON file storing per-symbol cooldown state across restarts.")
     parser.add_argument("--equity-peak-reset-pct", type=float, default=15.0, help="Auto-reset .equity_peak.json when wallet equity changes by more than this percent in one scan tick (interpreted as a manual withdrawal or deposit, not a trade loss). Prevents drawdown-haircut sizing from triggering after you move money in or out. 0 = off (peak only resets on manual file deletion).")
     parser.add_argument("--telegram-bot-token", default="", help="Telegram bot token from @BotFather. Empty = read from TELEGRAM_BOT_TOKEN env var; if neither is set the Telegram integration stays off.")
     parser.add_argument("--telegram-chat-id", default="", help="Telegram chat id (your own user id, get from @userinfobot). Empty = read from TELEGRAM_CHAT_ID env var.")
@@ -1307,6 +1313,11 @@ def _live_blocked_entry_symbols(args: argparse.Namespace, account: dict[str, obj
         and str(position.get("symbol", ""))
         and abs(_safe_float(position.get("positionAmt"))) > 0
     )
+    # Loss/win cooldown: symbols that hit consecutive loss/win thresholds are
+    # blocked from new entries for the cooldown period (matching backtest).
+    for symbol in list(_symbol_cooldown_state.keys()):
+        if _symbol_in_cooldown(args, symbol):
+            symbols.add(symbol)
     return symbols
 
 
@@ -1890,8 +1901,9 @@ def _consider_rotation(
             continue
         # Minimum hold: a freshly opened position has not had room to work yet -
         # rotating it out one scan after entry just churns fees.
+        min_hold_seconds = getattr(args, "rotation_min_hold_minutes", 90.0) * 60
         opened_at = _safe_float(item.get("entry_submitted_at")) or _safe_float(item.get("triggered_at"))
-        if opened_at > 0 and time.time() - opened_at < ROTATION_MIN_HOLD_SECONDS:
+        if opened_at > 0 and time.time() - opened_at < min_hold_seconds:
             continue
         score = _safe_float(item.get("momentum_score"))
         if score + ROTATION_MIN_EDGE >= exploder_score:
@@ -2304,9 +2316,17 @@ def _print_monitored_coins(pending_entries: list[dict[str, object]]) -> None:
 
 def run_auto_trader(client: BinanceClient, args: argparse.Namespace, settings: BreakoutSettings) -> int:
     """Continuous loop: scan every --scan-interval-minutes, manage entries/exits each fast tick."""
+    global _symbol_cooldown_state
     args.watch_exits = False  # each manage_pending_exits call performs a single pass
     scan_interval = args.scan_interval_minutes * 60
     last_scan = 0.0
+
+    # Load persisted cooldown state so restarts don't reset loss/win streaks.
+    _symbol_cooldown_state = _load_symbol_cooldown_state(args.cooldown_state_file)
+    blocked = sum(1 for s in _symbol_cooldown_state if _symbol_in_cooldown(args, s))
+    if blocked:
+        print(f"Cooldown: {blocked} symbol(s) blocked at startup from persisted state.")
+
     print(
         f"Auto-trader started. Scanning every {args.scan_interval_minutes} min; "
         f"max {args.max_concurrent_orders or 'unlimited'} concurrent positions. Ctrl-C to stop."
@@ -2560,6 +2580,12 @@ def manage_pending_exits(client: BinanceClient, args: argparse.Namespace) -> int
                 mark = mark_prices.get(symbol, 0.0)
                 if mark > 0:
                     _record_symbol_r_from_close(args, item, None, mark)
+                # Record outcome for loss/win cooldown tracking
+                entry_price = _safe_float(item.get("live_entry_price")) or _safe_float(item.get("trigger_price"))
+                if entry_price > 0 and mark > 0:
+                    side = str(item.get("side", "LONG"))
+                    realized_pnl_pct = ((mark - entry_price) / entry_price) if side == "LONG" else ((entry_price - mark) / entry_price)
+                    _record_symbol_outcome(args, symbol, realized_pnl_pct)
                 _notify_position_closed(args, client, item, mark)
                 cancelled = _cancel_exit_algos_for_closed_entry(client, item, args, failures)
                 closed_positions += 1
@@ -4707,6 +4733,73 @@ ROTATION_COOLDOWN_SECONDS = 30 * 60      # minimum gap between rotations, so a f
 
 # Wall-clock time of the last completed rotation; gates ROTATION_COOLDOWN_SECONDS.
 _last_rotation_ts = 0.0
+# Per-symbol cooldown tracking: when a symbol hits N consecutive losses/wins,
+# block new entries for the cooldown period. Persisted across restarts.
+# Format: {symbol: {"losses": int, "wins": int, "cooldown_until": float (unix ts)}}
+_symbol_cooldown_state: dict[str, dict[str, object]] = {}
+
+
+def _load_symbol_cooldown_state(path: Path) -> dict[str, dict[str, object]]:
+    try:
+        if not path.exists():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): {str(k2): v2 for k2, v2 in v.items()} for k, v in data.items()}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _save_symbol_cooldown_state(path: Path, state: dict[str, dict[str, object]]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, indent=2, default=str), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _record_symbol_outcome(args: argparse.Namespace, symbol: str, realized_pnl: float) -> None:
+    """Update cooldown state when a position closes. Called from manage_pending_exits."""
+    global _symbol_cooldown_state
+    if not symbol:
+        return
+    state = _symbol_cooldown_state.get(symbol, {"losses": 0, "wins": 0, "cooldown_until": 0.0})
+    loss_after = getattr(args, "loss_cooldown_after", 1)
+    loss_minutes = getattr(args, "loss_cooldown_minutes", 0.0)
+    win_after = getattr(args, "win_cooldown_after", 1)
+    win_minutes = getattr(args, "win_cooldown_minutes", 0.0)
+    now = time.time()
+
+    if realized_pnl < 0:
+        state["losses"] = int(state.get("losses", 0)) + 1
+        state["wins"] = 0
+        if loss_minutes > 0 and int(state["losses"]) >= loss_after:
+            state["cooldown_until"] = now + loss_minutes * 60
+            print(f"Cooldown: {symbol} hit {int(state['losses'])} consecutive losses - blocked for {loss_minutes:.0f} min.")
+    else:
+        state["wins"] = int(state.get("wins", 0)) + 1
+        state["losses"] = 0
+        if win_minutes > 0 and int(state["wins"]) >= win_after:
+            state["cooldown_until"] = now + win_minutes * 60
+            print(f"Cooldown: {symbol} hit {int(state['wins'])} consecutive wins - blocked for {win_minutes:.0f} min.")
+    _symbol_cooldown_state[symbol] = state
+    _save_symbol_cooldown_state(getattr(args, "cooldown_state_file", Path(".symbol_cooldown.json")), _symbol_cooldown_state)
+
+
+def _symbol_in_cooldown(args: argparse.Namespace, symbol: str) -> bool:
+    """Check if a symbol is blocked from new entries due to loss/win cooldown."""
+    state = _symbol_cooldown_state.get(symbol, {})
+    until = _safe_float(state.get("cooldown_until"))
+    if until > 0 and time.time() < until:
+        remaining = (until - time.time()) / 60
+        return True
+    # Cooldown expired - clear the block but keep loss/win streak
+    if until > 0:
+        state["cooldown_until"] = 0.0
+        _symbol_cooldown_state[symbol] = state
+        _save_symbol_cooldown_state(getattr(args, "cooldown_state_file", Path(".symbol_cooldown.json")), _symbol_cooldown_state)
+    return False
 # Throttle "no qualifying signals" prints to at most one per hour so a quiet
 # market does not spam the log. Active scans print normally and do not reset
 # this; the user still sees an hourly heartbeat that the bot is alive.
