@@ -31,7 +31,7 @@ BASE = [
     "--simulate-rotation",
     "--stagnation-after-r", "0.5", "--stagnation-candles", "12",
     "--trailing-stop", "--adaptive-trailing-callback",
-    "--trail-activation-r", "0.0",
+    "--trail-activation-r", "0.5",
     "--breakeven-trigger-r", "1.5",
     "--btc-chop-guards",
     "--dynamic-sl",

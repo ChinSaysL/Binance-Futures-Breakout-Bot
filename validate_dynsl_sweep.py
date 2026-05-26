@@ -24,7 +24,7 @@ BASE = [
     "--stagnation-after-r", "0.5", "--stagnation-candles", "12",
     "--trailing-stop", "--adaptive-trailing-callback",
     "--adaptive-trailing-callback-multiplier", "0.18",
-    "--trail-activation-r", "0.0",
+    "--trail-activation-r", "0.5",
     "--runner-pct", "50",
     "--breakeven-trigger-r", "1.5",
     "--btc-chop-guards",

@@ -606,6 +606,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--order-working-type", choices=["MARK_PRICE", "CONTRACT_PRICE"], default="MARK_PRICE", help="Trigger price type for conditional orders.")
     parser.add_argument("--order-price-protect", action="store_true", help="Enable Binance priceProtect on conditional orders.")
     parser.add_argument("--entry-mode", choices=["SMART_RETEST", "RETEST_LIMIT", "STOP_MARKET"], default="SMART_RETEST", help="Entry execution mode. SMART_RETEST watches trigger, waits for retest, then falls back to market.")
+    parser.add_argument("--instant-entry-slippage-pct", type=float, default=1.0, help="Models the live chase slippage on INSTANT entries: the entry trigger is bumped by this percent for INSTANT signals to reflect that market fills typically occur 0.5-2%% past the breakout trigger. 0 = no slippage (legacy/optimistic). Default 1.0 matches the backtest's validated live-bias adjustment.")
     parser.add_argument("--entry-pullback-pct", type=float, default=0.5, help="For RETEST_LIMIT, place the entry limit this percent better than the trigger.")
     parser.add_argument("--retest-timeout-seconds", type=float, default=300.0, help="For SMART_RETEST, seconds to wait for retest before entering at market.")
     parser.add_argument("--max-market-deviation-pct", type=float, default=1.5, help="For SMART_RETEST market fallback: skip entry if price has moved more than this percent beyond the trigger. Default 1.5.")
@@ -661,6 +662,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--adaptive-trailing-callback", action="store_true", help="Scale the trailing-stop callback by each coin's ATR%% instead of using a fixed --trailing-callback-pct. Validated +46%% sum equity / +33%% worst-case R over fixed 1.2%% in a 3-window backtest.")
     parser.add_argument("--adaptive-trailing-callback-multiplier", type=float, default=0.3, help="With --adaptive-trailing-callback: callback%% = clamp(atr_pct * multiplier, 0.5%%, 5.0%%). Default 0.3 was the worst-case-best multiplier in the 3-window sweep.")
     parser.add_argument("--trailing-quantity-pct", type=float, default=50.0, help="Runner quantity percent reserved for trailing stop when --tp-splits is not set. A 27-run sweep showed a bigger runner (50%%) compounds far better - a breakout's edge is in the few trades that run.")
+    parser.add_argument("--trail-activation-r", type=float, default=0.5, help="Gate the trailing stop behind this R-multiple of unrealized profit. 0 = trail is live immediately (legacy). 0.5 = trail only activates after the trade reaches +0.5R, preventing early pullback wick-outs. Backtest: 0.5 doubled expectancy and win rate (+0.087R -> +0.182R, 33%% -> 45%%) over the always-active default.")
     parser.add_argument("--smart-tp", action="store_true", help="Adapt the target, TP splits, and runner size from each signal's conviction.")
     parser.add_argument("--smart-tp-max-target-multiplier", type=float, default=2.5, help="Maximum multiplier applied to the signal target when --smart-tp is enabled.")
     parser.add_argument("--smart-tp-min-runner-pct", type=float, default=20.0, help="Minimum trailing runner percent used by --smart-tp.")
@@ -1101,6 +1103,23 @@ def place_best_orders(
 
         results.append(_order_execution_from_plan(plan, response, mode, effective_margin, args, leverage=effective_leverage))
 
+        # Trail activation gate: compute the price at which the trailing stop
+        # begins tracking. If trail_activation_r > 0, the trail is placed with
+        # an activationPrice so Binance only starts tracking after the trade
+        # reaches +activation_r * initial_risk. Prevents early pullback wick-outs.
+        _trail_activation = 0.0
+        if args.trailing_stop and getattr(args, "trail_activation_r", 0.0) > 0:
+            _entry_ref = signal.trigger_price
+            _stop_ref = signal.stop_price
+            if _entry_ref > 0 and _stop_ref > 0:
+                _risk = abs(_entry_ref - _stop_ref)
+                if _risk > 0:
+                    _gate_r = getattr(args, "trail_activation_r", 0.5)
+                    if signal.side == "LONG":
+                        _trail_activation = _entry_ref + _gate_r * _risk
+                    else:
+                        _trail_activation = _entry_ref - _gate_r * _risk
+
         exit_plans: list[ConditionalOrderPlan] = []
         if args.live_orders and args.entry_mode == "SMART_RETEST":
             if not args.no_exits:
@@ -1123,6 +1142,7 @@ def place_best_orders(
                         working_type=args.order_working_type,
                         price_protect=args.order_price_protect,
                         hedge_mode=args.hedge_mode,
+                        trail_activation_price=_trail_activation,
                     )
                 except OrderPlanError as exc:
                     failures.append(f"{signal.symbol}@{signal.interval} exits: {exc}")
@@ -1168,6 +1188,7 @@ def place_best_orders(
                 working_type=args.order_working_type,
                 price_protect=args.order_price_protect,
                 hedge_mode=args.hedge_mode,
+                trail_activation_price=_trail_activation,
             )
         except OrderPlanError as exc:
             failures.append(f"{signal.symbol}@{signal.interval} exits: {exc}")

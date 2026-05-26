@@ -172,6 +172,7 @@ def build_exit_order_plans(
     working_type: str,
     price_protect: bool,
     hedge_mode: bool,
+    trail_activation_price: float = 0.0,
 ) -> list[ConditionalOrderPlan]:
     plans = [
         _build_close_position_plan(
@@ -241,6 +242,7 @@ def build_exit_order_plans(
                     working_type=working_type,
                     hedge_mode=hedge_mode,
                     quantity_override=runner_remainder if runner_remainder > 0 else None,
+                    activation_price_override=trail_activation_price if trail_activation_price > 0 else None,
                 )
             )
         except OrderPlanError:
@@ -348,6 +350,7 @@ def _build_trailing_stop_plan(
     working_type: str,
     hedge_mode: bool,
     quantity_override: Decimal | None = None,
+    activation_price_override: Decimal | None = None,
 ) -> ConditionalOrderPlan:
     callback_rate = format_trailing_callback_pct(callback_pct)
     binance_side, activation_price, rounding = _trailing_stop_params(signal)
@@ -375,8 +378,6 @@ def _build_trailing_stop_plan(
             role="TRAILING_STOP",
         )
     rounded_activation = _round_to_step(activation_price, rule.price_tick_size, rounding=rounding)
-    # activatePrice is omitted so Binance uses the current mark price when the order
-    # is placed on an already-open position, avoiding the "would immediately trigger" 400.
     payload = {
         "algoType": "CONDITIONAL",
         "symbol": signal.symbol,
@@ -388,6 +389,14 @@ def _build_trailing_stop_plan(
         "newOrderRespType": "ACK",
         "clientAlgoId": client_order_id,
     }
+    # Trail activation gate: if an activation price is provided, Binance will
+    # only start tracking the trailing stop once the mark price crosses this
+    # level. This prevents the trail from wicking out on the entry-bar pullback
+    # and gives the trade room to develop. Omitted when 0 (legacy: trail active
+    # from placement, which doubles as an immediate-protection floor).
+    if activation_price_override is not None and activation_price_override > 0:
+        gate_price = _round_to_step(activation_price_override, rule.price_tick_size, rounding=rounding)
+        payload["activationPrice"] = _format_decimal(gate_price)
     if hedge_mode:
         payload["positionSide"] = signal.side
     else:
