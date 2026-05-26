@@ -407,6 +407,64 @@ class SmartRetestManagerTests(unittest.TestCase):
 
         self.assertTrue(cli._pending_exit_is_zombie(client, item, args))
 
+    def test_stale_pending_exit_entry_cancels_for_higher_scoring_signal(self):
+        args = _args(Path("entries.json"), Path("exits.json"))
+        item = {
+            "created_at": int(time.time() - 31 * 60),
+            "entry_submitted_at": time.time() - 31 * 60,
+            "symbol": "TESTUSDT",
+            "side": "LONG",
+            "interval": "15m",
+            "hedge_mode": False,
+            "entry_client_order_id": "test_entry",
+            "entry_stale_minutes": 30.0,
+            "momentum_score": 0.1,
+        }
+        client = _FakeClient(mark_price=100.0)
+        failures: list[str] = []
+
+        with redirect_stdout(StringIO()):
+            cleared = cli._maybe_clear_stale_pending_exit_order(
+                client,
+                item,
+                args,
+                [_breakout_signal(symbol="PHAUSDT")],
+                {"positions": []},
+                failures,
+            )
+
+        self.assertTrue(cleared)
+        self.assertEqual(client.cancelled_algos, [("TESTUSDT", "test_entry")])
+        self.assertEqual(failures, [])
+
+    def test_stale_pending_exit_entry_keeps_filled_position(self):
+        args = _args(Path("entries.json"), Path("exits.json"))
+        item = {
+            "created_at": int(time.time() - 61 * 60),
+            "entry_submitted_at": time.time() - 61 * 60,
+            "symbol": "TESTUSDT",
+            "side": "LONG",
+            "interval": "15m",
+            "hedge_mode": False,
+            "entry_client_order_id": "test_entry",
+            "entry_stale_minutes": 30.0,
+            "momentum_score": 0.1,
+        }
+        client = _FakeClient(mark_price=100.0)
+        account = {"positions": [{"symbol": "TESTUSDT", "positionAmt": "1"}]}
+
+        cleared = cli._maybe_clear_stale_pending_exit_order(
+            client,
+            item,
+            args,
+            [],
+            account,
+            [],
+        )
+
+        self.assertFalse(cleared)
+        self.assertEqual(client.cancelled_algos, [])
+
     def test_saved_pending_exit_preserves_management_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
             exit_file = Path(directory) / "exits.json"
@@ -439,6 +497,11 @@ class SmartRetestManagerTests(unittest.TestCase):
         self.assertEqual(saved["entry_client_order_id"], "test_entry")
         self.assertEqual(saved["leverage"], 13)
         self.assertEqual(saved["entry_regime"], "INSTANT")
+        self.assertGreater(saved["entry_submitted_at"], 0)
+        self.assertEqual(saved["entry_stale_minutes"], args.entry_stale_minutes)
+        self.assertEqual(saved["retest_timeout_seconds"], args.retest_timeout_seconds)
+        self.assertEqual(saved["max_market_deviation_pct"], args.max_market_deviation_pct)
+        self.assertEqual(saved["no_market_fallback"], args.no_market_fallback)
         self.assertGreater(saved["momentum_score"], 0)
         self.assertEqual(saved["trigger_price"], entry_plan.trigger_price)
         self.assertTrue(saved["dynamic_sl"])
@@ -846,6 +909,7 @@ def _args(entry_file: Path, exit_file: Path) -> Namespace:
         max_concurrent_orders=0,
         max_market_deviation_pct=1.5,
         no_market_fallback=False,
+        retest_timeout_seconds=300,
         entry_stale_minutes=30.0,
         dynamic_sl=False,
         sl_update_interval_seconds=300.0,

@@ -2096,6 +2096,31 @@ def _scan_and_arm(client: BinanceClient, args: argparse.Namespace, settings: Bre
                 and abs(_safe_float(position.get("positionAmt"))) > 0
             )
         fresh = [s for s in signals if s.symbol not in pending_symbols]
+    cleared_stale_exits: list[dict[str, object]] = []
+    for item in pending_exits:
+        stale_failures: list[str] = []
+        if _maybe_clear_stale_pending_exit_order(client, item, args, fresh, account, stale_failures):
+            cleared_stale_exits.append(item)
+        for failure in stale_failures:
+            print(f"- {failure}")
+    if cleared_stale_exits:
+        stale_exit_ids = {str(it.get("entry_client_order_id", "")) for it in cleared_stale_exits}
+        pending_exits = [
+            it for it in pending_exits
+            if str(it.get("entry_client_order_id", "")) not in stale_exit_ids
+        ]
+        _write_pending_exit_plans(args.exit_state_file, pending_exits)
+        pending_symbols = {str(item.get("symbol", "")) for item in pending}
+        if args.live_orders:
+            pending_symbols.update(str(item.get("symbol", "")) for item in pending_exits if str(item.get("symbol", "")))
+            pending_symbols.update(
+                str(position.get("symbol", ""))
+                for position in account.get("positions", [])
+                if isinstance(position, dict)
+                and str(position.get("symbol", ""))
+                and abs(_safe_float(position.get("positionAmt"))) > 0
+            )
+        fresh = [s for s in signals if s.symbol not in pending_symbols]
 
     # Position rotation: when every concurrency slot is taken and an exploding coin is
     # waiting, close a weaker open position to make room for it.
@@ -3114,6 +3139,66 @@ def _maybe_clear_stale_entry_order(
     return False
 
 
+def _maybe_clear_stale_pending_exit_order(
+    client: BinanceClient,
+    item: dict[str, object],
+    args: argparse.Namespace,
+    fresh: list[object],
+    account: dict[str, object],
+    failures: list[str],
+) -> bool:
+    """Cancel a stale pre-placed STOP_MARKET/RETEST_LIMIT algo entry.
+
+    Direct exchange-side entries are tracked in the pending-exits file until a
+    position appears. They need the same stale watchdog as ENTRY_ORDER_PLACED
+    records in pending-entries so an old unfilled stop does not reserve a slot
+    forever or fire long after the setup has gone cold.
+    """
+    threshold_min = _entry_stale_minutes_for_item(item, args)
+    if threshold_min <= 0:
+        return False
+    submitted_at = (
+        _safe_float(item.get("entry_submitted_at"))
+        or _safe_float(item.get("created_at"))
+    )
+    if submitted_at <= 0:
+        return False
+    age_seconds = time.time() - submitted_at
+    threshold_seconds = threshold_min * 60.0
+    if age_seconds < threshold_seconds:
+        return False
+
+    symbol = str(item.get("symbol", ""))
+    side = str(item.get("side", ""))
+    hedge_mode = bool(item.get("hedge_mode", False))
+    if _has_open_position(account, symbol=symbol, side=side, hedge_mode=hedge_mode):
+        return False
+
+    own_score = _safe_float(item.get("momentum_score"))
+    has_better_fresh = any(
+        _momentum_score(s) > own_score
+        for s in fresh
+        if str(getattr(s, "symbol", "")) != symbol
+    )
+    hard_timeout = age_seconds >= 2 * threshold_seconds
+    if not (has_better_fresh or hard_timeout):
+        return False
+
+    age_min = age_seconds / 60.0
+    if _cancel_pending_exit_entry_order(client, item, args):
+        reason = "hard timeout" if hard_timeout else "swapped for higher-scoring fresh signal"
+        print(
+            f"{symbol}@{item.get('interval', '')}: stale exchange entry cancelled "
+            f"after {age_min:.1f} min ({reason}); slot freed."
+        )
+        return True
+    failures.append(
+        f"{symbol}@{item.get('interval', '')}: stale exchange entry cancel failed at "
+        f"{age_min:.1f} min, will retry next scan."
+    )
+    return False
+
+
 def _cancel_exit_algos_for_closed_entry(
     client: BinanceClient,
     item: dict[str, object],
@@ -3595,9 +3680,11 @@ def _save_pending_exit_plans(
     entry_regime: str = "STOP_MARKET",
 ) -> None:
     pending = _load_pending_exit_plans(path)
+    now = int(time.time())
     pending.append(
         {
-            "created_at": int(time.time()),
+            "created_at": now,
+            "entry_submitted_at": now,
             "symbol": signal.symbol,
             "side": signal.side,
             "interval": signal.interval,
@@ -3606,10 +3693,14 @@ def _save_pending_exit_plans(
             "quantity": entry_plan.quantity,
             "trigger_price": entry_plan.trigger_price,
             "limit_price": entry_plan.limit_price,
+            "retest_timeout_seconds": args.retest_timeout_seconds,
+            "entry_stale_minutes": args.entry_stale_minutes,
             "entry_client_order_id": entry_plan.client_order_id,
             "leverage": leverage or args.leverage,
             "margin_type": args.margin_type or "",
             "max_concurrent_orders": args.max_concurrent_orders,
+            "max_market_deviation_pct": args.max_market_deviation_pct,
+            "no_market_fallback": args.no_market_fallback,
             "entry_regime": entry_regime,
             "momentum_score": round(_momentum_score(signal), 4),
             "ml_rank_score": round(_live_ml_rank_score(signal, args), 6) if getattr(args, "ml_rank_model_data", None) else 0.0,
