@@ -1876,6 +1876,8 @@ def _consider_rotation(
     exploders = [s for s in fresh if _classify_entry_regime(s) == "INSTANT"]
     if not exploders:
         return 0
+    # Pick the highest-momentum exploder, not just the first one in the list.
+    exploders.sort(key=lambda s: _momentum_score(s), reverse=True)
     exploder = exploders[0]
     # Cooldown: one rotation per ROTATION_COOLDOWN_SECONDS regardless of how
     # often the scan runs - a 3-min scan must not thrash between exploders.
@@ -4725,11 +4727,11 @@ def _place_bracket_side(
 # Slot/queue tuning for the continuous auto-trader.
 HIGH_CONVICTION_MAX_COMPRESSION = 0.08   # compression fraction at/under which a coil is "loaded"
 HIGH_CONVICTION_MIN_VOL_RATIO = 1.3      # volume building into the coil
-ROTATION_MIN_EDGE = 0.20                 # an exploding coin must beat a held position by this margin
+ROTATION_MIN_EDGE = 0.35                 # an exploding coin must beat a held position by this margin
 ROTATION_FEE_RATE = 0.0005               # estimated cost to market-close a position (fraction of notional)
 ROTATION_PROMPT_TIMEOUT = 120            # seconds to wait on the Windows cut-loss prompt
-ROTATION_MIN_HOLD_SECONDS = 90 * 60      # a position must run this long before it can be rotated out
-ROTATION_COOLDOWN_SECONDS = 30 * 60      # minimum gap between rotations, so a fast scan cannot thrash
+ROTATION_MIN_HOLD_SECONDS = 240 * 60     # a position must run this long before it can be rotated out (4h = 4 candles on 1h)
+ROTATION_COOLDOWN_SECONDS = 120 * 60     # minimum gap between rotations (2h), so a fast scan cannot thrash
 
 # Wall-clock time of the last completed rotation; gates ROTATION_COOLDOWN_SECONDS.
 _last_rotation_ts = 0.0
