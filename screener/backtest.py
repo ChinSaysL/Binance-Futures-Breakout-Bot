@@ -279,6 +279,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=1200.0,
         help="Max Binance requests per minute during backtests. 0 disables.",
     )
+    parser.add_argument("--offline-cache-dir", type=Path, default=None, help="Run offline: read klines from {symbol}_{interval}.json and exchange_info.json in this directory. Skips ALL Binance API calls.")
     args = parser.parse_args(argv)
     if args.tp_count <= 0:
         parser.error("--tp-count must be greater than 0")
@@ -521,13 +522,35 @@ def _fetch_klines_window(
     limit: int,
     start_time: int | None,
     end_time: int | None,
+    offline_cache_dir: str | None = None,
 ) -> list[list[object]]:
     """Fetch a historical kline window, paging past Binance's per-call limit.
 
-    Short windows keep the old cache key so existing 1500-candle caches are reused.
-    Longer windows use an ``all`` cache key to avoid accidentally trusting an older
-    partial date-window response.
+    When offline_cache_dir is set, reads directly from {symbol}_{interval}.json
+    files without any API calls.
     """
+    # ── offline mode: read from pre-fetched cache ──
+    if offline_cache_dir is not None:
+        cache_file = Path(offline_cache_dir) / f"{symbol}_{interval}.json"
+        if cache_file.exists():
+            try:
+                all_rows = json.loads(cache_file.read_text(encoding="utf-8"))
+                if not isinstance(all_rows, list):
+                    return []
+                # Filter to the requested time window
+                filtered = []
+                for row in all_rows:
+                    ot = int(row[0])
+                    if start_time is not None and ot < start_time:
+                        continue
+                    if end_time is not None and ot > end_time:
+                        continue
+                    filtered.append(row)
+                return filtered
+            except (OSError, ValueError, json.JSONDecodeError):
+                return []
+        return []
+
     if start_time is None:
         return client.klines(symbol, interval, limit, end_time=end_time)
 
@@ -644,7 +667,9 @@ def _fetch_klines(client: BinanceClient, symbol: str, args: argparse.Namespace, 
     if start_time is not None:
         start_time = max(int(start_time) - 150 * interval_ms, 0)
         limit = 1500
-    return _fetch_klines_window(client, symbol, args.interval, interval_ms, limit, start_time, end_time)
+    offline_dir = str(getattr(args, "offline_cache_dir", None) or "")
+    return _fetch_klines_window(client, symbol, args.interval, interval_ms, limit, start_time, end_time,
+                                offline_cache_dir=offline_dir or None)
 
 
 def _load_market_trend(client: BinanceClient, args: argparse.Namespace, interval_ms: int) -> MarketTrend | None:
@@ -980,6 +1005,37 @@ def _resolve_symbols(client: BinanceClient, args: argparse.Namespace) -> list[st
     """Resolve liquid perpetual futures symbols for the requested quote asset."""
     if args.symbols:
         return [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+
+    # ── offline mode: discover symbols from cache directory ──
+    offline_dir = getattr(args, "offline_cache_dir", None)
+    if offline_dir is not None:
+        cache_dir = Path(offline_dir)
+        # Try cached exchange_info first
+        ei_file = cache_dir / "_exchange_info.json"
+        if ei_file.exists():
+            try:
+                exchange_info = json.loads(ei_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                exchange_info = {}
+        else:
+            exchange_info = {}
+        perpetuals = {
+            str(item.get("symbol", ""))
+            for item in exchange_info.get("symbols", [])
+            if item.get("status") == "TRADING"
+            and item.get("contractType") == "PERPETUAL"
+            and (args.quote.upper() == "ALL" or item.get("quoteAsset") == args.quote.upper())
+        }
+        if not perpetuals:
+            # Fallback: discover from cache file names
+            import re as _re
+            pattern = _re.compile(r"^([A-Z0-9]+)_1h\.json$")
+            for f in cache_dir.iterdir():
+                m = pattern.match(f.name)
+                if m:
+                    perpetuals.add(m.group(1))
+        return sorted(s for s in perpetuals if s.isascii() and s.isalnum())
+
     quote = args.quote.upper()
     exchange_info = client.exchange_info()
     perpetuals = {

@@ -14,6 +14,11 @@
 
 # --- Local kline cache (regenerated on demand; ~GB-scale) ---
 .backtest_kline_cache/
+_kline_cache/
+_sweep/
+_sweep_cache/
+backtest_*.csv
+validate_smoke*.csv
 
 # --- Trade logs (default output of --trade-log; rotated per run) ---
 backtest_trades.csv

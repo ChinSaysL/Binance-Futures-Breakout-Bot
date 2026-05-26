@@ -65,7 +65,7 @@ def run_backtest(name: str, window: str, start: str, end: str, extra: list[str])
         "--simulate-rotation",
         "--start-date", start, "--end-date", end,
         "--trade-log", f"_sweep/{name}_{window}.csv",
-        "--rate-limit-rpm", "800",
+        "--rate-limit-rpm", "600",
     ] + extra
 
     t0 = time.time()
