@@ -265,6 +265,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--short-guard-ema-slack-pct", type=float, default=0.0, help="Allow SHORT signals only when BTC is no more than this percent above EMA.")
     parser.add_argument("--loss-cooldown-after", type=int, default=1, help="With --loss-cooldown-candles, pause a symbol after this many consecutive realized losses on that symbol.")
     parser.add_argument("--loss-cooldown-candles", type=int, default=48, help="Pause new entries on the losing symbol for N candles after the loss threshold is hit. 0 disables.")
+    parser.add_argument("--win-cooldown-after", type=int, default=1, help="With --win-cooldown-candles, pause a symbol after this many consecutive realized wins on that symbol.")
+    parser.add_argument("--win-cooldown-candles", type=int, default=0, help="Pause new entries on a winning symbol for N candles after the win threshold is hit. 0 disables (default).")
     parser.add_argument("--instant-size-multiplier", type=float, default=0.5, help="Moonshot sizing multiplier for INSTANT regimes.")
     parser.add_argument("--retest-size-multiplier", type=float, default=0.9, help="Moonshot sizing multiplier for RETEST regimes.")
     parser.add_argument("--trailing-retest-size-multiplier", type=float, default=0.5, help="Moonshot sizing multiplier for TRAILING_RETEST regimes.")
@@ -311,6 +313,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         parser.error("--loss-cooldown-after must be greater than 0")
     if args.loss_cooldown_candles < 0:
         parser.error("--loss-cooldown-candles must be zero or greater")
+    if args.win_cooldown_after <= 0:
+        parser.error("--win-cooldown-after must be greater than 0")
+    if args.win_cooldown_candles < 0:
+        parser.error("--win-cooldown-candles must be zero or greater")
     if args.rate_limit_rpm < 0:
         parser.error("--rate-limit-rpm must be zero or greater")
     if args.instant_size_multiplier < 0 or args.retest_size_multiplier < 0 or args.trailing_retest_size_multiplier < 0:
@@ -1670,6 +1676,7 @@ def _simulate_portfolio(
     interval_ms = interval_to_ms(args.interval)
     cooldown_until_by_symbol: dict[str, int] = {}
     consecutive_losses_by_symbol: dict[str, int] = {}
+    consecutive_wins_by_symbol: dict[str, int] = {}
 
     def realize(cutoff: float) -> None:
         nonlocal equity, peak, max_drawdown
@@ -1681,6 +1688,7 @@ def _simulate_portfolio(
             if position.net_pnl < 0:
                 losses = consecutive_losses_by_symbol.get(position.symbol, 0) + 1
                 consecutive_losses_by_symbol[position.symbol] = losses
+                consecutive_wins_by_symbol[position.symbol] = 0
                 if args.loss_cooldown_candles > 0 and losses >= args.loss_cooldown_after:
                     cooldown_until_by_symbol[position.symbol] = max(
                         cooldown_until_by_symbol.get(position.symbol, 0),
@@ -1688,6 +1696,13 @@ def _simulate_portfolio(
                     )
             else:
                 consecutive_losses_by_symbol[position.symbol] = 0
+                wins = consecutive_wins_by_symbol.get(position.symbol, 0) + 1
+                consecutive_wins_by_symbol[position.symbol] = wins
+                if args.win_cooldown_candles > 0 and wins >= args.win_cooldown_after:
+                    cooldown_until_by_symbol[position.symbol] = max(
+                        cooldown_until_by_symbol.get(position.symbol, 0),
+                        position.exit_time + args.win_cooldown_candles * interval_ms,
+                    )
             peak = max(peak, equity)
             if peak > 0:
                 max_drawdown = max(max_drawdown, (peak - equity) / peak * 100.0)
@@ -1696,7 +1711,10 @@ def _simulate_portfolio(
         realize(trade.entry_time)
         if equity <= 0:
             break  # account blown up
-        if args.loss_cooldown_candles > 0 and trade.entry_time < cooldown_until_by_symbol.get(trade.symbol, 0):
+        if (
+            (args.loss_cooldown_candles > 0 or args.win_cooldown_candles > 0)
+            and trade.entry_time < cooldown_until_by_symbol.get(trade.symbol, 0)
+        ):
             continue
         max_concurrent = _max_concurrent_for_equity(equity, args)
         if len(open_positions) >= max_concurrent:
@@ -1772,6 +1790,7 @@ def _simulate_portfolio_with_rotation(
     interval_ms = interval_to_ms(args.interval)
     cooldown_until_by_symbol: dict[str, int] = {}
     consecutive_losses_by_symbol: dict[str, int] = {}
+    consecutive_wins_by_symbol: dict[str, int] = {}
     open_positions: list[dict] = []
     taken: list[BacktestTrade] = []
     last_rotation_time_ms = 0
@@ -1815,6 +1834,7 @@ def _simulate_portfolio_with_rotation(
         if net_pnl < 0:
             losses = consecutive_losses_by_symbol.get(trade.symbol, 0) + 1
             consecutive_losses_by_symbol[trade.symbol] = losses
+            consecutive_wins_by_symbol[trade.symbol] = 0
             if args.loss_cooldown_candles > 0 and losses >= args.loss_cooldown_after:
                 cooldown_until_by_symbol[trade.symbol] = max(
                     cooldown_until_by_symbol.get(trade.symbol, 0),
@@ -1822,6 +1842,13 @@ def _simulate_portfolio_with_rotation(
                 )
         else:
             consecutive_losses_by_symbol[trade.symbol] = 0
+            wins = consecutive_wins_by_symbol.get(trade.symbol, 0) + 1
+            consecutive_wins_by_symbol[trade.symbol] = wins
+            if args.win_cooldown_candles > 0 and wins >= args.win_cooldown_after:
+                cooldown_until_by_symbol[trade.symbol] = max(
+                    cooldown_until_by_symbol.get(trade.symbol, 0),
+                    exit_time_ms + args.win_cooldown_candles * interval_ms,
+                )
         peak = max(peak, equity)
         if peak > 0:
             max_drawdown = max(max_drawdown, (peak - equity) / peak * 100.0)
@@ -1861,7 +1888,10 @@ def _simulate_portfolio_with_rotation(
         realize_natural_exits(trade.entry_time)
         if equity <= 0:
             break
-        if args.loss_cooldown_candles > 0 and trade.entry_time < cooldown_until_by_symbol.get(trade.symbol, 0):
+        if (
+            (args.loss_cooldown_candles > 0 or args.win_cooldown_candles > 0)
+            and trade.entry_time < cooldown_until_by_symbol.get(trade.symbol, 0)
+        ):
             continue
         max_concurrent = _max_concurrent_for_equity(equity, args)
         if len(open_positions) < max_concurrent:
@@ -2251,6 +2281,11 @@ def _print_report(
         print(
             f"Risk guard  pause each symbol {args.loss_cooldown_candles} candle(s) after "
             f"{args.loss_cooldown_after} realized loss(es) on that symbol"
+        )
+    if args.win_cooldown_candles > 0:
+        print(
+            f"Risk guard  pause each symbol {args.win_cooldown_candles} candle(s) after "
+            f"{args.win_cooldown_after} realized win(s) on that symbol"
         )
     if args.entry_on_signal_close:
         print("Entry      confirmed breakouts enter on signal close")
