@@ -529,27 +529,26 @@ def _fetch_klines_window(
     When offline_cache_dir is set, reads directly from {symbol}_{interval}.json
     files without any API calls.
     """
-    # ── offline mode: read from pre-fetched cache ──
+    # ── offline mode: read from pre-fetched cache as fallback ──
     if offline_cache_dir is not None:
         cache_file = Path(offline_cache_dir) / f"{symbol}_{interval}.json"
         if cache_file.exists():
             try:
                 all_rows = json.loads(cache_file.read_text(encoding="utf-8"))
-                if not isinstance(all_rows, list):
-                    return []
-                # Filter to the requested time window
-                filtered = []
-                for row in all_rows:
-                    ot = int(row[0])
-                    if start_time is not None and ot < start_time:
-                        continue
-                    if end_time is not None and ot > end_time:
-                        continue
-                    filtered.append(row)
-                return filtered
+                if isinstance(all_rows, list):
+                    filtered = []
+                    for row in all_rows:
+                        ot = int(row[0])
+                        if start_time is not None and ot < start_time:
+                            continue
+                        if end_time is not None and ot > end_time:
+                            continue
+                        filtered.append(row)
+                    if filtered:
+                        return filtered
             except (OSError, ValueError, json.JSONDecodeError):
-                return []
-        return []
+                pass
+        # Cache miss or no data in window — try API below
 
     if start_time is None:
         return client.klines(symbol, interval, limit, end_time=end_time)
@@ -1001,6 +1000,21 @@ def _rel_strength_allows(
     return coin_momentum - point.momentum_pct >= args.min_rel_strength_pct
 
 
+def _offline_discover_symbols(cache_dir: Path) -> list[str]:
+    """Discover symbols from cached {symbol}_1h.json files in a directory."""
+    import re as _re
+    pattern = _re.compile(r"^([A-Z0-9]+)_1h\.json$")
+    symbols = set()
+    try:
+        for f in cache_dir.iterdir():
+            m = pattern.match(f.name)
+            if m:
+                symbols.add(m.group(1))
+    except OSError:
+        pass
+    return sorted(s for s in symbols if s.isascii() and s.isalnum())
+
+
 def _resolve_symbols(client: BinanceClient, args: argparse.Namespace) -> list[str]:
     """Resolve liquid perpetual futures symbols for the requested quote asset."""
     if args.symbols:
@@ -1009,35 +1023,23 @@ def _resolve_symbols(client: BinanceClient, args: argparse.Namespace) -> list[st
     # ── offline mode: discover symbols from cache directory ──
     offline_dir = getattr(args, "offline_cache_dir", None)
     if offline_dir is not None:
-        cache_dir = Path(offline_dir)
-        # Try cached exchange_info first
-        ei_file = cache_dir / "_exchange_info.json"
-        if ei_file.exists():
-            try:
-                exchange_info = json.loads(ei_file.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                exchange_info = {}
-        else:
-            exchange_info = {}
-        perpetuals = {
-            str(item.get("symbol", ""))
-            for item in exchange_info.get("symbols", [])
-            if item.get("status") == "TRADING"
-            and item.get("contractType") == "PERPETUAL"
-            and (args.quote.upper() == "ALL" or item.get("quoteAsset") == args.quote.upper())
-        }
-        if not perpetuals:
-            # Fallback: discover from cache file names
-            import re as _re
-            pattern = _re.compile(r"^([A-Z0-9]+)_1h\.json$")
-            for f in cache_dir.iterdir():
-                m = pattern.match(f.name)
-                if m:
-                    perpetuals.add(m.group(1))
-        return sorted(s for s in perpetuals if s.isascii() and s.isalnum())
+        return _offline_discover_symbols(Path(offline_dir))
 
     quote = args.quote.upper()
-    exchange_info = client.exchange_info()
+    try:
+        exchange_info = client.exchange_info()
+    except BinanceClientError:
+        # API banned or offline — fall back to cache directory
+        offline_dir = getattr(args, "offline_cache_dir", None)
+        if offline_dir is not None:
+            print("exchange_info unavailable (API ban); discovering symbols from offline cache")
+            return _offline_discover_symbols(Path(offline_dir))
+        # Try _kline_cache as a last resort
+        fallback = Path("_kline_cache")
+        if fallback.is_dir():
+            print("exchange_info unavailable (API ban); discovering symbols from _kline_cache/")
+            return _offline_discover_symbols(fallback)
+        raise
     perpetuals = {
         str(item.get("symbol", ""))
         for item in exchange_info.get("symbols", [])
