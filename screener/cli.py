@@ -3953,6 +3953,7 @@ def _save_pending_exit_plans(
             "stagnation_candles": args.stagnation_candles,
             "stagnation_lookback": args.stagnation_lookback,
             "max_sl_loss_pct": args.max_sl_loss_pct,
+            "software_trail": _software_trail_metadata(args, signal, entry_plan.quantity) if args.trailing_stop and getattr(args, "software_trail", False) else None,
             "smart_tp": args.smart_tp,
             "smart_tp_max_target_multiplier": args.smart_tp_max_target_multiplier,
             "smart_tp_min_runner_pct": args.smart_tp_min_runner_pct,
