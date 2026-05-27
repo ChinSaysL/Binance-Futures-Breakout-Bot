@@ -1828,6 +1828,17 @@ def _exploder_entry_ready(
     fresh = _fresh_order_signal(client, exploder, args, settings)
     if fresh is None:
         return None, "no longer confirms on recheck"
+    # Check BTC market/chop guards before considering this exploder valid.
+    # Without this, rotation can close a position for a coin that gets
+    # immediately rejected by regime filters in place_best_orders.
+    entry_regime = _classify_entry_regime(fresh)
+    if entry_regime in (getattr(args, "skip_entry_regimes", None) or set()):
+        return None, f"entry regime {entry_regime} is skipped"
+    btc_guard_point = _current_btc_guard_point(client, args)
+    if btc_reason := _btc_guard_reject_reason(entry_regime, btc_guard_point, args):
+        return None, btc_reason
+    if chop_reason := _btc_chop_guard_reject_reason(fresh, entry_regime, btc_guard_point, args):
+        return None, chop_reason
     try:
         rules = trading_rules_from_exchange_info(client.exchange_info())
     except BinanceClientError as exc:
