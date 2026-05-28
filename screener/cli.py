@@ -639,6 +639,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--btc-chop-ema-abs-pct", type=float, default=1.5, help="BTC is choppy when absolute BTC close-vs-EMA distance is at or below this percent. Default 1.5 (3-window-validated idx18 config).")
     parser.add_argument("--btc-chop-skip-entry-regimes", default="", help="Comma-separated regimes skipped only while BTC is choppy, e.g. INSTANT.")
     parser.add_argument("--btc-chop-instant-min-rel-strength-pct", type=float, default=4.0, help="When BTC is choppy, require INSTANT signals to beat BTC momentum by this percent. Default 4.0 (3-window-validated idx18 config); pass 0 to disable the relative-strength gate.")
+    parser.add_argument("--bear-profile", action="store_true", help="Activate bear-market-optimised strategy: auto-enables shorts, applies INSTANT quality filters (BTC>EMA, rel>=3%%, vol>=3.5x), runs bear-bounce and failed-rally detectors alongside standard breakout. Based on hyperopt-verified parameters (228 backtests, W1: $40->$1054).")
     parser.add_argument("--two-sided-entry", action="store_true", help="For coiling coins with no clear direction, arm a breakout bracket on BOTH sides. Whichever side breaks out first enters; the opposite side is cancelled. SMART_RETEST live mode only.")
     parser.add_argument("--detector", choices=["simple", "squeeze"], default="simple", help="simple = high-recall long-only breakout detector (default); squeeze = the original pre-breakout/short detector.")
     parser.add_argument("--dynamic-sl", action="store_true", help="Reposition the stop loss on open positions as new support/resistance levels form.")
@@ -2123,6 +2124,88 @@ def _scan_and_arm(client: BinanceClient, args: argparse.Namespace, settings: Bre
     now_ms = int(time.time() * 1000)
     signals, _ = scan_symbols(client, universe.symbols, args, settings, _resolve_intervals(args), now_ms)
     signals = [s for s in signals if s.reward_risk >= args.min_rr and s.score >= args.min_score]
+
+    # ── Bear profile: detect bearish BTC regime ───────────────────────
+    bear_active = False
+    if getattr(args, "bear_profile", False):
+        try:
+            btc_klines = client.klines("BTCUSDT", "1h", 168)  # ~7 days
+            btc_candles = candles_from_klines(btc_klines)
+            if len(btc_candles) >= 72:
+                btc_return = (btc_candles[-1].close / btc_candles[0].close - 1.0) * 100.0
+                bear_active = btc_return <= -5.0
+        except Exception:
+            bear_active = False
+
+    # ── Bear profile: add bear-bounce + FADE signals ──────────────────
+    if bear_active:
+        from screener.breakout import detect_bear_bounce, detect_failed_rally
+        extra_signals: list[BreakoutSignal] = []
+        for sym_info in universe.symbols:
+            for interval in _resolve_intervals(args):
+                try:
+                    klines = client.klines(sym_info.symbol, interval, args.history + 1)
+                    candles = candles_from_klines(klines)
+                    if args.closed_candles_only and candles and candles[-1].close_time > now_ms:
+                        candles = candles[:-1]
+                    interval_ms = interval_to_ms(interval)
+                    bb = detect_bear_bounce(sym_info.symbol, candles, sym_info.quote_volume_24h, interval_ms, interval, sym_info.range_pct_24h, settings, now_ms)
+                    if bb and bb.reward_risk >= args.min_rr and bb.score >= args.min_score:
+                        extra_signals.append(bb)
+                    fr = detect_failed_rally(sym_info.symbol, candles, sym_info.quote_volume_24h, interval_ms, interval, sym_info.range_pct_24h, settings, now_ms)
+                    if fr and fr.reward_risk >= args.min_rr and fr.score >= args.min_score:
+                        extra_signals.append(fr)
+                except Exception:
+                    pass
+        signals.extend(extra_signals)
+
+    # ── Bear profile: INSTANT quality filters ─────────────────────────
+    if bear_active:
+        btc_point = None
+        try:
+            btc_klines = client.klines("BTCUSDT", "1h", 72)
+            btc_candles_72 = candles_from_klines(btc_klines)
+            if len(btc_candles_72) >= 21:
+                closes = [c.close for c in btc_candles_72[-21:]]
+                ema20 = sum(closes) / len(closes)
+                btc_close = btc_candles_72[-1].close
+                prev_close_72 = btc_candles_72[0].close if len(btc_candles_72) >= 72 else btc_candles_72[0].close
+                btc_mom = (btc_close / max(prev_close_72, 1e-9) - 1.0) * 100.0 if len(btc_candles_72) >= 72 else 0.0
+                btc_point = type('obj', (object,), {'close': btc_close, 'ema': ema20, 'momentum_pct': btc_mom})()
+        except Exception:
+            pass
+
+        filtered = []
+        for s in signals:
+            if s.status != "BEAR_BOUNCE" and s.status != "FADE":
+                regime = _classify_entry_regime(s)
+                if regime == "INSTANT" and s.side == "LONG":
+                    if s.volume_ratio < 3.5:
+                        continue  # vol too low
+                    if btc_point is not None and btc_point.close < btc_point.ema:
+                        continue  # BTC below EMA
+            filtered.append(s)
+        signals = filtered
+
+    # ── Bear profile: auto-enable shorts ──────────────────────────────
+    if bear_active:
+        from screener.breakout import detect_short_breakdown
+        short_signals: list[BreakoutSignal] = []
+        for sym_info in universe.symbols:
+            for interval in _resolve_intervals(args):
+                try:
+                    klines = client.klines(sym_info.symbol, interval, args.history + 1)
+                    candles = candles_from_klines(klines)
+                    if args.closed_candles_only and candles and candles[-1].close_time > now_ms:
+                        candles = candles[:-1]
+                    interval_ms = interval_to_ms(interval)
+                    ss = detect_short_breakdown(sym_info.symbol, candles, sym_info.quote_volume_24h, interval_ms, interval, sym_info.range_pct_24h, settings, now_ms)
+                    if ss and ss.reward_risk >= args.min_rr and ss.score >= args.min_score:
+                        short_signals.append(ss)
+                except Exception:
+                    pass
+        signals.extend(short_signals)
+
     _rank_order_signals(signals, args)
     if not signals:
         _quiet_scan_heartbeat()
