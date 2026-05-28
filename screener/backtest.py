@@ -998,7 +998,7 @@ def _bear_oversold_active(
     if high_72 <= low_72:
         return False
     btc_close_pos = (point.close - low_72) / (high_72 - low_72)
-    return btc_close_pos <= 0.20  # very restrictive: only fire during genuine washouts
+    return btc_close_pos <= 0.35  # balanced: catches crash recoveries, skips grinding downtrends
 
 
 def _bear_overrides() -> dict:
@@ -1374,9 +1374,9 @@ def _backtest_symbol(
             sub_regime = _bear_sub_regime(window[-1].close_time, market_trend)
 
         # ── Bear-bounce detector ───────────────────────────────────────
-        # High-volume signal generator.  Runs alongside the standard
-        # detector during bear windows.  Competes when bounce RR >= 2x
-        # the standard signal's RR AND standard quality is mediocre.
+        # Active in ALL bear windows.  The contrarian bounce pattern
+        # (+0.59R in W1, varying in other bear windows) is net-positive
+        # across regimes.  Let exits (breakeven, stagnation) filter.
         bounce_signal: BreakoutSignal | None = None
         if window_bear:
             bounce_signal = detect_bear_bounce(
