@@ -1793,16 +1793,15 @@ def _backtest_symbol(
                 index += 1
                 continue
 
-        # ── Fix: Block BREAKDOWN when window-level BTC return is positive ──
-        # BREAKDOWN shorts bled -$392 in 2024 (34.4% WR on 93 trades).  In
-        # a positive-BTC year these counter-trend trades are essentially
-        # donations.  Gate: if the full-window BTC return is > 0, skip all
-        # BREAKDOWN signals.
-        if (signal.status == "BREAKDOWN"
-                and btc_return is not None
-                and btc_return > 0):
-            index += 1
-            continue
+        # ── BREAKDOWN gate: only allow shorts when BTC is already weak ──
+        # BREAKDOWN shorts bled -$392 in 2024 (34.4% WR on 93 trades).
+        # Counter-trend shorts need a bearish macro backdrop to have edge.
+        # Uses per-timestamp 60-day BTC return — no hindsight, works live.
+        if signal.status == "BREAKDOWN":
+            ret_60d = _btc_return_pct(window[-1].close_time, market_trend, _MS_60D) if market_trend else None
+            if ret_60d is not None and ret_60d > -5.0:
+                index += 1
+                continue  # BTC not bearish enough — skip BREAKDOWN
 
         # ── Bear-profile guard overrides ──────────────────────────────
         # Use window-level bear detection (not per-timestamp) for guard
