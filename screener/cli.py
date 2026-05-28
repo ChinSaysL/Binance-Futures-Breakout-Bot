@@ -645,11 +645,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dynamic-sl", action="store_true", help="Reposition the stop loss on open positions as new support/resistance levels form.")
     parser.add_argument("--sl-update-interval-seconds", type=float, default=300.0, help="How often (seconds) to re-evaluate and reposition the dynamic stop loss. Default 300.")
     parser.add_argument("--sl-lookback", type=int, default=20, help="Number of candles to look back when computing support/resistance for dynamic SL. Default 20.")
-    parser.add_argument("--breakeven-trigger-r", type=float, default=1.5, help="Once unrealized profit reaches this R multiple, ratchet the stop to breakeven + a small profit lock. 0 = off. Default 1.5 was the worst-case-best in a 12-run sweep.")
+    parser.add_argument("--breakeven-trigger-r", type=float, default=0.0, help="Once unrealized profit reaches this R multiple, ratchet the stop to breakeven + a small profit lock. 0 = off. Per-window hyperopt: 0 (off) won on 5/6 windows.")
     parser.add_argument("--breakeven-offset-pct", type=float, default=0.1, help="When the breakeven trigger fires, the new stop sits this percent past entry (locks tiny profit + covers fees).")
     parser.add_argument("--exhaustion-exit", action="store_true", help="Monitor open positions and market-close once a trade has reached +0.5R and then shows peak rejection or 4 closed candles with no new high. NOTE: a 4-window sweep showed the hardcoded 4-candle stall is too tight for breakout consolidations (cut avg-win in half, -96%% on equity). Use --stagnation-after-r/--stagnation-candles instead.")
     parser.add_argument("--exhaustion-lookback", type=int, default=80, help="Closed candles fetched per monitored position for --exhaustion-exit.")
-    parser.add_argument("--stagnation-after-r", type=float, default=0.0, help="Stagnation exit: once unrealized profit reaches this R multiple, exit if no new favourable extreme appears for --stagnation-candles bars. 0 = off. Parameterized replacement for --exhaustion-exit (no rejection-candle path, configurable stall). Validated default: 0.5.")
+    parser.add_argument("--stagnation-after-r", type=float, default=1.0, help="Stagnation exit: once unrealized profit reaches this R multiple, exit if no new favourable extreme appears for --stagnation-candles bars. 0 = off. Per-window hyperopt: 1.0 won on W2/W3/W6 (let runners run), 0.5 on W1/W4/W5.")
     parser.add_argument("--stagnation-candles", type=int, default=12, help="Stagnation exit: closed candles of no new favourable extreme before market-closing. Only fires after --stagnation-after-r is reached. 12 was the worst-case-best in a 4-window sweep (W3 +19831%% vs +11127%% with no stagnation).")
     parser.add_argument("--stagnation-lookback", type=int, default=80, help="Closed candles fetched per monitored position for --stagnation-after-r.")
     parser.add_argument("--no-exits", action="store_true", help="Only place entry orders; do not place stop-loss/take-profit exit algo orders.")
@@ -2108,10 +2108,16 @@ def _drop_stale_waiting_entries(
 
 def _scan_and_arm(client: BinanceClient, args: argparse.Namespace, settings: BreakoutSettings) -> None:
     """Scan the market, re-rank the queue, and arm the strongest fresh opportunities."""
+    import copy
+    args = copy.copy(args)
     args._live_ml_symbol_context = _load_ml_symbol_context(args.ml_context_file)
     args._live_ml_btc_context = (
         _current_btc_ml_context(client, args)
-        if getattr(args, "ml_rank_model_data", None) or getattr(args, "btc_chop_guards", False)
+        if (
+            getattr(args, "ml_rank_model_data", None)
+            or getattr(args, "btc_chop_guards", False)
+            or getattr(args, "bear_profile", False)
+        )
         else {}
     )
     universe = _resolve_symbols(client, args)
@@ -2140,6 +2146,17 @@ def _scan_and_arm(client: BinanceClient, args: argparse.Namespace, settings: Bre
     # ── Bear profile: add bear-bounce + FADE signals ──────────────────
     if bear_active:
         from screener.breakout import detect_bear_bounce, detect_failed_rally
+        try:
+            from screener.backtest import _bear_overrides
+            overrides = _bear_overrides()
+            if "tp_count" in overrides: args.tp_count = overrides["tp_count"]
+            if "trailing_stop" in overrides: args.trailing_stop = overrides["trailing_stop"]
+            if "runner_pct" in overrides: args.trailing_runner_pct = overrides["runner_pct"]
+            if "breakeven_trigger_r" in overrides: args.breakeven_trigger_r = overrides["breakeven_trigger_r"]
+            if "stagnation_after_r" in overrides: args.stagnation_after_r = overrides["stagnation_after_r"]
+            if "stagnation_candles" in overrides: args.stagnation_candles = overrides["stagnation_candles"]
+        except ImportError:
+            pass
         extra_signals: list[BreakoutSignal] = []
         for sym_info in universe.symbols:
             for interval in _resolve_intervals(args):
@@ -2153,7 +2170,12 @@ def _scan_and_arm(client: BinanceClient, args: argparse.Namespace, settings: Bre
                     if bb and bb.reward_risk >= args.min_rr and bb.score >= args.min_score:
                         extra_signals.append(bb)
                     fr = detect_failed_rally(sym_info.symbol, candles, sym_info.quote_volume_24h, interval_ms, interval, sym_info.range_pct_24h, settings, now_ms)
-                    if fr and fr.reward_risk >= args.min_rr and fr.score >= args.min_score:
+                    if (
+                        fr
+                        and fr.reward_risk >= args.min_rr
+                        and fr.score >= args.min_score
+                        and _live_bear_short_quality_allows(fr, candles, args)
+                    ):
                         extra_signals.append(fr)
                 except Exception:
                     pass
@@ -2189,7 +2211,6 @@ def _scan_and_arm(client: BinanceClient, args: argparse.Namespace, settings: Bre
 
     # ── Bear profile: auto-enable shorts ──────────────────────────────
     if bear_active:
-        from screener.breakout import detect_short_breakdown
         short_signals: list[BreakoutSignal] = []
         for sym_info in universe.symbols:
             for interval in _resolve_intervals(args):
@@ -2200,7 +2221,12 @@ def _scan_and_arm(client: BinanceClient, args: argparse.Namespace, settings: Bre
                         candles = candles[:-1]
                     interval_ms = interval_to_ms(interval)
                     ss = detect_short_breakdown(sym_info.symbol, candles, sym_info.quote_volume_24h, interval_ms, interval, sym_info.range_pct_24h, settings, now_ms)
-                    if ss and ss.reward_risk >= args.min_rr and ss.score >= args.min_score:
+                    if (
+                        ss
+                        and ss.reward_risk >= args.min_rr
+                        and ss.score >= args.min_score
+                        and _live_bear_short_quality_allows(ss, candles, args)
+                    ):
                         short_signals.append(ss)
                 except Exception:
                     pass
@@ -5107,6 +5133,42 @@ def _live_market_signal_context(signal: BreakoutSignal, candles: list[object], a
     return context
 
 
+def _remember_live_signal_context(signal: BreakoutSignal, candles: list[object], args: argparse.Namespace) -> dict[str, float]:
+    context = _live_market_signal_context(signal, candles, args)
+    signal_contexts = getattr(args, "_live_ml_signal_contexts", {}) or {}
+    if isinstance(signal_contexts, dict):
+        signal_contexts[(signal.symbol, signal.interval)] = context
+        args._live_ml_signal_contexts = signal_contexts
+    return context
+
+
+def _live_bear_short_quality_allows(signal: BreakoutSignal, candles: list[object], args: argparse.Namespace) -> bool:
+    from screener.breakout import (
+        short_has_bear_trend,
+        short_has_failed_bounce,
+        short_is_controlled_failed_rally,
+        short_is_crash_continuation,
+        short_has_crash_setup,
+    )
+    if not short_has_bear_trend(candles):
+        return False
+    context = _remember_live_signal_context(signal, candles, args)
+    btc_mom = context.get("feat_btc_momentum_pct", 0.0)
+    rel_mom = context.get("feat_rel_momentum_pct", 0.0)
+    
+    if signal.status == "FADE":
+        from screener.breakout import BEAR_SHORT_CONTROLLED_MAX_BTC_MOM_PCT
+        return btc_mom <= BEAR_SHORT_CONTROLLED_MAX_BTC_MOM_PCT
+        
+    if signal.status == "BREAKDOWN":
+        if short_is_controlled_failed_rally(btc_mom, rel_mom) and short_has_failed_bounce(candles):
+            return True
+        if short_is_crash_continuation(btc_mom, rel_mom) and short_has_crash_setup(candles):
+            return True
+            
+    return False
+
+
 def _live_symbol_context(signal: BreakoutSignal, args: argparse.Namespace) -> dict[str, float]:
     raw_context = getattr(args, "_live_ml_symbol_context", {}) or {}
     recent = raw_context.get(signal.symbol, []) if isinstance(raw_context, dict) else []
@@ -5204,18 +5266,27 @@ def _live_ml_rank_score(signal: BreakoutSignal, args: argparse.Namespace) -> flo
     return _live_ml_scores_with_args(signal, model, args).get(args.ml_rank_score, 0.0)
 
 
+def _signal_selection_priority(signal: BreakoutSignal, args: argparse.Namespace) -> float:
+    context = getattr(args, "_live_ml_signal_contexts", {}) or {}
+    signal_context = context.get((signal.symbol, signal.interval), {}) if isinstance(context, dict) else {}
+    rel_mom = _safe_float(signal_context.get("feat_rel_momentum_pct")) if isinstance(signal_context, dict) else 0.0
+    btc_mom = _safe_float(signal_context.get("feat_btc_momentum_pct")) if isinstance(signal_context, dict) else 0.0
+    signed_rel = rel_mom if signal.side == "LONG" else -rel_mom
+    signed_btc = btc_mom if signal.side == "LONG" else -btc_mom
+    score_bias = max(signal.score - 90.0, 0.0) / 20.0
+    return _momentum_score(signal) + score_bias + (signed_rel * 0.02) + (signed_btc * 0.005)
+
+
 def _rank_order_signals(signals: list[BreakoutSignal], args: argparse.Namespace) -> None:
-    # Sort by momentum so the priority key matches what the rotation system
-    # and stale-entry watchdog use (momentum_score). Previously this was gated
-    # on --adaptive-entry, so without that flag the queue was ranked by
-    # quality_score while rotation compared by momentum_score - the "best"
-    # signal in the queue could be a different one than rotation would
-    # actually swap to. Quality sort remains available as a tiebreaker.
-    fallback_key = _momentum_sort_key
     if getattr(args, "ml_rank_model_data", None):
-        signals.sort(key=lambda signal: (-_live_ml_rank_score(signal, args), *fallback_key(signal)))
+        signals.sort(
+            key=lambda signal: (
+                -_live_ml_rank_score(signal, args),
+                *_selection_sort_key(signal, args),
+            )
+        )
     else:
-        signals.sort(key=fallback_key)
+        signals.sort(key=lambda signal: _selection_sort_key(signal, args))
 
 
 def _momentum_score(signal: BreakoutSignal) -> float:
@@ -5238,6 +5309,16 @@ def _is_high_conviction(signal: BreakoutSignal) -> bool:
 def _momentum_sort_key(signal: BreakoutSignal) -> tuple[float, float, float, int, str]:
     return (
         -_momentum_score(signal),
+        -signal.score,
+        -signal.reward_risk,
+        _interval_rank(signal.interval),
+        signal.symbol,
+    )
+
+
+def _selection_sort_key(signal: BreakoutSignal, args: argparse.Namespace) -> tuple[float, float, float, int, str]:
+    return (
+        -_signal_selection_priority(signal, args),
         -signal.score,
         -signal.reward_risk,
         _interval_rank(signal.interval),

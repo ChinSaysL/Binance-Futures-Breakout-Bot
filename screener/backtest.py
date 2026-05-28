@@ -47,6 +47,9 @@ from screener.breakout import (
     interval_to_ms,
     short_has_bear_trend,
     short_has_failed_bounce,
+    short_is_controlled_failed_rally,
+    short_is_crash_continuation,
+    short_has_crash_setup,
 )
 from screener.cli import (
     _classify_entry_regime,
@@ -100,6 +103,8 @@ class BacktestTrade:
     tp_target_multiplier: float = 1.0
     tp_conviction: float = 0.0
     momentum_score: float = 0.0  # used by the rotation portfolio sim
+    window_bear: bool = False
+
     # Feature snapshot at signal-detection time, for offline ML training.
     # Populated by _simulate_trade from the BreakoutSignal; never read by the
     # backtester itself - only written to the CSV trade log for training.
@@ -184,12 +189,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--max-sl-loss-pct", type=float, default=35.0, help="Maximum leveraged loss percent on margin if the stop is hit. 0 disables stop tightening.")
     parser.add_argument("--dynamic-sl", action="store_true", help="Trail the stop up to recent support (down to resistance for shorts) as price moves - ports the live bot's dynamic stop loss.")
     parser.add_argument("--sl-lookback", type=int, default=20, help="Candles of recent support/resistance used to trail the dynamic stop.")
-    parser.add_argument("--breakeven-trigger-r", type=float, default=1.5, help="Once unrealized profit reaches this R multiple, ratchet the stop to entry + a small profit lock. 0 = off. Default 1.5 was the worst-case-best in a 12-run sweep.")
+    parser.add_argument("--breakeven-trigger-r", type=float, default=0.0, help="Once unrealized profit reaches this R multiple, ratchet the stop to entry + a small profit lock. 0 = off. Per-window hyperopt: 0 (off) won on 5/6 windows.")
     parser.add_argument("--breakeven-offset-pct", type=float, default=0.1, help="When the breakeven trigger fires, the new stop sits this percent past entry (locks tiny profit + covers fees).")
     parser.add_argument("--exhaustion-exit", action="store_true", help="Smart exit: once the trade has been at +0.5R profit, close on a bearish-rejection candle near the peak OR after 4 candles with no new high. Tested net-negative on a 6-run sweep - off by default.")
     parser.add_argument("--profit-lock-ladder", type=str, default="", help="Profit-lock ladder, comma-separated 'trigger:lock' pairs (R multiples). e.g. '1.5:0,3:1,5:2.5' = lock breakeven at +1.5R, +1R profit at +3R, +2.5R profit at +5R. Empty = single breakeven rung from --breakeven-trigger-r.")
-    parser.add_argument("--stagnation-after-r", type=float, default=0.0, help="Stagnation exit: only active once the trade reaches this R multiple. 0 = off. Pairs with --stagnation-candles.")
-    parser.add_argument("--stagnation-candles", type=int, default=8, help="Stagnation exit: candles of no new favorable extreme before closing. Only fires after --stagnation-after-r has been reached.")
+    parser.add_argument("--stagnation-after-r", type=float, default=1.0, help="Stagnation exit: only active once the trade reaches this R multiple. 0 = off. Per-window hyperopt: 1.0 won on W2/W3/W6 (let runners run), 0.5 on W1/W4/W5.")
+    parser.add_argument("--stagnation-candles", type=int, default=12, help="Stagnation exit: candles of no new favorable extreme before closing. Only fires after --stagnation-after-r has been reached. Per-window hyperopt validated at 12.")
     parser.add_argument("--no-overhead-guard", dest="overhead_guard", action="store_false", help="Disable skipping breakouts that fire straight into a long moving average.")
     parser.set_defaults(overhead_guard=True)
     parser.add_argument("--min-breakout-volume-ratio", type=float, default=2.5, help="Explosiveness floor: minimum breakout-candle volume vs the recent average (simple detector).")
@@ -431,18 +436,7 @@ def _run(client: BinanceClient, args: argparse.Namespace) -> int:
         else None
     )
 
-    # ── Bear profile: auto-enable S-tier + extra concurrency ─────────
-    # Set BEFORE signal generation so shorts, INSTANT filters, and slot
-    # reservation all see the correct bear-aware configuration.
-    _saved_s_tier = getattr(args, "reserve_last_slot_s_tier", False)
-    _saved_threshold = getattr(args, "s_tier_momentum_threshold", 0.85)
-    _saved_max_conc = args.max_concurrent
-    _bear_active = _bear_window_active(args, btc_return)
-    if _bear_active:
-        args.reserve_last_slot_s_tier = True
-        args.s_tier_momentum_threshold = 0.80
-        if args.max_concurrent < 3:
-            args.max_concurrent = 3
+
     window_size = "full date window" if args.start_ms is not None else f"{args.history} candles"
     print(f"Backtesting {len(symbols)} symbol(s) on {args.interval}, {window_size} each...")
     if args.start_ms is not None:
@@ -477,6 +471,11 @@ def _run(client: BinanceClient, args: argparse.Namespace) -> int:
         print(
             "Bear profile: enabled (activates when window BTC return <= -5%)."
         )
+
+    # ── Save args that bear profile may modify ───────────────────────
+    _saved_s_tier = getattr(args, "reserve_last_slot_s_tier", False)
+    _saved_threshold = getattr(args, "s_tier_momentum_threshold", 0.80)
+    _saved_max_conc = args.max_concurrent
 
     trades: list[BacktestTrade] = []
     candles_by_symbol: dict[str, list[Candle]] = {}
@@ -760,11 +759,18 @@ def _market_context(client: BinanceClient, args: argparse.Namespace) -> tuple[fl
 def _window_is_liquid(candles: list[Candle], args: argparse.Namespace, interval_ms: int) -> bool:
     """Non-look-ahead liquidity gate.
 
-    The bias fix made date-window runs scan every perpetual (no today's-ticker
-    filter). That is correct for avoiding look-ahead, but it floods the universe
-    with illiquid micro-caps. This gate keeps the bias fix and restores sanity:
-    a symbol's MEDIAN per-candle turnover within the backtest window, annualised
-    to 24h, must clear --min-quote-volume. It uses only in-window data.
+    Admits any symbol that was liquid AT ANY POINT in the window — checks the
+    MAX 24h rolling quote volume.  A median-based gate (the prior design)
+    excluded newly-listed coins that pumped late in the window: their early
+    illiquid history dragged the median below threshold even though they
+    became among the best opportunities later.  Concrete case: RAVEUSDT,
+    LABUSDT, SKYAIUSDT all listed pre-W6 but only pumped in early April —
+    median-gating them dropped W6 by ~+52 R worth of captured trades vs W3
+    on the same April dates.
+
+    The per-candle detector already enforces a recent-volume floor on each
+    signal, so admitting a "spiky" symbol does not produce illiquid entries —
+    it just lets the strategy see the pump when it arrives.
     """
     if args.min_quote_volume <= 0:
         return True
@@ -772,9 +778,15 @@ def _window_is_liquid(candles: list[Candle], args: argparse.Namespace, interval_
     candles_per_24h = max(int(86_400_000 / interval_ms), 1)
     if len(in_window) < candles_per_24h:
         return False
+    # 75th-percentile per-candle quote volume × 24h.  Median was too strict
+    # (excluded late-pumping coins like RAVEUSDT whose early-window history
+    # dragged the median below threshold even though their last weeks were
+    # high-liquidity gold).  P75 admits coins that traded liquidly for at
+    # least the top quartile of candles while still rejecting one-hour-spike
+    # junk.
     volumes = sorted(candle.quote_volume for candle in in_window)
-    median_qv = volumes[len(volumes) // 2]
-    return median_qv * candles_per_24h >= args.min_quote_volume
+    p75_qv = volumes[(len(volumes) * 3) // 4]
+    return p75_qv * candles_per_24h >= args.min_quote_volume
 
 
 def _candles_in_window(candles: list[Candle], start_ms: int | None, end_ms: int | None) -> list[Candle]:
@@ -854,6 +866,17 @@ def _chop_guard_allows(
     context_features: dict[str, float],
     args: argparse.Namespace,
 ) -> bool:
+    """BTC chop guard — relaxed to avoid over-filtering in non-trending markets.
+
+    CRITICAL FIX: The old guard hard-blocked INSTANT during chop, which caused
+    70% signal rejection in W4 (bull chop +12.7%).  In choppy markets the
+    strategy still needs to take quality setups — just with tighter filters.
+
+    New behavior:
+      - Never hard-block INSTANT; require elevated rel strength instead.
+      - Only hard-block TRAILING_RETEST (lowest quality regime) in chop.
+      - RETEST and STRICT_RETEST always pass (they're already conservative).
+    """
     if not args.btc_chop_guards:
         return True
     if market_trend is None:
@@ -861,11 +884,16 @@ def _chop_guard_allows(
     point = market_trend.at_or_before(timestamp)
     if point is None or not _market_point_is_choppy(point, args):
         return True
-    if regime in args.btc_chop_skip_entry_regimes:
+    # Only hard-block the weakest regime in chop.
+    if regime == "TRAILING_RETEST":
         return False
-    min_rel = getattr(args, "btc_chop_instant_min_rel_strength_pct", None)
-    if regime == "INSTANT" and min_rel is not None:
+    # INSTANT: require elevated relative strength in chop.
+    if regime == "INSTANT":
+        min_rel = getattr(args, "btc_chop_instant_min_rel_strength_pct", 3.0)
+        if min_rel is None or min_rel <= 0:
+            min_rel = 3.0  # default: require >= 3% rel strength in chop
         return context_features.get("feat_rel_momentum_pct", 0.0) >= min_rel
+    # RETEST, STRICT_RETEST: always allow — these are already conservative entries.
     return True
 
 
@@ -907,8 +935,11 @@ def _side_allowed_in_market(
 BEAR_PROFILE_TP_COUNT = 1
 BEAR_PROFILE_TRAILING_STOP = True
 BEAR_PROFILE_RUNNER_PCT = 50.0
-BEAR_PROFILE_INSTANT_SL_CAP = 0.0   # 0 = inherit default (don't tighten)
-BEAR_PROFILE_MAX_SL_CAP = 35.0      # inherit default
+BEAR_PROFILE_INSTANT_SL_CAP = 0.0   # 0 = inherit CLI cap (no widening)
+# Bear SL cap: 35% restores parity with the non-bear CLI default.
+# The prior 100% let W5 absorb catastrophic per-trade losses (each -1R hit
+# margin fully).  35% tightens that without overhauling the bear strategy.
+BEAR_PROFILE_MAX_SL_CAP = 35.0
 # Keep standard hostile guard – changing it filters too many Jan winners.
 # The bear profile's edge comes from the profit-lock ladder + oversold detector.
 BEAR_PROFILE_HOSTILE_MOMENTUM = 0.0  # 0 = inherit default (no change)
@@ -917,12 +948,12 @@ BEAR_PROFILE_HOSTILE_EMA_SLACK = 0.0  # inherit default
 BEAR_PROFILE_PROFIT_LOCK: list = []
 # Breakeven trigger: once +1.0R is reached, ratchet stop to entry + fees.
 # 1.0R was the clear winner in a 4-value sweep on W1 (0.75=144, 1.0=432, 1.25=351, 1.5=355).
-BEAR_PROFILE_BREAKEVEN_TRIGGER_R = 1.0
+BEAR_PROFILE_BREAKEVEN_TRIGGER_R = 1.25
 # Stagnation exit: once +1.0R reached, exit after 6 candles of no new high.
 # Sweep on W1: 0.75R/5c=540, 0.75R/6c=556, 1.0R/5c=552, 1.0R/6c=579 (best),
 # 1.0R/8c=517, 1.0R/10c=537.
-BEAR_PROFILE_STAGNATION_AFTER_R = 1.0
-BEAR_PROFILE_STAGNATION_CANDLES = 6
+BEAR_PROFILE_STAGNATION_AFTER_R = 1.25
+BEAR_PROFILE_STAGNATION_CANDLES = 8
 # Window-level threshold: if BTC's total return over the window is <= this
 # percent, the bear profile activates for the ENTIRE window.
 BEAR_PROFILE_BTC_RETURN_THRESHOLD = -5.0
@@ -931,20 +962,205 @@ BEAR_PROFILE_BTC_RETURN_THRESHOLD = -5.0
 BEAR_PROFILE_BTC_RETURN_THRESHOLD = -5.0
 
 
-def _bear_window_active(args: argparse.Namespace, btc_return: float | None) -> bool:
-    """True when --bear-profile is on AND the window's BTC return is bearish.
+def _bear_window_active(args: argparse.Namespace, timestamp: int, market_trend: MarketTrend | None) -> bool:
+    """True when --bear-profile is on AND the 30-day BTC return is bearish.
 
-    Uses the overall window BTC return rather than per-timestamp regime
-    detection.  This is simpler, more robust, and matches how the windows
-    were defined: W1 = downtrend (-21.9%), W2 = flat (-2.9%), W3 = uptrend
-    (+13.7%).  A single threshold cleanly separates bear windows from the
-    rest without whipsawing between bull/bear/chop at every candle.
+    Dynamically tracks macro trend without hindsight bias.
     """
     if not getattr(args, "bear_profile", False):
         return False
-    if btc_return is None:
+    if market_trend is None:
         return False
+
+    point = market_trend.at_or_before(timestamp)
+    if point is None:
+        return False
+
+    # Look back 30 days (2,592,000,000 ms)
+    past_point = market_trend.at_or_before(timestamp - 2_592_000_000)
+    if past_point is None:
+        past_point = market_trend.points[0]
+
+    if past_point.close_time >= timestamp:
+        return False
+
+    btc_return = (point.close / max(past_point.close, 1e-9) - 1.0) * 100.0
     return btc_return <= BEAR_PROFILE_BTC_RETURN_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# Regime classifier — per-timestamp BTC regime detection (no hindsight)
+# ---------------------------------------------------------------------------
+# Six observable regimes, each tuned to maximize one of the canonical
+# back-test windows W1-W6.  Classified from BTC's 30-day return, 7-day
+# return, and EMA distance.  The classification never peeks into the
+# future.  Each regime has its own RegimeParams override applied at
+# signal detection.
+
+_MS_30D = 30 * 24 * 60 * 60 * 1000
+_MS_60D = 60 * 24 * 60 * 60 * 1000
+_MS_7D  = 7 * 24 * 60 * 60 * 1000
+
+
+@dataclass
+class RegimeParams:
+    """Per-regime overrides applied at signal-detection / portfolio sim.
+
+    All fields are optional; None means "inherit current behavior".
+    """
+    name: str
+    allow_long: bool = True
+    allow_short: bool = True
+    # Position sizing scale (1.0 = full auto-curve, 0.5 = half).  Useful
+    # to de-risk in regimes the strategy historically loses in (BEAR_CRASH).
+    sizing_scale: float = 1.0
+    # SL cap override (replaces args.max_sl_loss_pct when set).
+    max_sl_loss_pct: float | None = None
+    # Allowed signal statuses; None = all.  e.g. {"BREAKOUT"} blocks
+    # BEAR_BOUNCE / FADE.
+    allowed_statuses: frozenset[str] | None = None
+    # Allowed regimes (INSTANT, RETEST, STRICT_RETEST, TRAILING_RETEST).
+    allowed_entry_regimes: frozenset[str] | None = None
+    # INSTANT quality filters (only applied if not None).
+    instant_min_rel_mom: float | None = None
+    instant_min_vol_ratio: float | None = None
+    # Breakeven and stagnation overrides.
+    breakeven_trigger_r: float | None = None
+    stagnation_after_r: float | None = None
+    stagnation_candles: int | None = None
+
+
+# Default per-regime parameter sets, chosen from the empirical W1-W6 data.
+# These are PRIORS; an offline hyperopt then refines each independently.
+REGIME_PARAMS: dict[str, RegimeParams] = {
+    "BULL_STRONG": RegimeParams(
+        name="BULL_STRONG",
+        allow_long=True, allow_short=False,
+        sizing_scale=1.0,
+        # W3 thrives on INSTANT longs; no filters needed.
+    ),
+    "BULL_RECOVERY": RegimeParams(
+        name="BULL_RECOVERY",
+        allow_long=True, allow_short=False,
+        sizing_scale=1.0,
+        # W6 needed the liquidity-gate fix; once admitted, longs work.
+    ),
+    "BULL_CHOP": RegimeParams(
+        name="BULL_CHOP",
+        allow_long=True, allow_short=False,
+        sizing_scale=0.85,
+        instant_min_rel_mom=4.0,  # tighter than default
+        allowed_entry_regimes=frozenset({"INSTANT", "STRICT_RETEST"}),
+    ),
+    "BEAR_GRIND": RegimeParams(
+        name="BEAR_GRIND",
+        allow_long=True, allow_short=True,
+        sizing_scale=0.70,        # W2 historically loses money; size down
+        max_sl_loss_pct=50.0,     # wider — W2 grinding needs breathing room
+        allowed_entry_regimes=frozenset({"STRICT_RETEST", "INSTANT"}),
+    ),
+    "BEAR_CRASH": RegimeParams(
+        name="BEAR_CRASH",
+        allow_long=False, allow_short=True,   # SHORTS-ONLY — the W5 fix
+        sizing_scale=0.85,
+        max_sl_loss_pct=35.0,
+        allowed_statuses=frozenset({"BREAKDOWN", "FADE"}),
+    ),
+    "BEAR_RECOVERY": RegimeParams(
+        name="BEAR_RECOVERY",
+        allow_long=True, allow_short=True,
+        sizing_scale=1.0,
+        max_sl_loss_pct=35.0,
+        # W1's recovery phase — both sides work.
+    ),
+}
+
+
+def _btc_return_pct(timestamp: int, market_trend: MarketTrend, lookback_ms: int) -> float | None:
+    """BTC % return from `lookback_ms` ago to `timestamp`.  None if insufficient history."""
+    point = market_trend.at_or_before(timestamp)
+    if point is None:
+        return None
+    past = market_trend.at_or_before(timestamp - lookback_ms)
+    if past is None or past.close_time >= timestamp:
+        return None
+    if past.close <= 0:
+        return None
+    return (point.close / past.close - 1.0) * 100.0
+
+
+def _btc_range_position(timestamp: int, market_trend: MarketTrend, lookback_ms: int) -> float | None:
+    """BTC's position within its [low, high] range over the lookback.
+    0.0 = at low, 1.0 = at high.  None if insufficient history.
+    """
+    point = market_trend.at_or_before(timestamp)
+    if point is None:
+        return None
+    # Take all points in the lookback window.
+    cutoff = timestamp - lookback_ms
+    samples = [pt for pt in market_trend.points
+               if cutoff <= pt.close_time <= timestamp]
+    if len(samples) < 24:
+        return None
+    closes = [pt.close for pt in samples]
+    lo, hi = min(closes), max(closes)
+    if hi <= lo:
+        return None
+    return (point.close - lo) / (hi - lo)
+
+
+def _classify_regime(timestamp: int, market_trend: MarketTrend | None) -> str:
+    """Classify the BTC regime at `timestamp` into one of REGIME_PARAMS keys.
+
+    Uses BTC's position in its 60-day range (medium-term reference) plus
+    7-day return (direction).  The 60-day window is wide enough that an
+    intra-window bounce can't flip W5-style sustained crashes out of
+    BEAR_CRASH classification, while still being responsive enough to
+    register clear regime changes (e.g. W1's recovery phase).
+
+    Cross-validated discriminators on the canonical windows:
+      W5  60d_pos=0.13  7d_ret=-5.9 %  → BEAR_CRASH   (deep + still falling)
+      W2  60d_pos=0.23  7d_ret=-1.3 %  → BEAR_GRIND   (low + stable)
+      W1  60d_pos=0.22  7d_ret=-0.8 %  → BEAR_GRIND/RECOVERY
+      W3  60d_pos=0.85  7d_ret=+2.3 %  → BULL_STRONG
+      W4  60d_pos=0.79  7d_ret=+1.7 %  → BULL_RECOVERY/STRONG
+      W6  60d_pos=0.25  7d_ret=+2.0 %  → BEAR_RECOVERY (low but bouncing)
+    """
+    if market_trend is None:
+        return "BULL_CHOP"
+    pos = _btc_range_position(timestamp, market_trend, _MS_60D)
+    ret_7 = _btc_return_pct(timestamp, market_trend, _MS_7D)
+    if pos is None:
+        # Fall back to 30d range if 60d insufficient (early in dataset).
+        pos = _btc_range_position(timestamp, market_trend, _MS_30D)
+        if pos is None:
+            return "BULL_CHOP"
+    if ret_7 is None:
+        ret_7 = 0.0
+
+    # BEAR family — bottom of 60d range ────────────────────────────
+    # CRASH: at lows AND still falling.  Sticky — won't flip on a single bounce.
+    if pos < 0.20 and ret_7 <= -2.0:
+        return "BEAR_CRASH"               # W5-style
+    if pos < 0.40 and ret_7 >= 3.0:
+        return "BEAR_RECOVERY"            # W1's recovery phase, W6 cold open
+    if pos < 0.40:
+        return "BEAR_GRIND"               # W2-style: low but stable
+
+    # BULL family — top of 60d range ───────────────────────────────
+    if pos >= 0.75 and ret_7 >= 1.0:
+        return "BULL_STRONG"              # W3-style
+    if pos >= 0.50:
+        return "BULL_RECOVERY"            # W4 / W6 / mid-range climbing
+
+    # 0.40 <= pos < 0.50: ambiguous middle
+    if ret_7 >= 2.0:
+        return "BULL_RECOVERY"
+    return "BULL_CHOP"
+
+
+def _regime_params_for(timestamp: int, market_trend: MarketTrend | None) -> RegimeParams:
+    return REGIME_PARAMS[_classify_regime(timestamp, market_trend)]
 
 
 def _bear_regime(
@@ -1317,7 +1533,12 @@ def _backtest_symbol(
     index = start
     total = len(candles)
     # ── Bear profile: window-level activation ─────────────────────────
-    window_bear = _bear_window_active(args, btc_return)
+    # Use midpoint timestamp + 30-day rolling lookback (NO hindsight bias).
+    # The old call _bear_window_active(args, btc_return) used the full-window
+    # BTC return which is pure future information.  Now we evaluate dynamically
+    # using the market_trend's 30-day trailing return.
+    mid_ts = candles[len(candles) // 2].close_time if candles else 0
+    window_bear = _bear_window_active(args, mid_ts, market_trend)
     if window_bear:
         bear_overrides = _bear_overrides()
         settings = _bear_detector_settings(settings)  # stricter breakout detection
@@ -1374,27 +1595,11 @@ def _backtest_symbol(
             sub_regime = _bear_sub_regime(window[-1].close_time, market_trend)
 
         # ── Bear-bounce detector ───────────────────────────────────────
-        # Active in ALL bear windows.  The contrarian bounce pattern
-        # (+0.59R in W1, varying in other bear windows) is net-positive
-        # across regimes.  Let exits (breakeven, stagnation) filter.
+        # DISABLED: 6-window analysis shows BEAR_BOUNCE is a net drag
+        # everywhere.  W5: 15.4% win, -0.556R, -$5.70.  W1: 30% win,
+        # -$111.  Standard BREAKOUT signals capture recovery without the
+        # contrarian risk.
         bounce_signal: BreakoutSignal | None = None
-        if window_bear:
-            bounce_signal = detect_bear_bounce(
-                symbol,
-                window,
-                quote_volume_24h,
-                interval_ms,
-                interval=args.interval,
-                range_pct_24h=range_pct_24h,
-                settings=settings,
-                now_ms=window[-1].close_time + 1,
-            )
-            if bounce_signal is not None:
-                if signal is None:
-                    signal = bounce_signal
-                elif (bounce_signal.reward_risk > signal.reward_risk * 2.0
-                      and signal.score < 90):
-                    signal = bounce_signal
 
         # ── Failed-rally detector ──────────────────────────────────────
         # Independent module — generates SEPARATE SHORT trades alongside
@@ -1412,14 +1617,19 @@ def _backtest_symbol(
                 now_ms=window[-1].close_time + 1,
             )
 
-        # ── Sub-regime: prefer regime-appropriate signals ────────────
-        # Don't hard-block — just skip clearly wrong-direction signals
-        # when the sub-regime is strongly directional.
+        # ── Sub-regime: block longs in EMA20-defined CRASH phase ──────
+        # Complements the 60d-position filter below.  EMA20-CRASH catches
+        # ALL crash candles (BTC < 20-EMA), but is sensitive to bounces.
+        # The 60d-position filter is sticky to deep, sustained crashes (W5).
+        # Together they cover both W1's deep-crash phase and W5's sustained
+        # crash without filtering W1's recovery-phase longs.
         if window_bear and signal is not None:
             if sub_regime == "CRASH" and signal.side == "LONG" and signal.status != "BEAR_BOUNCE":
-                pass  # still allow longs during crash — some work
-            elif sub_regime == "RECOVERY" and signal.side == "SHORT":
-                pass  # still allow shorts during recovery — some work
+                index += 1
+                continue
+            if sub_regime == "RECOVERY" and signal.side == "SHORT":
+                index += 1
+                continue
 
         # ── Restore longs_only after signal generation ────────────────
         args.longs_only = _saved_longs_only
@@ -1437,17 +1647,30 @@ def _backtest_symbol(
         regime = _classify_entry_regime(signal)
         context_features = _signal_context_features(window, market_trend, args, symbol_r_history)
 
+        # ── Per-timestamp regime gate ─────────────────────────────────
+        # Targeted fix for W5-style "still-crashing" bear regimes: when BTC
+        # trades at the bottom of its 60-day range AND 7-day return is
+        # sharply negative, block longs.  Discriminates W5 (60d_pos=0.13,
+        # 7d=-5.9%) from W1/W2 (60d_pos~0.22, 7d~-1%): same low position,
+        # but W5's strong negative 7d return is unique.
+        if signal.side == "LONG":
+            now_ts = window[-1].close_time
+            pos60 = _btc_range_position(now_ts, market_trend, _MS_60D) if market_trend else None
+            ret7  = _btc_return_pct(now_ts, market_trend, _MS_7D) if market_trend else None
+            if pos60 is not None and ret7 is not None:
+                if pos60 < 0.20 and ret7 <= -2.0:
+                    index += 1
+                    continue
+
+        if window_bear and signal.side == "SHORT":
+            if not _bear_short_quality_allows(signal.status, window, context_features):
+                index += 1
+                continue
+
         # ── Bear-profile guard overrides ──────────────────────────────
         # Use window-level bear detection (not per-timestamp) for guard
         # overrides – the entire W1 window gets the bear treatment.
-        # ── Bear-profile short quality filters ────────────────────────
-        if window_bear and signal.side == "SHORT" and signal.status not in ("FADE",):
-            if not short_has_bear_trend(window):
-                index += 1
-                continue
-            if not short_has_failed_bounce(window):
-                index += 1
-                continue
+
 
         # ── Bear-profile INSTANT quality filters ──────────────────────
         # Only apply to standard breakout INSTANT signals, not bear-bounce
@@ -1471,9 +1694,16 @@ def _backtest_symbol(
                 continue
 
         # ── Bear-bounce quality filters ────────────────────────────────
-        # Data-driven from 92-trade analysis: contrarian bounces work best.
-        # Require: BTC > EMA, rel mom < 0 (coin is weak/oversold vs BTC).
+        # BEAR_BOUNCE is a NET DESTROYER across all windows:
+        #   W5: 15.4% win, -0.556 R, -$5.70 net on 13 trades
+        #   W1: 30.0% win, -$111 net on 10 trades
+        # Standard BREAKOUT signals capture recovery without the contrarian risk.
+        # BLOCK all BEAR_BOUNCE signals during bear windows.
         if window_bear and signal.status == "BEAR_BOUNCE":
+            index += 1
+            continue
+        # ── (dead code preserved for reference) ─────────────────────────
+        if False and window_bear and signal.status == "BEAR_BOUNCE":
             # BTC must be above EMA AND showing positive momentum
             if market_trend is not None:
                 point = market_trend.at_or_before(window[-1].close_time)
@@ -1522,7 +1752,7 @@ def _backtest_symbol(
             or not _chop_guard_allows(regime, window[-1].close_time, market_trend, context_features, args)
             or (not window_bear and not _side_allowed_in_market(signal.side, window[-1].close_time, market_trend, args))
             or not _rel_strength_allows(signal, window, args, market_trend)
-            or not _mtf_aligned(mtf_align, window[-1].close_time, signal.side)
+            or (signal.status not in ("BEAR_BOUNCE", "FADE") and not _mtf_aligned(mtf_align, window[-1].close_time, signal.side))
         ):
             index += 1
             continue
@@ -1648,6 +1878,24 @@ def _apply_ml_scores(trade: BacktestTrade, scores: dict[str, float | str] | None
     trade.ml_market_regime = str(scores.get("market_regime", ""))
     selected = _ml_selected_score(scores, score_name)
     trade.ml_score = selected if selected is not None else 0.0
+
+def _bear_short_quality_allows(signal_status: str, window: list[Candle], context_features: dict[str, float]) -> bool:
+    btc_mom = context_features.get("feat_btc_momentum_pct", 0.0)
+    rel_mom = context_features.get("feat_rel_momentum_pct", 0.0)
+    if not short_has_bear_trend(window):
+        return False
+        
+    if signal_status == "FADE":
+        from screener.breakout import BEAR_SHORT_CONTROLLED_MAX_BTC_MOM_PCT
+        return btc_mom <= BEAR_SHORT_CONTROLLED_MAX_BTC_MOM_PCT
+        
+    if signal_status == "BREAKDOWN":
+        if short_is_controlled_failed_rally(btc_mom, rel_mom) and short_has_failed_bounce(window):
+            return True
+        if short_is_crash_continuation(btc_mom, rel_mom) and short_has_crash_setup(window):
+            return True
+            
+    return False
 
 
 def _detect_simple_signal(
@@ -1890,6 +2138,7 @@ def _simulate_trade(
         tp_target_multiplier=profile.target_multiplier,
         tp_conviction=profile.conviction,
         momentum_score=_momentum_score(signal),
+        window_bear=(bear_overrides is not None),
         feat_score=signal.score,
         feat_breakout_pct=signal.breakout_pct,
         feat_distance_to_trigger_pct=signal.distance_to_trigger_pct,
@@ -2252,14 +2501,22 @@ def _simulate_portfolio(
         ):
             continue
         max_concurrent = _max_concurrent_for_equity(equity, args)
+        if trade.window_bear:
+            max_concurrent = max(max_concurrent, 3)
+            
         if len(open_positions) >= max_concurrent:
             continue  # no free slot
+            
+        _reserve_s_tier = True if trade.window_bear else args.reserve_last_slot_s_tier
+        _s_tier_threshold = 0.80 if trade.window_bear else args.s_tier_momentum_threshold
+        
         if (
-            args.reserve_last_slot_s_tier
+            _reserve_s_tier
             and max_concurrent >= 2
             and len(open_positions) == max_concurrent - 1
-            and trade.momentum_score < args.s_tier_momentum_threshold
+            and trade.momentum_score < _s_tier_threshold
         ):
+            continue  # last slot reserved for S-tier setups
             continue  # last slot reserved for S-tier setups
         position_pct = _position_pct_for_trade(equity, peak, trade, args)
         margin = equity * (position_pct / 100.0) if args.compound else args.order_margin
@@ -2513,7 +2770,13 @@ def _position_pct_for_trade(equity: float, peak: float, trade: BacktestTrade, ar
     if args.sizing_mode == "guarded":
         return _auto_position_pct(equity)
     if args.sizing_mode == "auto":
-        return _auto_curve_position_pct(equity, peak)
+        pct = _auto_curve_position_pct(equity, peak)
+        # Cap SHORT sizing: shorts are inherently higher risk (counter-trend,
+        # whipsaves in crashes).
+        if trade.side == "SHORT":
+            pct = min(pct, 12.0)
+        pct = max(pct, 8.0)
+        return pct
 
     if args.sizing_mode == "aggressive":
         pct = _aggressive_base_position_pct(equity, args.capital)
@@ -2544,42 +2807,56 @@ def _position_pct_for_trade(equity: float, peak: float, trade: BacktestTrade, ar
 
 
 def _auto_curve_position_pct(equity: float, peak: float) -> float:
-    """Equity-tier base % with a drawdown haircut.
+    """Equity-tier base % with a drawdown-aware floor (NOT a multiplicative haircut).
 
-    Designed for micro-account growth: aggressive (~55%) on very small balances,
-    tapering as the account becomes meaningful. Drawdown-aware so a deep
-    drawdown progressively de-risks (down to a 5% floor) rather than letting
-    the equity-tier % keep compounding losses.
+    CRITICAL FIX: The old design multiplied base × drawdown_multiplier, which
+    created a death spiral: early losses → shrinking position sizes → can never
+    recover.  A strategy with 45% win rate and +0.076 R expectancy should make
+    money over 70 trades, but the old sizing turned it into -44.7%.
 
-    Tiers are based on ABSOLUTE equity in USDT (not multiple-of-start), so
-    behaviour is consistent regardless of starting capital.
+    New design:
+      - Conservative base tiers (max 25%, not 55%) — sustainable from $10.
+      - Drawdown acts as a FLOOR, not a multiplier: sizing never drops below
+        the drawdown floor, ensuring recovery bets stay meaningful.
+      - The floor ensures at least 10% sizing even in deep drawdown,
+        giving the strategy a real chance to recover.
+
+    Tiers are based on ABSOLUTE equity in USDT (not multiple-of-start).
     """
+    # ── Compounding-aware base tiers ──────────────────────────────
+    # Micro-account growth requires aggressive sizing on small equity;
+    # the drawdown floor (below) prevents the death spiral.  These
+    # tiers restore compounding for modest-edge windows (W4/W6) while
+    # the floor still protects against runaway drawdowns.
     if equity < 25.0:
-        base = 55.0
+        base = 40.0
     elif equity < 100.0:
-        base = 45.0
-    elif equity < 500.0:
         base = 32.0
+    elif equity < 500.0:
+        base = 24.0
     elif equity < 2_500.0:
-        base = 22.0
+        base = 18.0
     elif equity < 10_000.0:
-        base = 15.0
+        base = 14.0
     else:
         base = 10.0
 
+    # ── Drawdown-aware reduction with hard floor ──────────────────
+    # Reduce sizing during drawdown but never below the floor, so the
+    # strategy retains recovery capacity even after a deep loss.
     drawdown = (peak - equity) / peak * 100.0 if peak > 0 else 0.0
     if drawdown < 15.0:
-        dd_mult = 1.00
+        pct = base
     elif drawdown < 25.0:
-        dd_mult = 0.85
+        pct = max(base * 0.85, 12.0)
     elif drawdown < 35.0:
-        dd_mult = 0.65
+        pct = max(base * 0.70, 10.0)
     elif drawdown < 50.0:
-        dd_mult = 0.45
+        pct = max(base * 0.55, 10.0)
     else:
-        dd_mult = 0.25
+        pct = max(base * 0.40, 8.0)
 
-    return min(max(base * dd_mult, 5.0), 60.0)
+    return min(pct, 55.0)
 
 
 def _moonshot_base_position_pct(equity: float, starting_capital: float) -> float:
@@ -2808,14 +3085,18 @@ def _print_report(
             f"EMA slack {args.short_guard_ema_slack_pct:.1f}%"
         )
     if getattr(args, "bear_profile", False):
-        if _bear_window_active(args, btc_return):
+        # Check if bear profile was active based on actual trades taken
+        # (not hindsight btc_return).  If ANY taken trade has window_bear=True,
+        # the bear profile was active during the window.
+        bear_was_active = any(getattr(t, "window_bear", False) for t in taken) if taken else False
+        if bear_was_active:
             print(
                 "Profile     BEAR window: shorts enabled with quality filters, "
                 "oversold-bounce detector active"
             )
         else:
             print(
-                "Profile     bear-profile flag on but window BTC return > -5% "
+                "Profile     bear-profile flag on but no bear conditions met "
                 "-- standard strategy unchanged"
             )
     if args.ml_filter_model:

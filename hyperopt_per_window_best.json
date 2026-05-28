@@ -1,0 +1,1130 @@
+{
+  "W1": {
+    "best_params": {
+      "HP_INST_REL": 3.0,
+      "HP_INST_VOL": 3.5,
+      "breakeven_r": 0.0,
+      "stag_after_r": 0.5,
+      "mtf_ma_period": 20,
+      "max_concurrent": 2
+    },
+    "best_equity": 187.02,
+    "history": [
+      {
+        "stage": "detector",
+        "best_equity": 82.83,
+        "best_params": {
+          "HP_INST_REL": 3.0,
+          "HP_INST_VOL": 3.5
+        },
+        "all": [
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5
+            },
+            "equity": 82.83,
+            "expectancy": 0.426
+          },
+          {
+            "params": {
+              "HP_INST_REL": 5.0,
+              "HP_INST_VOL": 3.5
+            },
+            "equity": 82.83,
+            "expectancy": 0.426
+          },
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.5
+            },
+            "equity": 82.83,
+            "expectancy": 0.426
+          },
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.0
+            },
+            "equity": 82.83,
+            "expectancy": 0.426
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.0
+            },
+            "equity": 82.83,
+            "expectancy": 0.426
+          },
+          {
+            "params": {
+              "HP_INST_REL": 5.0,
+              "HP_INST_VOL": 3.0
+            },
+            "equity": 82.83,
+            "expectancy": 0.426
+          }
+        ]
+      },
+      {
+        "stage": "exits",
+        "best_equity": 175.13,
+        "best_params": {
+          "HP_INST_REL": 3.0,
+          "HP_INST_VOL": 3.5,
+          "breakeven_r": 0.0,
+          "stag_after_r": 0.5
+        },
+        "all": [
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5,
+              "breakeven_r": 0.0,
+              "stag_after_r": 0.5
+            },
+            "equity": 175.13,
+            "expectancy": 0.47
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5,
+              "breakeven_r": 0.0,
+              "stag_after_r": 1.0
+            },
+            "equity": 169.84,
+            "expectancy": 0.474
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5,
+              "breakeven_r": 1.0,
+              "stag_after_r": 1.0
+            },
+            "equity": 125.21,
+            "expectancy": 0.401
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5,
+              "breakeven_r": 1.0,
+              "stag_after_r": 0.5
+            },
+            "equity": 122.58,
+            "expectancy": 0.387
+          }
+        ]
+      },
+      {
+        "stage": "mtf_conc",
+        "best_equity": 187.02,
+        "best_params": {
+          "HP_INST_REL": 3.0,
+          "HP_INST_VOL": 3.5,
+          "breakeven_r": 0.0,
+          "stag_after_r": 0.5,
+          "mtf_ma_period": 20,
+          "max_concurrent": 2
+        },
+        "all": [
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5,
+              "breakeven_r": 0.0,
+              "stag_after_r": 0.5,
+              "mtf_ma_period": 20,
+              "max_concurrent": 2
+            },
+            "equity": 187.02,
+            "expectancy": 0.516
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5,
+              "breakeven_r": 0.0,
+              "stag_after_r": 0.5,
+              "mtf_ma_period": 25,
+              "max_concurrent": 2
+            },
+            "equity": 175.13,
+            "expectancy": 0.47
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5,
+              "breakeven_r": 0.0,
+              "stag_after_r": 0.5,
+              "mtf_ma_period": 25,
+              "max_concurrent": 3
+            },
+            "equity": 109.61,
+            "expectancy": 0.35
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5,
+              "breakeven_r": 0.0,
+              "stag_after_r": 0.5,
+              "mtf_ma_period": 20,
+              "max_concurrent": 3
+            },
+            "equity": 45.63,
+            "expectancy": 0.318
+          }
+        ]
+      }
+    ],
+    "start": "2025-12-20",
+    "end": "2026-02-10",
+    "desc": "bear crash+recovery -21.9%"
+  },
+  "W2": {
+    "best_params": {
+      "HP_INST_REL": 4.0,
+      "HP_INST_VOL": 3.0,
+      "breakeven_r": 0.0,
+      "stag_after_r": 1.0,
+      "mtf_ma_period": 25,
+      "max_concurrent": 2
+    },
+    "best_equity": 13.18,
+    "history": [
+      {
+        "stage": "detector",
+        "best_equity": 11.04,
+        "best_params": {
+          "HP_INST_REL": 4.0,
+          "HP_INST_VOL": 3.0
+        },
+        "all": [
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.0
+            },
+            "equity": 11.04,
+            "expectancy": 0.138
+          },
+          {
+            "params": {
+              "HP_INST_REL": 5.0,
+              "HP_INST_VOL": 3.0
+            },
+            "equity": 8.87,
+            "expectancy": 0.105
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5
+            },
+            "equity": 8.86,
+            "expectancy": 0.098
+          },
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.5
+            },
+            "equity": 8.67,
+            "expectancy": 0.108
+          },
+          {
+            "params": {
+              "HP_INST_REL": 5.0,
+              "HP_INST_VOL": 3.5
+            },
+            "equity": 8.32,
+            "expectancy": 0.111
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.0
+            },
+            "equity": 7.62,
+            "expectancy": 0.115
+          }
+        ]
+      },
+      {
+        "stage": "exits",
+        "best_equity": 13.18,
+        "best_params": {
+          "HP_INST_REL": 4.0,
+          "HP_INST_VOL": 3.0,
+          "breakeven_r": 0.0,
+          "stag_after_r": 1.0
+        },
+        "all": [
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.0,
+              "breakeven_r": 0.0,
+              "stag_after_r": 1.0
+            },
+            "equity": 13.18,
+            "expectancy": 0.169
+          },
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.0,
+              "breakeven_r": 0.0,
+              "stag_after_r": 0.5
+            },
+            "equity": 13.18,
+            "expectancy": 0.169
+          },
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.0,
+              "breakeven_r": 1.0,
+              "stag_after_r": 1.0
+            },
+            "equity": 11.04,
+            "expectancy": 0.138
+          },
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.0,
+              "breakeven_r": 1.0,
+              "stag_after_r": 0.5
+            },
+            "equity": 11.04,
+            "expectancy": 0.138
+          }
+        ]
+      },
+      {
+        "stage": "mtf_conc",
+        "best_equity": 13.18,
+        "best_params": {
+          "HP_INST_REL": 4.0,
+          "HP_INST_VOL": 3.0,
+          "breakeven_r": 0.0,
+          "stag_after_r": 1.0,
+          "mtf_ma_period": 25,
+          "max_concurrent": 2
+        },
+        "all": [
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.0,
+              "breakeven_r": 0.0,
+              "stag_after_r": 1.0,
+              "mtf_ma_period": 25,
+              "max_concurrent": 2
+            },
+            "equity": 13.18,
+            "expectancy": 0.169
+          },
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.0,
+              "breakeven_r": 0.0,
+              "stag_after_r": 1.0,
+              "mtf_ma_period": 25,
+              "max_concurrent": 3
+            },
+            "equity": 10.71,
+            "expectancy": 0.146
+          },
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.0,
+              "breakeven_r": 0.0,
+              "stag_after_r": 1.0,
+              "mtf_ma_period": 20,
+              "max_concurrent": 3
+            },
+            "equity": 10.38,
+            "expectancy": 0.139
+          },
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.0,
+              "breakeven_r": 0.0,
+              "stag_after_r": 1.0,
+              "mtf_ma_period": 20,
+              "max_concurrent": 2
+            },
+            "equity": 10.37,
+            "expectancy": 0.161
+          }
+        ]
+      }
+    ],
+    "start": "2025-02-20",
+    "end": "2025-04-05",
+    "desc": "bear grinding -19.7%"
+  },
+  "W3": {
+    "best_params": {
+      "HP_INST_REL": 3.0,
+      "HP_INST_VOL": 3.0,
+      "breakeven_r": 0.0,
+      "stag_after_r": 1.0,
+      "mtf_ma_period": 20,
+      "max_concurrent": 2
+    },
+    "best_equity": 1101.38,
+    "history": [
+      {
+        "stage": "detector",
+        "best_equity": 657.1,
+        "best_params": {
+          "HP_INST_REL": 3.0,
+          "HP_INST_VOL": 3.0
+        },
+        "all": [
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.0
+            },
+            "equity": 657.1,
+            "expectancy": 0.589
+          },
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.0
+            },
+            "equity": 657.1,
+            "expectancy": 0.589
+          },
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.5
+            },
+            "equity": 657.1,
+            "expectancy": 0.589
+          },
+          {
+            "params": {
+              "HP_INST_REL": 5.0,
+              "HP_INST_VOL": 3.0
+            },
+            "equity": 657.1,
+            "expectancy": 0.589
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5
+            },
+            "equity": 657.1,
+            "expectancy": 0.589
+          },
+          {
+            "params": {
+              "HP_INST_REL": 5.0,
+              "HP_INST_VOL": 3.5
+            },
+            "equity": 657.1,
+            "expectancy": 0.589
+          }
+        ]
+      },
+      {
+        "stage": "exits",
+        "best_equity": 1009.2,
+        "best_params": {
+          "HP_INST_REL": 3.0,
+          "HP_INST_VOL": 3.0,
+          "breakeven_r": 0.0,
+          "stag_after_r": 1.0
+        },
+        "all": [
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.0,
+              "breakeven_r": 0.0,
+              "stag_after_r": 1.0
+            },
+            "equity": 1009.2,
+            "expectancy": 0.732
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.0,
+              "breakeven_r": 1.0,
+              "stag_after_r": 1.0
+            },
+            "equity": 835.58,
+            "expectancy": 0.599
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.0,
+              "breakeven_r": 0.0,
+              "stag_after_r": 0.5
+            },
+            "equity": 725.69,
+            "expectancy": 0.668
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.0,
+              "breakeven_r": 1.0,
+              "stag_after_r": 0.5
+            },
+            "equity": 605.46,
+            "expectancy": 0.537
+          }
+        ]
+      },
+      {
+        "stage": "mtf_conc",
+        "best_equity": 1101.38,
+        "best_params": {
+          "HP_INST_REL": 3.0,
+          "HP_INST_VOL": 3.0,
+          "breakeven_r": 0.0,
+          "stag_after_r": 1.0,
+          "mtf_ma_period": 20,
+          "max_concurrent": 2
+        },
+        "all": [
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.0,
+              "breakeven_r": 0.0,
+              "stag_after_r": 1.0,
+              "mtf_ma_period": 20,
+              "max_concurrent": 2
+            },
+            "equity": 1101.38,
+            "expectancy": 0.729
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.0,
+              "breakeven_r": 0.0,
+              "stag_after_r": 1.0,
+              "mtf_ma_period": 25,
+              "max_concurrent": 2
+            },
+            "equity": 1009.2,
+            "expectancy": 0.732
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.0,
+              "breakeven_r": 0.0,
+              "stag_after_r": 1.0,
+              "mtf_ma_period": 20,
+              "max_concurrent": 3
+            },
+            "equity": 995.21,
+            "expectancy": 0.606
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.0,
+              "breakeven_r": 0.0,
+              "stag_after_r": 1.0,
+              "mtf_ma_period": 25,
+              "max_concurrent": 3
+            },
+            "equity": 660.35,
+            "expectancy": 0.556
+          }
+        ]
+      }
+    ],
+    "start": "2026-04-01",
+    "end": "2026-05-21",
+    "desc": "bull strong +28.8%"
+  },
+  "W4": {
+    "best_params": {
+      "HP_INST_REL": 4.0,
+      "HP_INST_VOL": 3.0,
+      "breakeven_r": 0.0,
+      "stag_after_r": 0.5,
+      "mtf_ma_period": 25,
+      "max_concurrent": 2
+    },
+    "best_equity": 382.98,
+    "history": [
+      {
+        "stage": "detector",
+        "best_equity": 155.79,
+        "best_params": {
+          "HP_INST_REL": 4.0,
+          "HP_INST_VOL": 3.0
+        },
+        "all": [
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.0
+            },
+            "equity": 155.79,
+            "expectancy": 0.421
+          },
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.5
+            },
+            "equity": 155.79,
+            "expectancy": 0.421
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.0
+            },
+            "equity": 155.79,
+            "expectancy": 0.421
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5
+            },
+            "equity": 155.79,
+            "expectancy": 0.421
+          },
+          {
+            "params": {
+              "HP_INST_REL": 5.0,
+              "HP_INST_VOL": 3.5
+            },
+            "equity": 155.79,
+            "expectancy": 0.421
+          },
+          {
+            "params": {
+              "HP_INST_REL": 5.0,
+              "HP_INST_VOL": 3.0
+            },
+            "equity": 155.79,
+            "expectancy": 0.421
+          }
+        ]
+      },
+      {
+        "stage": "exits",
+        "best_equity": 382.98,
+        "best_params": {
+          "HP_INST_REL": 4.0,
+          "HP_INST_VOL": 3.0,
+          "breakeven_r": 0.0,
+          "stag_after_r": 0.5
+        },
+        "all": [
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.0,
+              "breakeven_r": 0.0,
+              "stag_after_r": 0.5
+            },
+            "equity": 382.98,
+            "expectancy": 0.55
+          },
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.0,
+              "breakeven_r": 0.0,
+              "stag_after_r": 1.0
+            },
+            "equity": 337.46,
+            "expectancy": 0.543
+          },
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.0,
+              "breakeven_r": 1.0,
+              "stag_after_r": 0.5
+            },
+            "equity": 206.97,
+            "expectancy": 0.399
+          },
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.0,
+              "breakeven_r": 1.0,
+              "stag_after_r": 1.0
+            },
+            "equity": 150.49,
+            "expectancy": 0.389
+          }
+        ]
+      },
+      {
+        "stage": "mtf_conc",
+        "best_equity": 382.98,
+        "best_params": {
+          "HP_INST_REL": 4.0,
+          "HP_INST_VOL": 3.0,
+          "breakeven_r": 0.0,
+          "stag_after_r": 0.5,
+          "mtf_ma_period": 25,
+          "max_concurrent": 2
+        },
+        "all": [
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.0,
+              "breakeven_r": 0.0,
+              "stag_after_r": 0.5,
+              "mtf_ma_period": 25,
+              "max_concurrent": 2
+            },
+            "equity": 382.98,
+            "expectancy": 0.55
+          },
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.0,
+              "breakeven_r": 0.0,
+              "stag_after_r": 0.5,
+              "mtf_ma_period": 20,
+              "max_concurrent": 2
+            },
+            "equity": 270.79,
+            "expectancy": 0.497
+          },
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.0,
+              "breakeven_r": 0.0,
+              "stag_after_r": 0.5,
+              "mtf_ma_period": 25,
+              "max_concurrent": 3
+            },
+            "equity": 253.45,
+            "expectancy": 0.408
+          },
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.0,
+              "breakeven_r": 0.0,
+              "stag_after_r": 0.5,
+              "mtf_ma_period": 20,
+              "max_concurrent": 3
+            },
+            "equity": 235.05,
+            "expectancy": 0.368
+          }
+        ]
+      }
+    ],
+    "start": "2025-06-04",
+    "end": "2025-07-23",
+    "desc": "bull chop +13.4%"
+  },
+  "W5": {
+    "best_params": {
+      "HP_INST_REL": 3.0,
+      "HP_INST_VOL": 3.5,
+      "breakeven_r": 1.0,
+      "stag_after_r": 0.5,
+      "mtf_ma_period": 20,
+      "max_concurrent": 2
+    },
+    "best_equity": 23.39,
+    "history": [
+      {
+        "stage": "detector",
+        "best_equity": 21.04,
+        "best_params": {
+          "HP_INST_REL": 3.0,
+          "HP_INST_VOL": 3.5
+        },
+        "all": [
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5
+            },
+            "equity": 21.04,
+            "expectancy": 0.297
+          },
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.5
+            },
+            "equity": 15.26,
+            "expectancy": 0.25
+          },
+          {
+            "params": {
+              "HP_INST_REL": 5.0,
+              "HP_INST_VOL": 3.5
+            },
+            "equity": 14.1,
+            "expectancy": 0.258
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.0
+            },
+            "equity": 10.71,
+            "expectancy": 0.24
+          },
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.0
+            },
+            "equity": 10.09,
+            "expectancy": 0.225
+          },
+          {
+            "params": {
+              "HP_INST_REL": 5.0,
+              "HP_INST_VOL": 3.0
+            },
+            "equity": 10.02,
+            "expectancy": 0.208
+          }
+        ]
+      },
+      {
+        "stage": "exits",
+        "best_equity": 21.04,
+        "best_params": {
+          "HP_INST_REL": 3.0,
+          "HP_INST_VOL": 3.5,
+          "breakeven_r": 1.0,
+          "stag_after_r": 0.5
+        },
+        "all": [
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5,
+              "breakeven_r": 1.0,
+              "stag_after_r": 0.5
+            },
+            "equity": 21.04,
+            "expectancy": 0.297
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5,
+              "breakeven_r": 1.0,
+              "stag_after_r": 1.0
+            },
+            "equity": 21.04,
+            "expectancy": 0.297
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5,
+              "breakeven_r": 0.0,
+              "stag_after_r": 0.5
+            },
+            "equity": 14.8,
+            "expectancy": 0.282
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5,
+              "breakeven_r": 0.0,
+              "stag_after_r": 1.0
+            },
+            "equity": 14.8,
+            "expectancy": 0.282
+          }
+        ]
+      },
+      {
+        "stage": "mtf_conc",
+        "best_equity": 23.39,
+        "best_params": {
+          "HP_INST_REL": 3.0,
+          "HP_INST_VOL": 3.5,
+          "breakeven_r": 1.0,
+          "stag_after_r": 0.5,
+          "mtf_ma_period": 20,
+          "max_concurrent": 2
+        },
+        "all": [
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5,
+              "breakeven_r": 1.0,
+              "stag_after_r": 0.5,
+              "mtf_ma_period": 20,
+              "max_concurrent": 2
+            },
+            "equity": 23.39,
+            "expectancy": 0.297
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5,
+              "breakeven_r": 1.0,
+              "stag_after_r": 0.5,
+              "mtf_ma_period": 25,
+              "max_concurrent": 2
+            },
+            "equity": 21.04,
+            "expectancy": 0.297
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5,
+              "breakeven_r": 1.0,
+              "stag_after_r": 0.5,
+              "mtf_ma_period": 25,
+              "max_concurrent": 3
+            },
+            "equity": 16.72,
+            "expectancy": 0.239
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5,
+              "breakeven_r": 1.0,
+              "stag_after_r": 0.5,
+              "mtf_ma_period": 20,
+              "max_concurrent": 3
+            },
+            "equity": 14.99,
+            "expectancy": 0.225
+          }
+        ]
+      }
+    ],
+    "start": "2025-10-08",
+    "end": "2025-11-26",
+    "desc": "bear massive crash -28.2%"
+  },
+  "W6": {
+    "best_params": {
+      "HP_INST_REL": 3.0,
+      "HP_INST_VOL": 3.5,
+      "breakeven_r": 0.0,
+      "stag_after_r": 1.0,
+      "mtf_ma_period": 20,
+      "max_concurrent": 2
+    },
+    "best_equity": 2080.88,
+    "history": [
+      {
+        "stage": "detector",
+        "best_equity": 438.06,
+        "best_params": {
+          "HP_INST_REL": 3.0,
+          "HP_INST_VOL": 3.5
+        },
+        "all": [
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5
+            },
+            "equity": 438.06,
+            "expectancy": 0.829
+          },
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.0
+            },
+            "equity": 438.06,
+            "expectancy": 0.829
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.0
+            },
+            "equity": 438.06,
+            "expectancy": 0.829
+          },
+          {
+            "params": {
+              "HP_INST_REL": 5.0,
+              "HP_INST_VOL": 3.0
+            },
+            "equity": 438.06,
+            "expectancy": 0.829
+          },
+          {
+            "params": {
+              "HP_INST_REL": 5.0,
+              "HP_INST_VOL": 3.5
+            },
+            "equity": 438.06,
+            "expectancy": 0.829
+          },
+          {
+            "params": {
+              "HP_INST_REL": 4.0,
+              "HP_INST_VOL": 3.5
+            },
+            "equity": 438.06,
+            "expectancy": 0.829
+          }
+        ]
+      },
+      {
+        "stage": "exits",
+        "best_equity": 1409.57,
+        "best_params": {
+          "HP_INST_REL": 3.0,
+          "HP_INST_VOL": 3.5,
+          "breakeven_r": 0.0,
+          "stag_after_r": 1.0
+        },
+        "all": [
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5,
+              "breakeven_r": 0.0,
+              "stag_after_r": 1.0
+            },
+            "equity": 1409.57,
+            "expectancy": 1.159
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5,
+              "breakeven_r": 0.0,
+              "stag_after_r": 0.5
+            },
+            "equity": 1299.7,
+            "expectancy": 1.078
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5,
+              "breakeven_r": 1.0,
+              "stag_after_r": 1.0
+            },
+            "equity": 286.68,
+            "expectancy": 0.742
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5,
+              "breakeven_r": 1.0,
+              "stag_after_r": 0.5
+            },
+            "equity": 230.06,
+            "expectancy": 0.685
+          }
+        ]
+      },
+      {
+        "stage": "mtf_conc",
+        "best_equity": 2080.88,
+        "best_params": {
+          "HP_INST_REL": 3.0,
+          "HP_INST_VOL": 3.5,
+          "breakeven_r": 0.0,
+          "stag_after_r": 1.0,
+          "mtf_ma_period": 20,
+          "max_concurrent": 2
+        },
+        "all": [
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5,
+              "breakeven_r": 0.0,
+              "stag_after_r": 1.0,
+              "mtf_ma_period": 20,
+              "max_concurrent": 2
+            },
+            "equity": 2080.88,
+            "expectancy": 1.226
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5,
+              "breakeven_r": 0.0,
+              "stag_after_r": 1.0,
+              "mtf_ma_period": 20,
+              "max_concurrent": 3
+            },
+            "equity": 1549.36,
+            "expectancy": 0.944
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5,
+              "breakeven_r": 0.0,
+              "stag_after_r": 1.0,
+              "mtf_ma_period": 25,
+              "max_concurrent": 2
+            },
+            "equity": 1409.57,
+            "expectancy": 1.159
+          },
+          {
+            "params": {
+              "HP_INST_REL": 3.0,
+              "HP_INST_VOL": 3.5,
+              "breakeven_r": 0.0,
+              "stag_after_r": 1.0,
+              "mtf_ma_period": 25,
+              "max_concurrent": 3
+            },
+            "equity": 881.34,
+            "expectancy": 0.876
+          }
+        ]
+      }
+    ],
+    "start": "2026-02-25",
+    "end": "2026-04-15",
+    "desc": "bull recovery +16.1%"
+  }
+}

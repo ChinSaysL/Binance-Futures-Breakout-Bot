@@ -678,10 +678,11 @@ def detect_short_breakdown(
         and prior_low / max(latest.close, EPSILON) - 1.0 > settings.breakout_max_extension_pct
     ):
         return None  # already too far below the level - entering here is chasing
-    if settings.breakout_max_base_range_pct > 0:
-        prior_high = max(candle.high for candle in prior_window)
-        if prior_high <= 0 or (prior_high - prior_low) / prior_low > settings.breakout_max_base_range_pct:
-            return None  # base too wide/sloppy - not a tight coil
+    # Bypass max base range for shorts: in a crash, bases are naturally volatile and wide.
+    # if settings.breakout_max_base_range_pct > 0:
+    #     prior_high = max(candle.high for candle in prior_window)
+    #     if prior_high <= 0 or (prior_high - prior_low) / prior_low > settings.breakout_max_base_range_pct:
+    #         return None  # base too wide/sloppy - not a tight coil
 
     atr_pct = _atr_pct(candles[-settings.atr_lookback - 1 :], latest.close)
     if atr_pct < settings.min_breakout_atr_pct:
@@ -1187,7 +1188,24 @@ def detect_oversold_bounce(
 #      and the current candle is now breaking down through it.
 
 SHORT_EMA_PERIOD = 72
-SHORT_FAILED_BOUNCE_LOOKBACK = 3
+SHORT_FAILED_BOUNCE_LOOKBACK = 6
+SHORT_FAILED_BOUNCE_MIN_GREEN = 2
+SHORT_FAILED_BOUNCE_MIN_BOUNCE_PCT = 3.0
+SHORT_FAILED_BOUNCE_MAX_BOUNCE_PCT = 8.5
+SHORT_FAILED_BOUNCE_MAX_RALLY_TO_CLOSE_PCT = 7.0
+SHORT_FAILED_BOUNCE_MIN_CLOSE_POS = 0.65
+SHORT_FAILED_BOUNCE_MIN_BODY_POS = 0.18
+SHORT_FAILED_BOUNCE_MIN_EMA20_DIST_PCT = -8.5
+SHORT_FAILED_BOUNCE_MAX_EMA20_DIST_PCT = -2.0
+SHORT_FAILED_BOUNCE_MIN_EMA72_DIST_PCT = -18.0
+
+BEAR_SHORT_CONTROLLED_MIN_BTC_MOM_PCT = -7.0
+BEAR_SHORT_CONTROLLED_MAX_BTC_MOM_PCT = 0.0
+BEAR_SHORT_CONTROLLED_MIN_REL_MOM_PCT = -12.5
+BEAR_SHORT_CONTROLLED_MAX_REL_MOM_PCT = -2.5
+BEAR_SHORT_CRASH_MAX_BTC_MOM_PCT = -2.0
+BEAR_SHORT_CRASH_MIN_REL_MOM_PCT = -50.0
+BEAR_SHORT_CRASH_MAX_REL_MOM_PCT = -5.0
 
 
 def short_has_bear_trend(candles: list[Candle]) -> bool:
@@ -1202,10 +1220,89 @@ def short_has_bear_trend(candles: list[Candle]) -> bool:
 
 
 def short_has_failed_bounce(candles: list[Candle]) -> bool:
-    """True when a recent green candle (failed rally) precedes the breakdown."""
-    lookback = min(SHORT_FAILED_BOUNCE_LOOKBACK, len(candles) - 2)
-    prior = candles[-lookback - 1 : -1]
-    return any(c.close > c.open for c in prior)
+    """True when a controlled failed rally precedes the breakdown."""
+    if len(candles) < max(SHORT_EMA_PERIOD, SHORT_FAILED_BOUNCE_LOOKBACK + 2):
+        return False
+
+    latest = candles[-1]
+    if latest.close >= latest.open:
+        return False
+
+    candle_range = latest.high - latest.low
+    if candle_range <= 0:
+        return False
+    short_close_position = 1.0 - _close_position(latest)
+    if short_close_position < SHORT_FAILED_BOUNCE_MIN_CLOSE_POS:
+        return False
+    body_position = (latest.open - latest.close) / candle_range
+    if body_position < SHORT_FAILED_BOUNCE_MIN_BODY_POS:
+        return False
+
+    prior = candles[-SHORT_FAILED_BOUNCE_LOOKBACK - 1 : -1]
+    if len(prior) < SHORT_FAILED_BOUNCE_LOOKBACK:
+        return False
+    if sum(1 for c in prior if c.close > c.open) < SHORT_FAILED_BOUNCE_MIN_GREEN:
+        return False
+    if latest.low >= min(c.low for c in prior):
+        return False
+
+    prior_low = min(c.low for c in prior)
+    prior_high = max(c.high for c in prior)
+    if prior_low <= 0 or latest.close <= 0:
+        return False
+    bounce_pct = (prior_high / prior_low - 1.0) * 100.0
+    if not (SHORT_FAILED_BOUNCE_MIN_BOUNCE_PCT <= bounce_pct <= SHORT_FAILED_BOUNCE_MAX_BOUNCE_PCT):
+        return False
+    rally_to_close_pct = (prior_high / latest.close - 1.0) * 100.0
+    if rally_to_close_pct > SHORT_FAILED_BOUNCE_MAX_RALLY_TO_CLOSE_PCT:
+        return False
+
+    closes = [c.close for c in candles]
+    ema20 = _ema(closes[-80:], 20)
+    ema72 = _ema(closes[-120:], SHORT_EMA_PERIOD)
+    if math.isnan(ema20) or math.isnan(ema72):
+        return False
+    ema20_dist_pct = (latest.close / max(ema20, EPSILON) - 1.0) * 100.0
+    if not (SHORT_FAILED_BOUNCE_MIN_EMA20_DIST_PCT <= ema20_dist_pct <= SHORT_FAILED_BOUNCE_MAX_EMA20_DIST_PCT):
+        return False
+    ema72_dist_pct = (latest.close / max(ema72, EPSILON) - 1.0) * 100.0
+    return ema72_dist_pct >= SHORT_FAILED_BOUNCE_MIN_EMA72_DIST_PCT
+
+
+def short_is_controlled_failed_rally(btc_momentum_pct: float, rel_momentum_pct: float) -> bool:
+    """True when BTC/relative momentum supports a controlled failed rally short."""
+    return (
+        BEAR_SHORT_CONTROLLED_MIN_BTC_MOM_PCT <= btc_momentum_pct <= BEAR_SHORT_CONTROLLED_MAX_BTC_MOM_PCT
+        and BEAR_SHORT_CONTROLLED_MIN_REL_MOM_PCT <= rel_momentum_pct <= BEAR_SHORT_CONTROLLED_MAX_REL_MOM_PCT
+    )
+
+
+def short_is_crash_continuation(btc_momentum_pct: float, rel_momentum_pct: float) -> bool:
+    """True when BTC/relative momentum supports a crash continuation short."""
+    # Allow hyperopt to override the crash thresholds
+    import os
+    crash_max_btc = float(os.environ.get("HP_CRASH_BTC", BEAR_SHORT_CRASH_MAX_BTC_MOM_PCT))
+    crash_max_rel = float(os.environ.get("HP_CRASH_REL", BEAR_SHORT_CRASH_MAX_REL_MOM_PCT))
+    return (
+        btc_momentum_pct <= crash_max_btc
+        and BEAR_SHORT_CRASH_MIN_REL_MOM_PCT <= rel_momentum_pct <= crash_max_rel
+    )
+
+
+def short_has_crash_setup(candles: list[Candle]) -> bool:
+    """True when the coin is structurally sound for a crash short."""
+    if len(candles) < 20:
+        return False
+    # Avoid shorting if it's already completely collapsed and extremely disconnected from EMA20
+    closes = [c.close for c in candles]
+    ema20 = _ema(closes[-80:], 20)
+    if math.isnan(ema20):
+        return False
+    latest = candles[-1]
+    ema20_dist_pct = (latest.close / max(ema20, EPSILON) - 1.0) * 100.0
+    if ema20_dist_pct < -20.0:  # already dumped >20% below its 20-period moving average
+        return False
+    return True
 
 
 def _candidate_priority(status: str) -> int:
@@ -1443,10 +1540,9 @@ def detect_failed_rally(
     # ── 3. REJECTION: current candle is RED, making a lower low ──────────
     if latest.close >= latest.open:
         return None  # must be a red candle (rejection)
-    # Must break below the rally window's low (rally fully erased)
-    rally_window_low = min(c.low for c in rally_window)
-    if latest.low >= rally_window_low:
-        return None  # holding above rally zone — rejection incomplete
+    # Must break back below the breakout point (prior_high)
+    if latest.low > prior_low:
+        return None  # holding above the resistance — rejection incomplete
     candle_range = latest.high - latest.low
     if candle_range <= 0:
         return None
