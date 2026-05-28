@@ -105,6 +105,8 @@ class BacktestTrade:
     tp_conviction: float = 0.0
     momentum_score: float = 0.0  # used by the rotation portfolio sim
     window_bear: bool = False
+    sizing_scale: float = 1.0   # from REGIME_PARAMS — applied in position sizing
+    btc_regime: str = ""        # BTC regime name at signal time (BULL_CHOP etc.)
 
     # Feature snapshot at signal-detection time, for offline ML training.
     # Populated by _simulate_trade from the BreakoutSignal; never read by the
@@ -1929,6 +1931,12 @@ def _backtest_symbol(
         if trade is None:
             index += 1
             continue
+        # ── Per-timestamp BTC regime → sizing scale ───────────────────
+        # Look up the current BTC regime at signal time and store the
+        # sizing_scale so _position_pct_for_trade can apply it automatically.
+        rp = _regime_params_for(window[-1].close_time, market_trend)
+        trade.sizing_scale = rp.sizing_scale
+        trade.btc_regime = rp.name
         _apply_context_features(trade, context_features)
         _apply_ml_scores(trade, ml_scores, args.ml_filter_score)
         if (start_ms is not None and trade.entry_time < start_ms) or (end_ms is not None and trade.entry_time > end_ms):
@@ -1950,6 +1958,8 @@ def _backtest_symbol(
                     else:
                         fade_trade = _simulate_trade(fade_signal, candles, index, args, fade_regime, bear_overrides or None)
                         if fade_trade is not None:
+                            fade_trade.sizing_scale = rp.sizing_scale
+                            fade_trade.btc_regime = rp.name
                             _apply_context_features(fade_trade, context_features)
                             if not ((start_ms is not None and fade_trade.entry_time < start_ms) or (end_ms is not None and fade_trade.entry_time > end_ms)):
                                 trades.append(fade_trade)
@@ -2944,6 +2954,7 @@ def _position_pct_for_trade(equity: float, peak: float, trade: BacktestTrade, ar
         if trade.side == "SHORT":
             pct = min(pct, 12.0)
         pct = max(pct, 8.0)
+        pct *= trade.sizing_scale
         return pct
 
     if args.sizing_mode == "aggressive":
@@ -2970,6 +2981,11 @@ def _position_pct_for_trade(equity: float, peak: float, trade: BacktestTrade, ar
         pct *= args.instant_size_multiplier
     elif trade.regime == "TRAILING_RETEST":
         pct *= args.trailing_retest_size_multiplier
+
+    # ── BTC regime sizing scale ──────────────────────────────────────
+    # Per-regime de-risking: BULL_CHOP=0.85x, BEAR_GRIND=0.70x, etc.
+    # Computed at signal time from _regime_params_for() and stored on trade.
+    pct *= trade.sizing_scale
 
     return min(max(pct, 5.0), ceiling)
 
@@ -3124,6 +3140,8 @@ def _write_trade_log(
         "feat_symbol_win_rate_30",
         "feat_symbol_avg_r_30",
         "feat_interval",
+        "sizing_scale",
+        "btc_regime",
     ]
     with output.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -3188,6 +3206,8 @@ def _write_trade_log(
                     "feat_symbol_win_rate_30": f"{trade.feat_symbol_win_rate_30:.6f}",
                     "feat_symbol_avg_r_30": f"{trade.feat_symbol_avg_r_30:.6f}",
                     "feat_interval": args.interval if args is not None else "",
+                    "sizing_scale": f"{trade.sizing_scale:.2f}",
+                    "btc_regime": trade.btc_regime,
                 }
             )
     return output
