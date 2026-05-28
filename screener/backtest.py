@@ -1055,6 +1055,12 @@ BEAR_PROFILE_BTC_RETURN_THRESHOLD = -5.0
 # a year when BTC was mostly flat-to-up).
 BEAR_SHORT_60D_RETURN_THRESHOLD = -10.0
 
+# ── DD-based equity reset ──
+# When drawdown exceeds DD_RESET_THRESHOLD%, halve position sizing for the
+# next DD_RESET_TRADES trades to break the compounding bleed cycle.
+DD_RESET_THRESHOLD = 50.0  # percent drawdown trigger
+DD_RESET_TRADES = 5        # number of halved-size trades during reset
+
 
 def _bear_window_active(args: argparse.Namespace, timestamp: int, market_trend: MarketTrend | None) -> bool:
     """True when --bear-profile is on AND the 30-day BTC return is bearish.
@@ -2598,11 +2604,7 @@ def _simulate_portfolio(
     consecutive_losses_by_symbol: dict[str, int] = {}
     consecutive_wins_by_symbol: dict[str, int] = {}
     # ── DD-based equity reset ──
-    # When drawdown exceeds 50%, halve position sizing for the next N trades
-    # to break the compounding bleed cycle.  Counter resets on new peak.
     dd_reset_remaining = 0
-    DD_RESET_TRADES = 5
-    DD_RESET_THRESHOLD = 50.0  # percent
 
     def realize(cutoff: float) -> None:
         nonlocal equity, peak, max_drawdown, dd_reset_remaining
