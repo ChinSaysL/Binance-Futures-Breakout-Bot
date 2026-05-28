@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 from bisect import bisect_right
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import csv
 from dataclasses import dataclass, replace
 from dataclasses import dataclass, replace
@@ -179,6 +180,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--min-quote-volume", type=float, default=20_000_000.0, help="Liquidity floor: skip symbols below this 24h quote volume.")
     parser.add_argument("--detector", choices=["simple", "squeeze"], default="simple", help="simple = high-recall long-breakout detector; squeeze = the original pre-breakout detector.")
     parser.add_argument("--interval", default="1h", help="Kline interval, e.g. 15m, 1h, 4h.")
+    parser.add_argument("--intervals", default=None, help="Comma-separated intervals to scan in one run, mirroring live (--timeframes 15m,1h,4h).  When set, each symbol is backtested on every interval and all trades feed into the same portfolio simulator.  Overrides --interval.")
     parser.add_argument("--history", type=int, default=1500, help="Klines to pull per symbol (max 1500).")
     parser.add_argument("--start-date", help="UTC start date for the backtest window, YYYY-MM-DD.")
     parser.add_argument("--end-date", help="UTC end date for the backtest window, YYYY-MM-DD.")
@@ -294,6 +296,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="Max Binance requests per minute during backtests. 0 disables.",
     )
     parser.add_argument("--offline-cache-dir", type=Path, default=None, help="Run offline: read klines from {symbol}_{interval}.json and exchange_info.json in this directory. Skips ALL Binance API calls.")
+    parser.add_argument("--workers", type=int, default=1, help="Number of worker threads for parallel symbol processing. Default 1 (serial). Set to 0 for cpu_count.")
     args = parser.parse_args(argv)
     if args.shorts_only:
         args.longs_only = False
@@ -388,6 +391,72 @@ def _parse_regime_set(raw: str) -> set[str]:
     return {part.strip().upper() for part in raw.split(",") if part.strip()}
 
 
+def _process_symbol_worker(
+    symbol: str,
+    index: int,
+    total: int,
+    ml_model_local,
+    btc_return_local,
+    market_trend_local,
+    scan_intervals_local,
+    args_local,
+    settings_local,
+    client_local=None,
+):
+    """Process a single symbol across all scan intervals — module-level for multiprocessing.
+
+    In offline mode the BinanceClient is never called; klines are read directly from
+    {offline_cache_dir}/{symbol}_{interval}.json by _fetch_klines_window.
+    client_local can be None when using --offline-cache-dir (required for multiprocessing).
+    """
+    import copy
+    thread_args = copy.copy(args_local)
+    symbol_trades_all: list[BacktestTrade] = []
+    symbol_candles: list[Candle] | None = None
+    symbol_total = 0
+    best_iv_ms = 0
+    for iv in scan_intervals_local:
+        thread_args.interval = iv
+        iv_ms = interval_to_ms(iv)
+        try:
+            raw = _fetch_klines(client_local, symbol, thread_args, iv_ms)
+        except Exception as exc:
+            print(f"  [{index}/{total}] {symbol}@{iv}: klines failed ({exc})")
+            continue
+        candles = candles_from_klines(raw)
+        if not _window_is_liquid(candles, thread_args, iv_ms):
+            continue
+        mtf_align: MtfAlignment | None = None
+        if thread_args.mtf_alignment_tf and thread_args.mtf_alignment_tf != iv:
+            try:
+                _offline_dir = getattr(thread_args, "offline_cache_dir", None)
+                mtf_raw = _fetch_klines_at(
+                    client_local, symbol, thread_args.mtf_alignment_tf,
+                    interval_to_ms(thread_args.mtf_alignment_tf), thread_args.start_ms, thread_args.end_ms,
+                    offline_cache_dir=str(_offline_dir) if _offline_dir else None,
+                )
+            except Exception:
+                mtf_raw = []
+            if mtf_raw:
+                mtf_align = _build_mtf_alignment(
+                    candles_from_klines(mtf_raw),
+                    thread_args.mtf_alignment_ma_period,
+                    thread_args.mtf_alignment_ma_type,
+                )
+        symbol_trades = _backtest_symbol(
+            symbol, candles, thread_args, settings_local,
+            thread_args.start_ms, thread_args.end_ms, market_trend_local,
+            mtf_align, ml_model_local, btc_return_local,
+        )
+        symbol_trades_all.extend(symbol_trades)
+        if thread_args.simulate_rotation and symbol_trades:
+            if symbol_candles is None or iv_ms < best_iv_ms:
+                symbol_candles = candles
+                best_iv_ms = iv_ms
+        symbol_total += len(symbol_trades)
+    return symbol, symbol_trades_all, symbol_candles, symbol_total, index, total
+
+
 def _run(client: BinanceClient, args: argparse.Namespace) -> int:
     if args.position_pct <= 0 and args.sizing_mode == "guarded":
         args.position_pct = _auto_position_pct(args.capital)
@@ -404,7 +473,12 @@ def _run(client: BinanceClient, args: argparse.Namespace) -> int:
         target_intensity_max=args.target_intensity_max,
         tp_cap_recent_swing_high_candles=args.tp_cap_recent_swing_high_candles,
     )
-    interval_ms = interval_to_ms(args.interval)
+    # Resolve scan intervals (multi-tf when --intervals is set, mirroring live).
+    if args.intervals:
+        scan_intervals = [iv.strip() for iv in args.intervals.split(",") if iv.strip()]
+    else:
+        scan_intervals = [args.interval]
+    interval_ms = interval_to_ms(scan_intervals[0])
     symbols = _resolve_symbols(client, args)
     if not symbols:
         print("No symbols resolved for the backtest.")
@@ -479,36 +553,46 @@ def _run(client: BinanceClient, args: argparse.Namespace) -> int:
 
     trades: list[BacktestTrade] = []
     candles_by_symbol: dict[str, list[Candle]] = {}
-    for index, symbol in enumerate(symbols, start=1):
-        try:
-            raw = _fetch_klines(client, symbol, args, interval_ms)
-        except BinanceClientError as exc:
-            print(f"  [{index}/{len(symbols)}] {symbol}: klines failed ({exc})")
-            continue
-        candles = candles_from_klines(raw)
-        if not _window_is_liquid(candles, args, interval_ms):
-            print(f"  [{index}/{len(symbols)}] {symbol}: skipped (illiquid in window)")
-            continue
-        mtf_align: MtfAlignment | None = None
-        if args.mtf_alignment_tf:
-            try:
-                mtf_raw = _fetch_klines_at(
-                    client, symbol, args.mtf_alignment_tf,
-                    interval_to_ms(args.mtf_alignment_tf), args.start_ms, args.end_ms,
-                )
-            except BinanceClientError:
-                mtf_raw = []
-            if mtf_raw:
-                mtf_align = _build_mtf_alignment(
-                    candles_from_klines(mtf_raw),
-                    args.mtf_alignment_ma_period,
-                    args.mtf_alignment_ma_type,
-                )
-        symbol_trades = _backtest_symbol(symbol, candles, args, settings, args.start_ms, args.end_ms, market_trend, mtf_align, ml_model, btc_return)
-        trades.extend(symbol_trades)
-        if args.simulate_rotation and symbol_trades:
-            candles_by_symbol[symbol] = candles
-        print(f"  [{index}/{len(symbols)}] {symbol}: {len(symbol_trades)} trade(s)")
+    # Save the user-set --interval; we mutate args.interval per scan so the
+    # per-symbol code paths (regime detection, interval-aware sizing, trade
+    # log labels) see the correct TF for each pass.
+    _saved_interval = args.interval
+
+    # ── Resolve worker count ─────────────────────────────────────────
+    workers = args.workers if args.workers > 0 else os.cpu_count() or 4
+    workers = max(1, workers)
+
+    if workers <= 1:
+        # ── Serial path (original behaviour) ─────────────────────────
+        for index, symbol in enumerate(symbols, start=1):
+            symbol, symbol_trades_all, symbol_candles, symbol_total, _, _ = _process_symbol_worker(
+                symbol, index, len(symbols), ml_model, btc_return, market_trend,
+                scan_intervals, args, settings, client,
+            )
+            trades.extend(symbol_trades_all)
+            if symbol_candles is not None:
+                candles_by_symbol[symbol] = symbol_candles
+            print(f"  [{index}/{len(symbols)}] {symbol}: {symbol_total} trade(s) across {len(scan_intervals)} TF(s)")
+    else:
+        # ── Parallel path (ProcessPoolExecutor for true CPU parallelism) ──
+        print(f"Processing {len(symbols)} symbol(s) with {workers} worker processes...")
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(
+                    _process_symbol_worker,
+                    symbol, idx, len(symbols), ml_model, btc_return, market_trend,
+                    scan_intervals, args, settings,
+                ): symbol
+                for idx, symbol in enumerate(symbols, start=1)
+            }
+            for future in as_completed(futures):
+                symbol, symbol_trades_all, symbol_candles, symbol_total, index, total = future.result()
+                trades.extend(symbol_trades_all)
+                if symbol_candles is not None:
+                    candles_by_symbol[symbol] = symbol_candles
+                print(f"  [{index}/{total}] {symbol}: {symbol_total} trade(s) across {len(scan_intervals)} TF(s)")
+
+    args.interval = _saved_interval
 
     if args.simulate_rotation:
         taken, final_equity, max_drawdown = _simulate_portfolio_with_rotation(trades, candles_by_symbol, args)
@@ -563,7 +647,11 @@ def _fetch_klines_window(
     When offline_cache_dir is set, reads directly from {symbol}_{interval}.json
     files without any API calls.
     """
-    # ── offline mode: read from pre-fetched cache as fallback ──
+    # ── Forced-offline guard: multiprocessing workers pass client=None ──
+    if client is None and offline_cache_dir is None:
+        return []  # no API client available — skip
+
+    # ── offline mode: read from pre-fetched cache ──
     if offline_cache_dir is not None:
         cache_file = Path(offline_cache_dir) / f"{symbol}_{interval}.json"
         if cache_file.exists():
@@ -582,7 +670,8 @@ def _fetch_klines_window(
                         return filtered
             except (OSError, ValueError, json.JSONDecodeError):
                 pass
-        # Cache miss or no data in window — try API below
+        # Cache miss or no data in window — return empty (offline mode has no API fallback)
+        return []
 
     if start_time is None:
         return client.klines(symbol, interval, limit, end_time=end_time)
@@ -630,6 +719,7 @@ def _fetch_klines_at(
     start_ms: int | None,
     end_ms: int | None,
     history: int = 1500,
+    offline_cache_dir: str | None = None,
 ) -> list[list[object]]:
     """Fetch klines at an arbitrary interval (caches like _fetch_klines).
     Used for the MTF-alignment higher-timeframe lookup."""
@@ -639,7 +729,8 @@ def _fetch_klines_at(
     if start_time is not None:
         start_time = max(int(start_time) - 150 * interval_ms, 0)
         limit = 1500
-    return _fetch_klines_window(client, symbol, interval, interval_ms, limit, start_time, end_time)
+    return _fetch_klines_window(client, symbol, interval, interval_ms, limit, start_time, end_time,
+                                offline_cache_dir=offline_cache_dir)
 
 
 @dataclass(frozen=True)
@@ -957,15 +1048,20 @@ BEAR_PROFILE_STAGNATION_CANDLES = 8
 # Window-level threshold: if BTC's total return over the window is <= this
 # percent, the bear profile activates for the ENTIRE window.
 BEAR_PROFILE_BTC_RETURN_THRESHOLD = -5.0
-# Window-level threshold: if BTC's total return over the window is <= this
-# percent, the bear profile activates for the ENTIRE window.
-BEAR_PROFILE_BTC_RETURN_THRESHOLD = -5.0
+# ── Dynamic bear-profile activation for SHORTS ──
+# BTC must be in a sustained downtrend before shorts fire.  60-day lookback
+# at -10% means shorts only activate in genuine bear markets (2024 rarely
+# crossed this threshold, which is exactly the point — shorts bled -$350 in
+# a year when BTC was mostly flat-to-up).
+BEAR_SHORT_60D_RETURN_THRESHOLD = -10.0
 
 
 def _bear_window_active(args: argparse.Namespace, timestamp: int, market_trend: MarketTrend | None) -> bool:
     """True when --bear-profile is on AND the 30-day BTC return is bearish.
 
-    Dynamically tracks macro trend without hindsight bias.
+    Bear-profile activation (long-side guards, profit-lock ladder etc.)
+    still uses the shorter 30d/-5% threshold — these protective measures
+    should activate earlier than shorts.
     """
     if not getattr(args, "bear_profile", False):
         return False
@@ -986,6 +1082,34 @@ def _bear_window_active(args: argparse.Namespace, timestamp: int, market_trend: 
 
     btc_return = (point.close / max(past_point.close, 1e-9) - 1.0) * 100.0
     return btc_return <= BEAR_PROFILE_BTC_RETURN_THRESHOLD
+
+
+def _bear_shorts_enabled(args: argparse.Namespace, timestamp: int, market_trend: MarketTrend | None) -> bool:
+    """True when shorts should fire: BTC is in a SUSTAINED downtrend.
+
+    Uses a 60-day lookback at -10% — much stricter than the general bear
+    profile.  In 2024 BTC's 60-day return almost never crossed -10%, so
+    shorts stayed off (saving ~$390 of BREAKDOWN bleed).
+    """
+    if not getattr(args, "bear_profile", False):
+        return False
+    if market_trend is None:
+        return False
+
+    point = market_trend.at_or_before(timestamp)
+    if point is None:
+        return False
+
+    # Look back 60 days
+    past_point = market_trend.at_or_before(timestamp - _MS_60D)
+    if past_point is None:
+        past_point = market_trend.points[0]
+
+    if past_point.close_time >= timestamp:
+        return False
+
+    btc_return = (point.close / max(past_point.close, 1e-9) - 1.0) * 100.0
+    return btc_return <= BEAR_SHORT_60D_RETURN_THRESHOLD
 
 
 # ---------------------------------------------------------------------------
@@ -1539,6 +1663,8 @@ def _backtest_symbol(
     # using the market_trend's 30-day trailing return.
     mid_ts = candles[len(candles) // 2].close_time if candles else 0
     window_bear = _bear_window_active(args, mid_ts, market_trend)
+    # ── Shorts gate: require sustained BTC downtrend (60d < -10%) ──
+    shorts_enabled = _bear_shorts_enabled(args, mid_ts, market_trend)
     if window_bear:
         bear_overrides = _bear_overrides()
         settings = _bear_detector_settings(settings)  # stricter breakout detection
@@ -1563,7 +1689,7 @@ def _backtest_symbol(
 
         # ── Bear profile: temporarily enable short detection ──────────
         _saved_longs_only = args.longs_only
-        if window_bear:
+        if shorts_enabled:
             args.longs_only = False  # allow short signals to be generated
 
         if args.detector == "simple":
@@ -1605,7 +1731,7 @@ def _backtest_symbol(
         # Independent module — generates SEPARATE SHORT trades alongside
         # standard signals.  Both share the same slot pool.
         fade_signal: BreakoutSignal | None = None
-        if window_bear:
+        if shorts_enabled:
             fade_signal = detect_failed_rally(
                 symbol,
                 window,
@@ -1638,7 +1764,7 @@ def _backtest_symbol(
             signal is None
             or signal.reward_risk < args.min_rr
             or signal.score < args.min_score
-            or (args.longs_only and signal.side == "SHORT" and not window_bear)
+            or (args.longs_only and signal.side == "SHORT" and not shorts_enabled)
             or (args.shorts_only and signal.side == "LONG")
             or (args.detector == "squeeze" and _dead_coin_reason(signal))
         ):
@@ -1666,6 +1792,17 @@ def _backtest_symbol(
             if not _bear_short_quality_allows(signal.status, window, context_features):
                 index += 1
                 continue
+
+        # ── Fix: Block BREAKDOWN when window-level BTC return is positive ──
+        # BREAKDOWN shorts bled -$392 in 2024 (34.4% WR on 93 trades).  In
+        # a positive-BTC year these counter-trend trades are essentially
+        # donations.  Gate: if the full-window BTC return is > 0, skip all
+        # BREAKDOWN signals.
+        if (signal.status == "BREAKDOWN"
+                and btc_return is not None
+                and btc_return > 0):
+            index += 1
+            continue
 
         # ── Bear-profile guard overrides ──────────────────────────────
         # Use window-level bear detection (not per-timestamp) for guard
@@ -2461,9 +2598,15 @@ def _simulate_portfolio(
     cooldown_until_by_symbol: dict[str, int] = {}
     consecutive_losses_by_symbol: dict[str, int] = {}
     consecutive_wins_by_symbol: dict[str, int] = {}
+    # ── DD-based equity reset ──
+    # When drawdown exceeds 50%, halve position sizing for the next N trades
+    # to break the compounding bleed cycle.  Counter resets on new peak.
+    dd_reset_remaining = 0
+    DD_RESET_TRADES = 5
+    DD_RESET_THRESHOLD = 50.0  # percent
 
     def realize(cutoff: float) -> None:
-        nonlocal equity, peak, max_drawdown
+        nonlocal equity, peak, max_drawdown, dd_reset_remaining
         for position in sorted(
             [p for p in open_positions if p.exit_time <= cutoff], key=lambda p: p.exit_time
         ):
@@ -2488,8 +2631,16 @@ def _simulate_portfolio(
                         position.exit_time + args.win_cooldown_candles * interval_ms,
                     )
             peak = max(peak, equity)
+            # ── DD-based equity reset ──
+            # If we just hit a new peak, clear the reset counter.
+            if equity >= peak:
+                dd_reset_remaining = 0
             if peak > 0:
-                max_drawdown = max(max_drawdown, (peak - equity) / peak * 100.0)
+                current_dd = (peak - equity) / peak * 100.0
+                max_drawdown = max(max_drawdown, current_dd)
+                # Trigger reset if DD crosses threshold and not already resetting
+                if current_dd >= DD_RESET_THRESHOLD and dd_reset_remaining <= 0:
+                    dd_reset_remaining = DD_RESET_TRADES
 
     for trade in ordered:
         realize(trade.entry_time)
@@ -2517,8 +2668,11 @@ def _simulate_portfolio(
             and trade.momentum_score < _s_tier_threshold
         ):
             continue  # last slot reserved for S-tier setups
-            continue  # last slot reserved for S-tier setups
         position_pct = _position_pct_for_trade(equity, peak, trade, args)
+        # ── DD-based sizing reset: halve position size during reset window ──
+        if dd_reset_remaining > 0:
+            position_pct = position_pct / 2.0
+            dd_reset_remaining -= 1
         margin = equity * (position_pct / 100.0) if args.compound else args.order_margin
         notional = margin * max(trade.leverage, 1)
         if notional < 5.0:
@@ -2588,9 +2742,11 @@ def _simulate_portfolio_with_rotation(
     last_rotation_time_ms = 0
     rotation_cooldown_ms = _ROTATION_COOLDOWN_SECONDS * 1000
     rotation_min_hold_ms = _ROTATION_MIN_HOLD_SECONDS * 1000
+    # ── DD-based equity reset ──
+    dd_reset_remaining = 0
 
     def close_position(pos: dict, exit_time_ms: int, exit_price: float, by_rotation: bool) -> None:
-        nonlocal equity, peak, max_drawdown
+        nonlocal equity, peak, max_drawdown, dd_reset_remaining
         trade = pos["trade"]
         side = pos["side"]
         entry_price = pos["entry_price"]
@@ -2642,8 +2798,14 @@ def _simulate_portfolio_with_rotation(
                     exit_time_ms + args.win_cooldown_candles * interval_ms,
                 )
         peak = max(peak, equity)
+        # ── DD-based equity reset ──
+        if equity >= peak:
+            dd_reset_remaining = 0
         if peak > 0:
-            max_drawdown = max(max_drawdown, (peak - equity) / peak * 100.0)
+            current_dd = (peak - equity) / peak * 100.0
+            max_drawdown = max(max_drawdown, current_dd)
+            if current_dd >= DD_RESET_THRESHOLD and dd_reset_remaining <= 0:
+                dd_reset_remaining = DD_RESET_TRADES
 
     def realize_natural_exits(cutoff_ms: int) -> None:
         due = [p for p in open_positions if p["natural_exit_time"] <= cutoff_ms]
@@ -2653,7 +2815,12 @@ def _simulate_portfolio_with_rotation(
             open_positions.remove(pos)
 
     def open_new(trade: BacktestTrade) -> bool:
+        nonlocal dd_reset_remaining
         position_pct = _position_pct_for_trade(equity, peak, trade, args)
+        # ── DD-based sizing reset: halve position size during reset window ──
+        if dd_reset_remaining > 0:
+            position_pct = position_pct / 2.0
+            dd_reset_remaining -= 1
         margin = equity * (position_pct / 100.0) if args.compound else args.order_margin
         notional = margin * max(trade.leverage, 1)
         if notional < 5.0:
