@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Iterable
@@ -1028,6 +1029,185 @@ def _clamp(value: float, low: float, high: float) -> float:
     return min(max(value, low), high)
 
 
+# ---------------------------------------------------------------------------
+# Bear-market oversold-bounce detector
+# ---------------------------------------------------------------------------
+# In sustained downtrends, breakout longs get faded.  The edge shifts to
+# mean-reversion: coins that are deeply discounted, showing capitulation
+# volume, and printing their first green candle after a red streak.
+#
+# Design choices (backed by the W1 crash/recovery pattern analysis):
+#   * Require the coin to be near the bottom of its 72-candle range (close
+#     position <= 0.25) -- it must genuinely be "on sale".
+#   * Require at least 3 of the last 5 candles to be red (bearish streak)
+#     so we are catching a reversal, not joining a dip that keeps dipping.
+#   * The entry candle must close green (close > open) as confirmation the
+#     bounce has begun.
+#   * Volume on the entry candle must be >= 1.3x the 20-period average
+#     (capitulation or accumulation volume -- either is fine for a bounce).
+#   * Stop goes just below the recent swing low (tight, because if the
+#     bounce fails we want out fast).
+#   * Target is a quick 2R: entry + 2 * risk.  Bear-market rallies are
+#     sharp but short-lived; trying to capture more than 2R usually gives
+#     it all back.
+#   * The detector is only activated when BTC itself is bearish (checked
+#     by the caller in backtest.py), so it never fires in bull markets.
+
+OVERSOLD_LOOKBACK = 72
+OVERSOLD_MAX_CLOSE_POSITION = 0.25  # must be in bottom quartile of range
+OVERSOLD_RED_STREAK_MIN = 3
+OVERSOLD_RED_STREAK_WINDOW = 5
+OVERSOLD_MIN_VOLUME_RATIO = 1.3
+OVERSOLD_VOLUME_LOOKBACK = 20
+OVERSOLD_TARGET_R_MULTIPLE = 2.0
+OVERSOLD_STOP_LOOKBACK = 10
+OVERSOLD_MIN_ATR_PCT = 0.008  # 0.8% -- must have some volatility to bounce
+
+
+def detect_oversold_bounce(
+    symbol: str,
+    candles: list[Candle],
+    quote_volume_24h: float,
+    interval_ms: int,
+    interval: str = "",
+    range_pct_24h: float = 0.0,
+    settings: BreakoutSettings | None = None,
+    now_ms: int | None = None,
+) -> BreakoutSignal | None:
+    """Detect mean-reversion long setups in bear markets.
+
+    Looks for coins that are deeply discounted (bottom quartile of their
+    recent range), in a red streak, and printing their first green candle
+    with elevated volume -- a capitulation-to-reversal signature.
+    """
+    settings = settings or BreakoutSettings()
+    need = OVERSOLD_LOOKBACK + 2
+    if len(candles) < need:
+        return None
+    now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    latest = candles[-1]
+
+    # ── 1. Deep discount check ──────────────────────────────────────────
+    window_72 = candles[-OVERSOLD_LOOKBACK - 1 :]
+    high_72 = max(c.high for c in window_72)
+    low_72 = min(c.low for c in window_72)
+    if high_72 <= low_72:
+        return None
+    close_position_72 = (latest.close - low_72) / (high_72 - low_72)
+    if close_position_72 > OVERSOLD_MAX_CLOSE_POSITION:
+        return None  # not discounted enough
+
+    # ── 2. Red streak check ─────────────────────────────────────────────
+    recent_5 = candles[-OVERSOLD_RED_STREAK_WINDOW - 1 : -1]  # exclude latest
+    red_count = sum(1 for c in recent_5 if c.close < c.open)
+    if red_count < OVERSOLD_RED_STREAK_MIN:
+        return None  # no bearish momentum to reverse
+
+    # ── 3. Green entry candle ───────────────────────────────────────────
+    if latest.close <= latest.open:
+        return None  # entry candle must be green (reversal confirmation)
+
+    # ── 4. Volume check ─────────────────────────────────────────────────
+    vol_lookback = min(OVERSOLD_VOLUME_LOOKBACK, len(candles) - 2)
+    vol_window = candles[-vol_lookback - 1 : -1]
+    volume_ratio, open_candle = _volume_ratio(latest, vol_window, interval_ms, now_ms)
+    if volume_ratio < OVERSOLD_MIN_VOLUME_RATIO:
+        return None  # no capitulation/accumulation volume
+
+    # ── 5. ATR / liquidity check ────────────────────────────────────────
+    atr_pct = _atr_pct(candles[-settings.atr_lookback - 1 :], latest.close)
+    if atr_pct < OVERSOLD_MIN_ATR_PCT:
+        return None  # too dead to bounce
+
+    avg_quote_volume = _average_quote_volume(vol_window)
+    min_required_quote_volume = settings.min_avg_quote_volume * interval_ms / BASE_FLOW_INTERVAL_MS
+    if avg_quote_volume < min_required_quote_volume:
+        return None
+
+    # ── 6. Stop: below the recent swing low ─────────────────────────────
+    stop_lookback = min(OVERSOLD_STOP_LOOKBACK, len(candles) - 1)
+    stop_window = candles[-stop_lookback - 1 : -1]
+    swing_low = min(c.low for c in stop_window)
+    stop_price = swing_low * (1.0 - settings.stop_buffer_pct)
+
+    # ── 7. Entry & target ───────────────────────────────────────────────
+    trigger_price = latest.close  # market entry at signal close
+    if stop_price <= 0 or stop_price >= trigger_price:
+        return None
+    risk = trigger_price - stop_price
+    target_price = trigger_price + risk * OVERSOLD_TARGET_R_MULTIPLE
+
+    # ── 8. Build signal ─────────────────────────────────────────────────
+    close_pos = _close_position(latest)
+    return _build_signal(
+        symbol=symbol,
+        interval=interval,
+        side="LONG",
+        status="OVERSOLD_BOUNCE",
+        close=latest.close,
+        resistance=high_72,
+        support=swing_low,
+        breakout_pct=close_position_72,  # repurposed: how deep the discount
+        move_pct=(latest.close - latest.open) / max(latest.open, EPSILON),
+        sweep_pct=0.0,
+        distance_to_trigger_pct=0.0,
+        trigger_price=trigger_price,
+        stop_price=stop_price,
+        target_price=target_price,
+        volume_ratio=volume_ratio,
+        avg_quote_volume=avg_quote_volume,
+        min_required_quote_volume=min_required_quote_volume,
+        compression_pct=0.0,
+        atr_pct=atr_pct,
+        close_position=close_pos,
+        trend_score=_trend_score(candles, side="LONG"),
+        quote_volume_24h=quote_volume_24h,
+        trade_count_24h=0,
+        range_pct_24h=range_pct_24h,
+        price_change_pct_24h=0.0,
+        open_candle=open_candle,
+        settings=settings,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bear-market short filter helpers
+# ---------------------------------------------------------------------------
+# The standard short detector mirrors the long-breakout logic, which works
+# poorly in bear markets because breakdowns get bought up (bear-trap rallies).
+# Two extra filters improve short quality in bear regimes:
+#
+#   1. TREND CONFIRMATION – the coin must already be below its 72-period
+#      EMA (downtrend in place).  Shorting a coin that is still above its
+#      long-term average is fighting the primary trend even if the local
+#      breakdown looks good.
+#
+#   2. FAILED-BOUNCE PATTERN – the best shorts come after a dead-cat bounce:
+#      at least one of the last 3 candles closed green (attempted rally)
+#      and the current candle is now breaking down through it.
+
+SHORT_EMA_PERIOD = 72
+SHORT_FAILED_BOUNCE_LOOKBACK = 3
+
+
+def short_has_bear_trend(candles: list[Candle]) -> bool:
+    """True when the coin is in a sustained downtrend (close below 72-EMA)."""
+    if len(candles) < SHORT_EMA_PERIOD:
+        return True  # not enough data; let it through
+    closes = [c.close for c in candles[-SHORT_EMA_PERIOD:]]
+    ema = _ema(closes, SHORT_EMA_PERIOD)
+    if math.isnan(ema):
+        return True
+    return candles[-1].close < ema
+
+
+def short_has_failed_bounce(candles: list[Candle]) -> bool:
+    """True when a recent green candle (failed rally) precedes the breakdown."""
+    lookback = min(SHORT_FAILED_BOUNCE_LOOKBACK, len(candles) - 2)
+    prior = candles[-lookback - 1 : -1]
+    return any(c.close > c.open for c in prior)
+
+
 def _candidate_priority(status: str) -> int:
     return {
         "SPRING": 3,
@@ -1049,6 +1229,291 @@ def _status(is_pre_breakout: bool, is_shakeout: bool, is_confirmed_breakout: boo
     if is_fakeout:
         return "FAKEOUT"
     return "NONE"
+
+
+# ---------------------------------------------------------------------------
+# Bear-bounce detector — high-volume mean-reversion signal generator
+# ---------------------------------------------------------------------------
+# Previous iterations were too strict (2-18 trades), making evaluation
+# impossible.  This version generates MANY signals with loose entry
+# criteria, relying on the exit strategy (breakeven, stagnation, trail)
+# to separate winners from losers.
+#
+# The hypothesis: in bear markets, buying ANY green candle after a red
+# streak, with a tight stop and quick target, has a small but real edge.
+# Volume of trades × small edge = profit.
+
+# Data-driven thresholds from 92-trade W1 analysis:
+#   Winners: ATR 2.74%, vol 2.04x, rel mom -6.95%, BTC mom 2.66%
+#   Losers:  ATR 2.20%, vol 2.07x, rel mom -3.36%, BTC mom 1.99%
+#   BTC < EMA: 20% WR / -0.56R  →  BLOCK
+#   rel mom < -5%: 44% WR / +0.39R  →  REQUIRE  (contrarian bounce)
+#   vol > 2.0x: 24% WR  →  BLOCK (exhaustion)
+#   hold=1c: 0% WR (24 trades!)  →  need close_position filter
+
+BB_RED_STREAK_MIN = 2
+BB_MIN_VOLUME_RATIO = 1.2
+BB_MAX_VOLUME_RATIO = 2.5    # cap: extreme vol = exhaustion, not ignition
+BB_TARGET_R = 2.0
+BB_MIN_ATR_PCT = 0.015        # need 1.5%+ ATR (data: winners avg 2.74%)
+BB_MIN_CLOSE_POS = 0.55       # close in top 55% (filter wicky fakeouts)
+BB_MIN_BODY_ATR = 0.2         # body >= 0.2x ATR (real buying, not a wick)
+
+
+def detect_bear_bounce(
+    symbol: str,
+    candles: list[Candle],
+    quote_volume_24h: float,
+    interval_ms: int,
+    interval: str = "",
+    range_pct_24h: float = 0.0,
+    settings: BreakoutSettings | None = None,
+    now_ms: int | None = None,
+) -> BreakoutSignal | None:
+    """High-volume bear-market bounce signal generator.
+
+    Simple hypothesis: after a short red streak, a green candle with
+    slightly above-average volume is a bounce candidate.  Enter at close
+    with a tight stop below the candle low.  Let the exit strategy
+    (breakeven, stagnation, trail) do the filtering.
+    """
+    settings = settings or BreakoutSettings()
+    need = 20
+    if len(candles) < need:
+        return None
+    now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    latest = candles[-1]
+
+    # ── 1. Green candle after red streak ─────────────────────────────────
+    if latest.close <= latest.open:
+        return None
+    reds = 0
+    for c in candles[-BB_RED_STREAK_MIN - 1 : -1]:
+        if c.close < c.open:
+            reds += 1
+    if reds < BB_RED_STREAK_MIN:
+        return None
+
+    # ── 2. Basic quality ─────────────────────────────────────────────────
+    atr_pct = _atr_pct(candles[-settings.atr_lookback - 1 :], latest.close)
+    if atr_pct < BB_MIN_ATR_PCT:
+        return None
+
+    # ── 2b. Close position: must close in top 55% (not a wicky fakeout)
+    # 24/92 trades stopped out in 1c — those were wicky fakeouts.
+    candle_range = latest.high - latest.low
+    if candle_range <= 0:
+        return None
+    close_pos = (latest.close - latest.low) / candle_range
+    if close_pos < BB_MIN_CLOSE_POS:
+        return None
+    # Body must be meaningful (>= 0.2x ATR)
+    atr_abs = atr_pct * latest.close
+    body = latest.close - latest.open
+    if body < BB_MIN_BODY_ATR * atr_abs:
+        return None
+
+    # ── 3. Volume ────────────────────────────────────────────────────────
+    vol_lookback = min(20, len(candles) - 2)
+    vol_window = candles[-vol_lookback - 1 : -1]
+    volume_ratio, open_candle = _volume_ratio(latest, vol_window, interval_ms, now_ms)
+    if volume_ratio < BB_MIN_VOLUME_RATIO:
+        return None
+    if volume_ratio > BB_MAX_VOLUME_RATIO:
+        return None  # extreme vol = exhaustion, not ignition (24% WR)
+
+    avg_quote_volume = _average_quote_volume(vol_window)
+    min_required_quote_volume = settings.min_avg_quote_volume * interval_ms / BASE_FLOW_INTERVAL_MS
+    if avg_quote_volume < min_required_quote_volume:
+        return None
+
+    # ── 4. Stop & target ─────────────────────────────────────────────────
+    stop_price = latest.low * (1.0 - settings.stop_buffer_pct)
+    trigger_price = latest.close
+    if stop_price <= 0 or stop_price >= trigger_price:
+        return None
+    risk = trigger_price - stop_price
+    target_price = trigger_price + risk * BB_TARGET_R
+
+    return _build_signal(
+        symbol=symbol,
+        interval=interval,
+        side="LONG",
+        status="BEAR_BOUNCE",
+        close=latest.close,
+        resistance=latest.high,
+        support=latest.low,
+        breakout_pct=(latest.close - latest.open) / max(latest.open, EPSILON),
+        move_pct=(latest.close - latest.open) / max(latest.open, EPSILON),
+        sweep_pct=0.0,
+        distance_to_trigger_pct=0.0,
+        trigger_price=trigger_price,
+        stop_price=stop_price,
+        target_price=target_price,
+        volume_ratio=volume_ratio,
+        avg_quote_volume=avg_quote_volume,
+        min_required_quote_volume=min_required_quote_volume,
+        compression_pct=0.0,
+        atr_pct=atr_pct,
+        close_position=_close_position(latest),
+        trend_score=_trend_score(candles, side="LONG"),
+        quote_volume_24h=quote_volume_24h,
+        trade_count_24h=0,
+        range_pct_24h=range_pct_24h,
+        price_change_pct_24h=0.0,
+        open_candle=open_candle,
+        settings=settings,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Failed-rally detector — short bear-market bounces that get rejected
+# ---------------------------------------------------------------------------
+# Pattern (visible on the PIEVERSEUSDT chart):
+#   1. Downtrend: price below MA(25) and MA(99) — bears in control
+#   2. Rally attempt: 1-3 green candles pushed price up, breaking a minor
+#      resistance (made a higher high vs the prior 5 candles)
+#   3. Rejection: current candle is RED, closing near its low, with volume
+#      confirming sellers took back control
+#   4. The rejection close should be BELOW the rally's starting point
+#      (the rally completely failed — no higher low was established)
+#
+# Entry: short at the rejection candle's close
+# Stop:   above the rally high (point of maximum optimism)
+# Target: 1.5R (failed rallies often retrace the entire bounce quickly)
+
+FR_MA_PERIOD = 25              # must be below this MA (downtrend)
+FR_RALLY_LOOKBACK = 3           # candles before rally to establish "prior range"
+FR_RALLY_WINDOW = 3             # candles to scan for the rally attempt
+FR_REJECTION_MIN_BODY_ATR = float(os.environ.get('HP_FR_BODY', '0.15'))
+FR_REJECTION_MAX_CLOSE_POS = float(os.environ.get('HP_FR_CP', '0.45'))
+FR_MIN_VOLUME_RATIO = float(os.environ.get('HP_FR_VOL', '1.1'))
+FR_TARGET_R = 1.5
+FR_MIN_ATR_PCT = 0.010
+
+
+def detect_failed_rally(
+    symbol: str,
+    candles: list[Candle],
+    quote_volume_24h: float,
+    interval_ms: int,
+    interval: str = "",
+    range_pct_24h: float = 0.0,
+    settings: BreakoutSettings | None = None,
+    now_ms: int | None = None,
+) -> BreakoutSignal | None:
+    """Detect failed rallies in bear markets.
+
+    Three-part pattern:
+      1. DOWNTEND: price is below its MA(25) — bears in control
+      2. RALLY: a recent green candle pushed above the prior range
+         (made a higher high, attempting a recovery)
+      3. REJECTION: current candle is RED, closing low, with volume
+         The close is BELOW the rally's starting point — rally fully erased
+
+    This is the classic bear-market pattern visible on the chart:
+    price grinds down, pops up (trapping longs), then reverses hard.
+    """
+    settings = settings or BreakoutSettings()
+    need = FR_MA_PERIOD + FR_RALLY_LOOKBACK + FR_RALLY_WINDOW + 3
+    if len(candles) < need:
+        return None
+    now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    latest = candles[-1]          # rejection candle
+
+    # ── 1. DOWNTEND: price below MA(25) ──────────────────────────────────
+    ma_closes = [c.close for c in candles[-FR_MA_PERIOD - 1:]]
+    ma25 = sum(ma_closes[-FR_MA_PERIOD:]) / FR_MA_PERIOD
+    if latest.close >= ma25:
+        return None  # not in a downtrend — don't short
+
+    # ── 2. RALLY ATTEMPT: any candle in rally_window pushed above prior range ─
+    rally_window = candles[-FR_RALLY_WINDOW - 1 : -1]  # exclude latest
+    prior_range = candles[-FR_RALLY_LOOKBACK - FR_RALLY_WINDOW - 1 : -FR_RALLY_WINDOW - 1]
+    if len(prior_range) < 3 or len(rally_window) < 1:
+        return None
+    prior_high = max(c.high for c in prior_range)
+    prior_low = min(c.low for c in prior_range)
+
+    # Find the rally peak: highest high in the rally window that exceeds prior_high
+    rally_high = max(c.high for c in rally_window)
+    if rally_high <= prior_high:
+        return None  # no rally — price never broke above the prior range
+
+    # ── 3. REJECTION: current candle is RED, making a lower low ──────────
+    if latest.close >= latest.open:
+        return None  # must be a red candle (rejection)
+    # Must break below the rally window's low (rally fully erased)
+    rally_window_low = min(c.low for c in rally_window)
+    if latest.low >= rally_window_low:
+        return None  # holding above rally zone — rejection incomplete
+    candle_range = latest.high - latest.low
+    if candle_range <= 0:
+        return None
+    close_pos = (latest.close - latest.low) / candle_range
+    if close_pos > FR_REJECTION_MAX_CLOSE_POS:
+        return None  # didn't close weak enough
+
+    # Body must be meaningful (real selling, not a doji)
+    atr_pct = _atr_pct(candles[-settings.atr_lookback - 1 :], latest.close)
+    if atr_pct < FR_MIN_ATR_PCT:
+        return None
+    atr_abs = atr_pct * latest.close
+    body = latest.open - latest.close  # red body
+    if body < FR_REJECTION_MIN_BODY_ATR * atr_abs:
+        return None
+
+    # ── 4. Volume confirmation ───────────────────────────────────────────
+    vol_lookback = min(20, len(candles) - 2)
+    vol_window = candles[-vol_lookback - 1 : -1]
+    volume_ratio, open_candle = _volume_ratio(latest, vol_window, interval_ms, now_ms)
+    if volume_ratio < FR_MIN_VOLUME_RATIO:
+        return None
+    avg_quote_volume = _average_quote_volume(vol_window)
+    min_required_quote_volume = settings.min_avg_quote_volume * interval_ms / BASE_FLOW_INTERVAL_MS
+    if avg_quote_volume < min_required_quote_volume:
+        return None
+
+    # ── 5. Stop & target ─────────────────────────────────────────────────
+    # The logical invalidation for a failed-rally short is the rally peak.
+    # If price gets back above the rally high, the "failed rally" thesis
+    # is wrong — buyers are still in control.
+    stop_price = rally_high * (1.0 + settings.stop_buffer_pct)
+    trigger_price = latest.close
+    if stop_price <= trigger_price:
+        return None
+    risk = stop_price - trigger_price
+    target_price = max(trigger_price - risk * FR_TARGET_R, EPSILON)
+
+    return _build_signal(
+        symbol=symbol,
+        interval=interval,
+        side="SHORT",
+        status="FADE",
+        close=latest.close,
+        resistance=latest.high,
+        support=latest.low,
+        breakout_pct=(latest.high - latest.close) / max(latest.high, EPSILON),
+        move_pct=(latest.open - latest.close) / max(latest.open, EPSILON),
+        sweep_pct=0.0,
+        distance_to_trigger_pct=0.0,
+        trigger_price=trigger_price,
+        stop_price=stop_price,
+        target_price=target_price,
+        volume_ratio=volume_ratio,
+        avg_quote_volume=avg_quote_volume,
+        min_required_quote_volume=min_required_quote_volume,
+        compression_pct=0.0,
+        atr_pct=atr_pct,
+        close_position=1.0 - close_pos,
+        trend_score=_trend_score(candles, side="SHORT"),
+        quote_volume_24h=quote_volume_24h,
+        trade_count_24h=0,
+        range_pct_24h=range_pct_24h,
+        price_change_pct_24h=0.0,
+        open_candle=open_candle,
+        settings=settings,
+    )
 
 
 def _move_pct(status: str, breakout_pct: float, reclaim_pct: float, resistance_sweep_pct: float) -> float:
