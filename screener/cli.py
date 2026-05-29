@@ -58,6 +58,9 @@ API_SECRET_ENV_NAMES = (
 )
 TESTNET_API_KEY_ENV_NAMES = ("BINANCE_TESTNET_API_KEY", "BINANCE_DEMO_API_KEY")
 TESTNET_API_SECRET_ENV_NAMES = ("BINANCE_TESTNET_API_SECRET", "BINANCE_DEMO_API_SECRET")
+_BTC_REGIME_60D_MS = 60 * 24 * 60 * 60 * 1000
+_BTC_REGIME_30D_MS = 30 * 24 * 60 * 60 * 1000
+_BTC_REGIME_7D_MS = 7 * 24 * 60 * 60 * 1000
 
 
 @dataclass(frozen=True)
@@ -556,7 +559,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--history", type=int, default=120, help="Klines to fetch per symbol.")
     parser.add_argument("--top", type=int, default=0, help="Scan the top N symbols by 24h quote volume. Use 0 for all.")
     parser.add_argument("--limit", type=int, default=15, help="Maximum number of signals to print.")
-    parser.add_argument("--workers", type=int, default=4, help="Parallel Binance kline requests.")
+    parser.add_argument("--workers", type=int, default=16, help="Parallel Binance kline requests.")
     parser.add_argument("--min-rr", type=float, default=1.2, help="Minimum measured reward/risk to show.")
     parser.add_argument("--min-score", type=float, default=0.0, help="Minimum setup score to show.")
     parser.add_argument("--min-quote-volume", type=float, default=1_000_000, help="Minimum 24h quote volume.")
@@ -591,8 +594,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     parser.add_argument("--scan-interval-minutes", type=int, default=3, help="How often the auto-trader scans for new opportunities. Default 3 - a slow scan discovers fast breakouts after the move is over.")
     parser.add_argument("--live-orders", action="store_true", help="Deprecated/no-op: the auto-trader always trades live. Use --testnet for a safe environment.")
-    parser.add_argument("--order-count", type=int, default=3, help="Number of best unique-symbol signals to order.")
-    parser.add_argument("--max-concurrent-orders", type=int, default=0, help="Maximum number of entries that can be active (placed or in open position) at the same time. 0 = unlimited.")
+    parser.add_argument("--order-count", type=int, default=5, help="Number of best unique-symbol signals to order.")
+    parser.add_argument("--max-concurrent-orders", type=int, default=5, help="Maximum number of entries that can be active (placed or in open position) at the same time. 0 = unlimited.")
     parser.add_argument("--queue-size", type=int, default=0, help="How many coins to arm and watch for a breakout at once. 0 (default) = watch all qualifying candidates. Independent of --max-concurrent-orders.")
     parser.add_argument("--order-notional", type=float, default=0.0, help="USDT position notional per entry order.")
     parser.add_argument("--order-margin", type=float, default=0.0, help="Approximate USDT margin per entry order. Position notional is margin multiplied by --leverage. Ignored when --sizing-mode auto sets margin from current equity.")
@@ -600,7 +603,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--equity-peak-file", default=".equity_peak.json", help="Path to JSON state file storing the running equity peak for the --sizing-mode auto drawdown haircut. Reset by deleting this file.")
     parser.add_argument("--leverage", type=int, default=0, help="Set initial leverage for each ordered symbol before placing the entry order.")
     parser.add_argument("--dynamic-leverage", action="store_true", help="Scale leverage per coin from ATR volatility and stop distance. --leverage sets the base (default 10 when enabled).")
-    parser.add_argument("--max-sl-loss-pct", type=float, default=35.0, help="Maximum leveraged loss percent on margin if the stop loss is hit. Use 0 to disable leverage-aware stop tightening.")
+    parser.add_argument("--max-sl-loss-pct", type=float, default=50.0, help="Maximum leveraged loss percent on margin if the stop loss is hit. Use 0 to disable leverage-aware stop tightening.")
     parser.add_argument("--margin-type", choices=["ISOLATED", "CROSSED"], help="Set symbol margin type before placing the entry order.")
     parser.add_argument("--hedge-mode", action="store_true", help="Send positionSide LONG/SHORT for Binance Hedge Mode accounts.")
     parser.add_argument("--order-working-type", choices=["MARK_PRICE", "CONTRACT_PRICE"], default="MARK_PRICE", help="Trigger price type for conditional orders.")
@@ -626,7 +629,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--skip-entry-regimes", default="", help="Comma-separated adaptive entry regimes to skip live, e.g. TRAILING_RETEST. Default: include all.")
     parser.add_argument("--ml-rank-model", type=Path, help="Live-compatible JSON model artifact used to rank qualifying signals. Ranking only; it does not hard-filter trades.")
     parser.add_argument("--ml-rank-score", choices=["pwin", "expected-r", "tail", "not-bad", "composite"], default="tail", help="Model score used by --ml-rank-model. Default: tail.")
-    parser.add_argument("--btc-market-guards", action="store_true", help="Apply the backtested BTC regime guards live: block INSTANT entries in weak BTC conditions and allow only STRICT_RETEST in hostile BTC conditions.")
+    parser.add_argument("--btc-market-guards", dest="btc_market_guards", action="store_true", default=True, help="Apply the backtested BTC regime guards live: block INSTANT entries in weak BTC conditions and allow only STRICT_RETEST in hostile BTC conditions. Default on.")
+    parser.add_argument("--no-btc-market-guards", dest="btc_market_guards", action="store_false", help="Disable BTC market guards.")
+    parser.add_argument("--no-btc-regime-guards", dest="btc_regime_guards", action="store_false", help="With --btc-market-guards, disable the full BTC regime router that forces BULL_STRONG to STRICT_RETEST.")
+    parser.set_defaults(btc_regime_guards=True)
     parser.add_argument("--btc-guard-interval", default="1h", help="BTC timeframe used for --btc-market-guards. Default: 1h.")
     parser.add_argument("--btc-ema-candles", type=int, default=72, help="BTC EMA length for --btc-market-guards. Default: 72.")
     parser.add_argument("--btc-momentum-candles", type=int, default=72, help="BTC momentum lookback for --btc-market-guards. Default: 72.")
@@ -634,7 +640,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--instant-guard-ema-slack-pct", type=float, default=1.5, help="Allowed BTC close distance below EMA for INSTANT entries when --btc-market-guards is enabled. Default: 1.5.")
     parser.add_argument("--hostile-momentum-pct", type=float, default=0.0, help="BTC momentum below this is hostile when --btc-market-guards is enabled. Default: 0.")
     parser.add_argument("--hostile-ema-slack-pct", type=float, default=0.0, help="BTC close below EMA by this slack is hostile when --btc-market-guards is enabled. Default: 0.")
-    parser.add_argument("--btc-chop-guards", action="store_true", help="Apply BTC flat/choppy-regime guards without changing normal/uptrend market behavior.")
+    parser.add_argument("--btc-chop-guards", dest="btc_chop_guards", action="store_true", default=True, help="Apply BTC flat/choppy-regime guards without changing normal/uptrend market behavior. Default on.")
+    parser.add_argument("--no-btc-chop-guards", dest="btc_chop_guards", action="store_false", help="Disable BTC chop guards.")
     parser.add_argument("--btc-chop-momentum-abs-pct", type=float, default=1.0, help="BTC is choppy when absolute BTC momentum is at or below this percent. Default 1.0 (3-window-validated idx18 config).")
     parser.add_argument("--btc-chop-ema-abs-pct", type=float, default=1.5, help="BTC is choppy when absolute BTC close-vs-EMA distance is at or below this percent. Default 1.5 (3-window-validated idx18 config).")
     parser.add_argument("--btc-chop-skip-entry-regimes", default="", help="Comma-separated regimes skipped only while BTC is choppy, e.g. INSTANT.")
@@ -4336,7 +4343,7 @@ def _filter_order_books(client: BinanceClient, universe: SymbolUniverse, args: a
         depth_pct=args.book_depth_pct,
         max_spread_bps=args.max_spread_bps,
         limit=args.book_limit,
-        workers=max(min(args.workers, 4), 1),
+        workers=max(args.workers, 1),
     )
 
 
@@ -4347,7 +4354,7 @@ def _filter_open_interest(client: BinanceClient, universe: SymbolUniverse, args:
         client=client,
         universe=universe,
         min_notional=args.min_open_interest_notional,
-        workers=max(min(args.workers, 4), 1),
+        workers=max(args.workers, 1),
     )
 
 
@@ -4607,7 +4614,7 @@ def _parse_entry_regime_set(raw: str, parser: argparse.ArgumentParser) -> set[st
 
 def _current_btc_guard_point(client: BinanceClient, args: argparse.Namespace) -> tuple[float, float, float] | None:
     """Return latest BTC close, EMA, and momentum percentage for live market guards."""
-    context = _current_btc_ml_context(client, args)
+    context = getattr(args, "_live_ml_btc_context", None) or _current_btc_ml_context(client, args)
     if not context:
         return None
     close = float(context.get("_btc_close", 0.0))
@@ -4620,7 +4627,8 @@ def _current_btc_guard_point(client: BinanceClient, args: argparse.Namespace) ->
 
 def _current_btc_ml_context(client: BinanceClient, args: argparse.Namespace) -> dict[str, float]:
     """Return the BTC context features used by both guards and ML ranking."""
-    limit = min(max(args.btc_ema_candles, args.btc_momentum_candles) + 80, 1500)
+    regime_candles = math.ceil(_BTC_REGIME_60D_MS / max(interval_to_ms(args.btc_guard_interval), 1)) + 2
+    limit = min(max(args.btc_ema_candles, args.btc_momentum_candles, regime_candles) + 5, 1500)
     try:
         candles = candles_from_klines(client.klines("BTCUSDT", args.btc_guard_interval, limit))
     except BinanceClientError:
@@ -4636,12 +4644,86 @@ def _current_btc_ml_context(client: BinanceClient, args: argparse.Namespace) -> 
     previous = candles[-1 - args.btc_momentum_candles]
     momentum_pct = (latest.close / max(previous.close, 1e-9) - 1.0) * 100.0
     ema_distance_pct = (latest.close / max(ema, 1e-9) - 1.0) * 100.0
+    pos_60d = _btc_range_position_from_candles(candles, _BTC_REGIME_60D_MS)
+    pos_30d = _btc_range_position_from_candles(candles, _BTC_REGIME_30D_MS)
+    ret_7d = _btc_return_pct_from_candles(candles, _BTC_REGIME_7D_MS)
     return {
         "_btc_close": latest.close,
         "_btc_ema": ema,
         "feat_btc_momentum_pct": momentum_pct,
         "feat_btc_ema_distance_pct": ema_distance_pct,
+        "_btc_range_pos_60d": pos_60d if pos_60d is not None else -1.0,
+        "_btc_range_pos_30d": pos_30d if pos_30d is not None else -1.0,
+        "_btc_return_7d_pct": ret_7d if ret_7d is not None else 0.0,
     }
+
+
+def _btc_return_pct_from_candles(candles: list, lookback_ms: int) -> float | None:
+    if not candles:
+        return None
+    latest = candles[-1]
+    target_time = latest.close_time - lookback_ms
+    if candles[0].close_time > target_time:
+        return None
+    previous = None
+    for candle in reversed(candles):
+        if candle.close_time <= target_time:
+            previous = candle
+            break
+    if previous is None:
+        return None
+    return (latest.close / max(previous.close, 1e-9) - 1.0) * 100.0
+
+
+def _btc_range_position_from_candles(candles: list, lookback_ms: int) -> float | None:
+    if not candles:
+        return None
+    latest = candles[-1]
+    cutoff = latest.close_time - lookback_ms
+    if candles[0].close_time > cutoff:
+        return None
+    window = [candle for candle in candles if candle.close_time >= cutoff]
+    if len(window) < 2:
+        return None
+    low = min(candle.low for candle in window)
+    high = max(candle.high for candle in window)
+    if high <= low:
+        return 0.5
+    return max(0.0, min(1.0, (latest.close - low) / (high - low)))
+
+
+def _btc_regime_from_context(context: dict[str, float]) -> str:
+    pos = float(context.get("_btc_range_pos_60d", -1.0))
+    if pos < 0:
+        pos = float(context.get("_btc_range_pos_30d", -1.0))
+    if pos < 0:
+        return "BULL_CHOP"
+    ret_7 = float(context.get("_btc_return_7d_pct", 0.0))
+    if pos < 0.20 and ret_7 <= -2.0:
+        return "BEAR_CRASH"
+    if pos < 0.40 and ret_7 >= 3.0:
+        return "BEAR_RECOVERY"
+    if pos < 0.40:
+        return "BEAR_GRIND"
+    if pos >= 0.75 and ret_7 >= 1.0:
+        return "BULL_STRONG"
+    if pos >= 0.50:
+        return "BULL_RECOVERY"
+    if ret_7 >= 2.0:
+        return "BULL_RECOVERY"
+    return "BULL_CHOP"
+
+
+def _btc_regime_guard_reject_reason(entry_regime: str, args: argparse.Namespace) -> str:
+    if not (getattr(args, "btc_market_guards", False) and getattr(args, "btc_regime_guards", True)):
+        return ""
+    context = getattr(args, "_live_ml_btc_context", {}) or {}
+    if not context:
+        return ""
+    btc_regime = _btc_regime_from_context(context)
+    if btc_regime == "BULL_STRONG" and entry_regime != "STRICT_RETEST":
+        return "BTC BULL_STRONG regime guard; only STRICT_RETEST allowed"
+    return ""
 
 
 def _btc_guard_reject_reason(
@@ -4651,6 +4733,8 @@ def _btc_guard_reject_reason(
 ) -> str:
     if not args.btc_market_guards:
         return ""
+    if regime_reason := _btc_regime_guard_reject_reason(entry_regime, args):
+        return regime_reason
     if guard_point is None:
         return "" if entry_regime == "STRICT_RETEST" else "BTC hostile/unavailable; only STRICT_RETEST allowed"
 

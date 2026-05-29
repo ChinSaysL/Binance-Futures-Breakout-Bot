@@ -1,0 +1,55 @@
+{
+  "W2_bear_grind": {
+    "regime": "BEAR_GRIND",
+    "overrides": {
+      "HP_INST_REL": 5.0,
+      "HP_INST_VOL": 3.5,
+      "breakeven_trigger_r": 0.0,
+      "stagnation_after_r": 1.0,
+      "stagnation_candles": 12
+    }
+  },
+  "W3_bull_strong": {
+    "regime": "BULL_STRONG",
+    "allowed_entry_regimes": [
+      "STRICT_RETEST"
+    ],
+    "overrides": {
+      "HP_INST_REL": 5.0,
+      "HP_INST_VOL": 3.5,
+      "breakeven_trigger_r": 0.0,
+      "stagnation_after_r": 0.5,
+      "stagnation_candles": 12
+    }
+  },
+  "W4_bull_chop": {
+    "regime": "BULL_CHOP",
+    "overrides": {
+      "HP_INST_REL": 5.0,
+      "HP_INST_VOL": 3.5,
+      "breakeven_trigger_r": 1.0,
+      "stagnation_after_r": 0.5,
+      "stagnation_candles": 12
+    }
+  },
+  "W1_W5_bear_crash": {
+    "regime": "BEAR_CRASH",
+    "overrides": {
+      "HP_INST_REL": 4.0,
+      "HP_INST_VOL": 3.5,
+      "breakeven_trigger_r": 0.0,
+      "stagnation_after_r": 1.0,
+      "stagnation_candles": 12
+    }
+  },
+  "W6_bull_recovery": {
+    "regime": "BULL_RECOVERY",
+    "overrides": {
+      "HP_INST_REL": 5.0,
+      "HP_INST_VOL": 3.5,
+      "breakeven_trigger_r": 0.0,
+      "stagnation_after_r": 0.5,
+      "stagnation_candles": 12
+    }
+  }
+}

@@ -29,6 +29,7 @@ from dataclasses import dataclass, replace
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 import json
+
 import math
 import os
 from pathlib import Path
@@ -107,6 +108,7 @@ class BacktestTrade:
     window_bear: bool = False
     sizing_scale: float = 1.0   # from REGIME_PARAMS — applied in position sizing
     btc_regime: str = ""        # BTC regime name at signal time (BULL_CHOP etc.)
+    interval: str = ""          # interval used for this trade (e.g. 15m, 1h, 4h)
 
     # Feature snapshot at signal-detection time, for offline ML training.
     # Populated by _simulate_trade from the BreakoutSignal; never read by the
@@ -180,17 +182,17 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--symbols", help="Explicit comma-separated symbols. Overrides --top.")
     parser.add_argument("--top", type=int, default=40, help="Backtest the top N symbols by 24h range. 0 = scan every coin.")
     parser.add_argument("--min-quote-volume", type=float, default=20_000_000.0, help="Liquidity floor: skip symbols below this 24h quote volume.")
+    parser.add_argument("--start-date", help="UTC start date for the backtest window, YYYY-MM-DD.")
+    parser.add_argument("--end-date", help="UTC end date for the backtest window, YYYY-MM-DD.")
     parser.add_argument("--detector", choices=["simple", "squeeze"], default="simple", help="simple = high-recall long-breakout detector; squeeze = the original pre-breakout detector.")
     parser.add_argument("--interval", default="1h", help="Kline interval, e.g. 15m, 1h, 4h.")
     parser.add_argument("--intervals", default=None, help="Comma-separated intervals to scan in one run, mirroring live (--timeframes 15m,1h,4h).  When set, each symbol is backtested on every interval and all trades feed into the same portfolio simulator.  Overrides --interval.")
     parser.add_argument("--history", type=int, default=1500, help="Klines to pull per symbol (max 1500).")
-    parser.add_argument("--start-date", help="UTC start date for the backtest window, YYYY-MM-DD.")
-    parser.add_argument("--end-date", help="UTC end date for the backtest window, YYYY-MM-DD.")
     parser.add_argument("--trade-log", default="backtest_trades.csv", help="CSV path for the per-signal trade log.")
     parser.add_argument("--order-margin", type=float, default=5.0, help="USDT margin committed per trade.")
     parser.add_argument("--leverage", type=int, default=10, help="Base leverage.")
     parser.add_argument("--dynamic-leverage", action="store_true", help="Scale leverage per coin from ATR.")
-    parser.add_argument("--max-sl-loss-pct", type=float, default=35.0, help="Maximum leveraged loss percent on margin if the stop is hit. 0 disables stop tightening.")
+    parser.add_argument("--max-sl-loss-pct", type=float, default=50.0, help="Maximum leveraged loss percent on margin if the stop is hit. 0 disables stop tightening.")
     parser.add_argument("--dynamic-sl", action="store_true", help="Trail the stop up to recent support (down to resistance for shorts) as price moves - ports the live bot's dynamic stop loss.")
     parser.add_argument("--sl-lookback", type=int, default=20, help="Candles of recent support/resistance used to trail the dynamic stop.")
     parser.add_argument("--breakeven-trigger-r", type=float, default=0.0, help="Once unrealized profit reaches this R multiple, ratchet the stop to entry + a small profit lock. 0 = off. Per-window hyperopt: 0 (off) won on 5/6 windows.")
@@ -211,7 +213,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.set_defaults(tp_cap_below_ma=True)
     parser.add_argument("--breakout-volume-trend-ratio", type=float, default=0.0, help="Detection upgrade: require base up-candle volume >= ratio x down-candle volume (LONG; mirrored for SHORT). 0 = off. 1.0 = simple net-accumulation, 1.5 = stronger demand bias.")
     parser.add_argument("--mtf-alignment-tf", type=str, default=None, help="Detection upgrade: require entry signals to align with a higher-timeframe trend (e.g. '4h'). Long signals only fire when the higher-TF close is above its MA; short signals require below. Unset = off.")
-    parser.add_argument("--mtf-alignment-ma-period", type=int, default=25, help="Moving-average period on the higher TF used for --mtf-alignment-tf. Default 25.")
+    parser.add_argument("--mtf-alignment-ma-period", type=int, default=20, help="Moving-average period on the higher TF used for --mtf-alignment-tf. Default 20.")
     parser.add_argument("--mtf-alignment-ma-type", choices=["sma", "ema"], default="sma", help="Moving-average type for the MTF alignment check. EMA reacts faster to recent price; SMA is smoother.")
     parser.add_argument("--simulate-rotation", action="store_true", help="Use the rotation-aware portfolio sim: when all slots are full and a higher-momentum INSTANT signal arrives, close a weaker profitable position to make room. Mirrors the live rotation logic (90-min min hold, 30-min cooldown, ROTATION_MIN_EDGE).")
     parser.add_argument("--rotation-cut-losers", action="store_true", help="With --simulate-rotation, also cut a losing position when no profitable candidate is available but the exploder still passes the momentum-edge gate. Matches the behaviour of the live --rotation-auto-cut-loss flag.")
@@ -248,6 +250,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--entry-on-signal-close", action="store_true", help="For confirmed breakouts, enter on the signal close instead of waiting for the next candle trigger.")
     parser.add_argument("--entry-style", choices=["trigger", "retest", "retest-confirmed"], default="trigger", help="trigger = enter when price crosses the breakout trigger; retest = limit fill at the broken level on a pullback; retest-confirmed = enter only after a candle closes back through the level, abort if a candle closes the wrong side.")
     parser.add_argument("--slippage-pct", type=float, default=0.03, help="Entry slippage percent.")
+    parser.add_argument("--dynamic-threshold", type=float, default=None, help="Dynamic exit threshold percent; applies preset overrides for breakeven, stagnation, and cooldown.")
+    parser.add_argument("--window-config", type=str, default=None, help="Path to JSON file mapping window start/end dates to exit overrides.")
     parser.add_argument("--fee-pct", type=float, default=0.045, help="Taker fee percent, charged per side.")
     parser.add_argument("--funding-pct-per-8h", type=float, default=0.01, help="Assumed funding rate percent per 8h. Longs pay it, shorts receive it. Set 0 to disable.")
     parser.add_argument("--longs-only", dest="longs_only", action="store_true", default=True, help="Skip SHORT signals entirely.")
@@ -256,7 +260,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--bear-profile", action="store_true", help="Activate bear-market-optimised strategy profile: switches exits to fixed take-profits, tightens INSTANT SL, adds oversold-bounce detector, and improves short quality filters when BTC is in a bearish regime. Designed to lift worst-window (W1) results toward bull-window levels without touching bull-market behaviour.")
     parser.add_argument("--capital", type=float, default=1000.0, help="Starting account balance.")
     parser.add_argument("--compound", action="store_true", help="Scale each position's margin with the running equity (compounding).")
-    parser.add_argument("--max-concurrent", type=int, default=2, help="Max positions open at once. 0 = dynamic cap by current equity.")
+    parser.add_argument("--max-concurrent", type=int, default=5, help="Max positions open at once. 0 = dynamic cap by current equity.")
     parser.add_argument("--position-pct", type=float, default=0.0, help="Fixed margin percent of equity when --compound is set. 0 = use --sizing-mode.")
     parser.add_argument("--sizing-mode", choices=["guarded", "moonshot", "aggressive", "auto"], default="moonshot", help="guarded = fixed 10%% sizing; moonshot/aggressive = dynamic tiers vs starting-capital multiple; auto = absolute-equity tiers + drawdown haircut (designed to grow micro accounts fast while de-risking on drawdown).")
     parser.add_argument("--skip-entry-regimes", default="TRAILING_RETEST", help="Comma-separated adaptive entry regimes to exclude. Default: TRAILING_RETEST; pass none to include all.")
@@ -273,7 +277,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.set_defaults(hostile_market_strict_only=True)
     parser.add_argument("--hostile-momentum-pct", type=float, default=0.0, help="BTC momentum below this percent is hostile for regime selection.")
     parser.add_argument("--hostile-ema-slack-pct", type=float, default=0.0, help="BTC close this far below EMA is hostile for regime selection, percent.")
-    parser.add_argument("--btc-chop-guards", action="store_true", help="Apply BTC flat/choppy-regime guards without changing normal/uptrend market behavior.")
+    parser.add_argument("--btc-chop-guards", dest="btc_chop_guards", action="store_true", default=True, help="Apply BTC flat/choppy-regime guards without changing normal/uptrend market behavior. Default on.")
+    parser.add_argument("--no-btc-chop-guards", dest="btc_chop_guards", action="store_false", help="Disable BTC chop guards.")
     parser.add_argument("--btc-chop-momentum-abs-pct", type=float, default=1.0, help="BTC is choppy when absolute BTC momentum is at or below this percent. Default 1.0 (3-window-validated idx18 config).")
     parser.add_argument("--btc-chop-ema-abs-pct", type=float, default=1.5, help="BTC is choppy when absolute BTC close-vs-EMA distance is at or below this percent. Default 1.5 (3-window-validated idx18 config).")
     parser.add_argument("--btc-chop-skip-entry-regimes", default="", help="Comma-separated regimes skipped only while BTC is choppy, e.g. INSTANT.")
@@ -284,8 +289,14 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--short-guard-ema-slack-pct", type=float, default=0.0, help="Allow SHORT signals only when BTC is no more than this percent above EMA.")
     parser.add_argument("--loss-cooldown-after", type=int, default=1, help="With --loss-cooldown-candles, pause a symbol after this many consecutive realized losses on that symbol.")
     parser.add_argument("--loss-cooldown-candles", type=int, default=48, help="Pause new entries on the losing symbol for N candles after the loss threshold is hit. 0 disables.")
+    parser.add_argument("--loss-cooldown-candles-15m", type=int, default=None, help="Loss cooldown candles for 15m timeframe. If None, inherits --loss-cooldown-candles.")
+    parser.add_argument("--loss-cooldown-candles-1h", type=int, default=None, help="Loss cooldown candles for 1h timeframe. If None, inherits --loss-cooldown-candles.")
+    parser.add_argument("--loss-cooldown-candles-4h", type=int, default=None, help="Loss cooldown candles for 4h timeframe. If None, inherits --loss-cooldown-candles.")
     parser.add_argument("--win-cooldown-after", type=int, default=1, help="With --win-cooldown-candles, pause a symbol after this many consecutive realized wins on that symbol.")
     parser.add_argument("--win-cooldown-candles", type=int, default=0, help="Pause new entries on a winning symbol for N candles after the win threshold is hit. 0 disables (default).")
+    parser.add_argument("--win-cooldown-candles-15m", type=int, default=None, help="Win cooldown candles for 15m timeframe. If None, inherits --win-cooldown-candles.")
+    parser.add_argument("--win-cooldown-candles-1h", type=int, default=None, help="Win cooldown candles for 1h timeframe. If None, inherits --win-cooldown-candles.")
+    parser.add_argument("--win-cooldown-candles-4h", type=int, default=None, help="Win cooldown candles for 4h timeframe. If None, inherits --win-cooldown-candles.")
     parser.add_argument("--instant-size-multiplier", type=float, default=0.5, help="Moonshot sizing multiplier for INSTANT regimes.")
     parser.add_argument("--retest-size-multiplier", type=float, default=0.9, help="Moonshot sizing multiplier for RETEST regimes.")
     parser.add_argument("--trailing-retest-size-multiplier", type=float, default=0.5, help="Moonshot sizing multiplier for TRAILING_RETEST regimes.")
@@ -298,7 +309,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="Max Binance requests per minute during backtests. 0 disables.",
     )
     parser.add_argument("--offline-cache-dir", type=Path, default=None, help="Run offline: read klines from {symbol}_{interval}.json and exchange_info.json in this directory. Skips ALL Binance API calls.")
-    parser.add_argument("--workers", type=int, default=1, help="Number of worker threads for parallel symbol processing. Default 1 (serial). Set to 0 for cpu_count.")
+    parser.add_argument("--workers", type=int, default=16, help="Number of worker threads for parallel symbol processing. Default 16. Set to 0 for cpu_count.")
     args = parser.parse_args(argv)
     if args.shorts_only:
         args.longs_only = False
@@ -320,12 +331,48 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         parser.error("--sl-lookback must be greater than 1")
     if args.max_concurrent < 0:
         parser.error("--max-concurrent must be zero or greater")
+    # Load regime‑based overrides configuration (maps BTC regime → overrides)
+    if args.window_config:
+        try:
+            with open(args.window_config, "r", encoding="utf-8") as f:
+                raw_cfg = json.load(f)
+        except Exception as exc:
+            parser.error(f"Failed to load window-config {args.window_config}: {exc}")
+        args.regime_override_map = {}
+        args.regime_allowed_entry_map = {}
+        for win_name, win_def in raw_cfg.items():
+            regime = win_def.get("regime")
+            if not regime:
+                continue
+            overrides = args.regime_override_map.get(regime, {})
+            overrides.update(_normalize_regime_overrides(win_def.get("overrides", {})))
+            args.regime_override_map[regime] = overrides
+            try:
+                allowed_entries = _normalize_regime_set(win_def.get("allowed_entry_regimes"))
+            except ValueError as exc:
+                parser.error(f"window-config {win_name}: {exc}")
+            if allowed_entries is not None:
+                args.regime_allowed_entry_map[regime] = allowed_entries
+    else:
+        args.regime_override_map = {}
+        args.regime_allowed_entry_map = {}
+
+    # Convert date strings → millisecond timestamps used throughout the code
     try:
         args.start_ms = _parse_date(args.start_date, end=False) if args.start_date else None
-        args.end_ms = _parse_date(args.end_date, end=True) if args.end_date else None
-        args.ml_filter_start_ms = _parse_date(args.ml_filter_start_date, end=False) if args.ml_filter_start_date else None
     except ValueError as exc:
         parser.error(str(exc))
+    try:
+        args.end_ms = _parse_date(args.end_date, end=True) if args.end_date else None
+    except ValueError as exc:
+        parser.error(str(exc))
+    try:
+        args.ml_filter_start_ms = (
+            _parse_date(args.ml_filter_start_date, end=False) if args.ml_filter_start_date else None
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
     if args.start_ms is not None and args.end_ms is not None and args.start_ms > args.end_ms:
         parser.error("--start-date must be on or before --end-date")
     if args.btc_ema_candles <= 1:
@@ -336,10 +383,18 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         parser.error("--loss-cooldown-after must be greater than 0")
     if args.loss_cooldown_candles < 0:
         parser.error("--loss-cooldown-candles must be zero or greater")
+    for tf in ["15m", "1h", "4h"]:
+        val = getattr(args, f"loss_cooldown_candles_{tf}", None)
+        if val is not None and val < 0:
+            parser.error(f"--loss-cooldown-candles-{tf} must be zero or greater")
     if args.win_cooldown_after <= 0:
         parser.error("--win-cooldown-after must be greater than 0")
     if args.win_cooldown_candles < 0:
         parser.error("--win-cooldown-candles must be zero or greater")
+    for tf in ["15m", "1h", "4h"]:
+        val = getattr(args, f"win_cooldown_candles_{tf}", None)
+        if val is not None and val < 0:
+            parser.error(f"--win-cooldown-candles-{tf} must be zero or greater")
     if args.rate_limit_rpm < 0:
         parser.error("--rate-limit-rpm must be zero or greater")
     if args.instant_size_multiplier < 0 or args.retest_size_multiplier < 0 or args.trailing_retest_size_multiplier < 0:
@@ -391,6 +446,34 @@ def _parse_regime_set(raw: str) -> set[str]:
     if raw.strip().lower() in {"none", "off"}:
         return set()
     return {part.strip().upper() for part in raw.split(",") if part.strip()}
+
+
+def _normalize_regime_set(raw: object) -> frozenset[str] | None:
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return frozenset(_parse_regime_set(raw))
+    if isinstance(raw, (list, tuple, set)):
+        return frozenset(str(part).strip().upper() for part in raw if str(part).strip())
+    raise ValueError("regime set must be a comma-separated string or list")
+
+
+_REGIME_OVERRIDE_ALIASES = {
+    "breakeven": "breakeven_trigger_r",
+    "breakeven_r": "breakeven_trigger_r",
+    "stag_after_r": "stagnation_after_r",
+    "stag_candles": "stagnation_candles",
+}
+
+
+def _normalize_regime_overrides(raw: dict) -> dict:
+    """Accept historical hyperopt keys while storing simulator keys."""
+    normalized: dict = {}
+    for key, value in raw.items():
+        if value is None:
+            continue
+        normalized[_REGIME_OVERRIDE_ALIASES.get(key, key)] = value
+    return normalized
 
 
 def _process_symbol_worker(
@@ -1160,6 +1243,7 @@ class RegimeParams:
     breakeven_trigger_r: float | None = None
     stagnation_after_r: float | None = None
     stagnation_candles: int | None = None
+    min_rel_strength_pct: float | None = None
 
 
 # Default per-regime parameter sets, chosen from the empirical W1-W6 data.
@@ -1169,19 +1253,32 @@ REGIME_PARAMS: dict[str, RegimeParams] = {
         name="BULL_STRONG",
         allow_long=True, allow_short=False,
         sizing_scale=1.0,
-        # W3 thrives on INSTANT longs; no filters needed.
+        instant_min_rel_mom=3.0,
+        instant_min_vol_ratio=3.0,
+        breakeven_trigger_r=1.25,
+        stagnation_after_r=1.25,
+        stagnation_candles=8,
+        min_rel_strength_pct=1.0,
     ),
     "BULL_RECOVERY": RegimeParams(
         name="BULL_RECOVERY",
         allow_long=True, allow_short=False,
         sizing_scale=1.0,
-        # W6 needed the liquidity-gate fix; once admitted, longs work.
+        instant_min_rel_mom=3.0,
+        instant_min_vol_ratio=3.5,
+        breakeven_trigger_r=1.25,
+        stagnation_after_r=1.25,
+        stagnation_candles=8,
+        min_rel_strength_pct=None,
     ),
     "BULL_CHOP": RegimeParams(
         name="BULL_CHOP",
         allow_long=True, allow_short=False,
         sizing_scale=0.85,
-        instant_min_rel_mom=4.0,  # tighter than default
+        instant_min_rel_mom=4.0,
+        instant_min_vol_ratio=3.0,
+        breakeven_trigger_r=0.0,
+        stagnation_after_r=0.5,
         allowed_entry_regimes=frozenset({"INSTANT", "STRICT_RETEST"}),
     ),
     "BEAR_GRIND": RegimeParams(
@@ -1189,6 +1286,10 @@ REGIME_PARAMS: dict[str, RegimeParams] = {
         allow_long=True, allow_short=True,
         sizing_scale=0.70,        # W2 historically loses money; size down
         max_sl_loss_pct=50.0,     # wider — W2 grinding needs breathing room
+        instant_min_rel_mom=4.0,
+        instant_min_vol_ratio=3.0,
+        breakeven_trigger_r=0.0,
+        stagnation_after_r=1.0,
         allowed_entry_regimes=frozenset({"STRICT_RETEST", "INSTANT"}),
     ),
     "BEAR_CRASH": RegimeParams(
@@ -1196,6 +1297,11 @@ REGIME_PARAMS: dict[str, RegimeParams] = {
         allow_long=False, allow_short=True,   # SHORTS-ONLY — the W5 fix
         sizing_scale=0.85,
         max_sl_loss_pct=35.0,
+        instant_min_rel_mom=3.0,
+        instant_min_vol_ratio=3.5,
+        breakeven_trigger_r=1.25,
+        stagnation_after_r=1.25,
+        stagnation_candles=8,
         allowed_statuses=frozenset({"BREAKDOWN", "FADE"}),
     ),
     "BEAR_RECOVERY": RegimeParams(
@@ -1203,7 +1309,11 @@ REGIME_PARAMS: dict[str, RegimeParams] = {
         allow_long=True, allow_short=True,
         sizing_scale=1.0,
         max_sl_loss_pct=35.0,
-        # W1's recovery phase — both sides work.
+        instant_min_rel_mom=3.0,
+        instant_min_vol_ratio=3.5,
+        breakeven_trigger_r=1.25,
+        stagnation_after_r=1.25,
+        stagnation_candles=8,
     ),
 }
 
@@ -1293,6 +1403,11 @@ def _classify_regime(timestamp: int, market_trend: MarketTrend | None) -> str:
 
 def _regime_params_for(timestamp: int, market_trend: MarketTrend | None) -> RegimeParams:
     return REGIME_PARAMS[_classify_regime(timestamp, market_trend)]
+
+
+def _allowed_entry_regimes_for(rp: RegimeParams, args: argparse.Namespace) -> frozenset[str] | None:
+    configured = getattr(args, "regime_allowed_entry_map", {}).get(rp.name)
+    return configured if configured is not None else rp.allowed_entry_regimes
 
 
 def _bear_regime(
@@ -1550,13 +1665,15 @@ def _rel_strength_allows(
     window: list[Candle],
     args: argparse.Namespace,
     market_trend: MarketTrend | None,
+    min_rel_strength_pct: float | None = None,
 ) -> bool:
     """Detection upgrade: require the coin to be outpacing BTC by --min-rel-strength-pct.
 
     A breakout while the coin leads BTC is genuine independent strength; one that
     only keeps up because the whole market is rising is a weaker signal.
     """
-    if args.min_rel_strength_pct is None or market_trend is None:
+    target_pct = min_rel_strength_pct if min_rel_strength_pct is not None else args.min_rel_strength_pct
+    if target_pct is None or market_trend is None:
         return True
     lookback = args.btc_momentum_candles
     if len(window) <= lookback:
@@ -1565,7 +1682,7 @@ def _rel_strength_allows(
     if point is None:
         return True
     coin_momentum = (window[-1].close / max(window[-1 - lookback].close, 1e-9) - 1.0) * 100.0
-    return coin_momentum - point.momentum_pct >= args.min_rel_strength_pct
+    return coin_momentum - point.momentum_pct >= target_pct
 
 
 def _offline_discover_symbols(cache_dir: Path) -> list[str]:
@@ -1664,20 +1781,6 @@ def _backtest_symbol(
     symbol_r_history: list[float] = []
     index = start
     total = len(candles)
-    # ── Bear profile: window-level activation ─────────────────────────
-    # Use midpoint timestamp + 30-day rolling lookback (NO hindsight bias).
-    # The old call _bear_window_active(args, btc_return) used the full-window
-    # BTC return which is pure future information.  Now we evaluate dynamically
-    # using the market_trend's 30-day trailing return.
-    mid_ts = candles[len(candles) // 2].close_time if candles else 0
-    window_bear = _bear_window_active(args, mid_ts, market_trend)
-    # ── Shorts gate: require sustained BTC downtrend (60d < -10%) ──
-    shorts_enabled = _bear_shorts_enabled(args, mid_ts, market_trend)
-    if window_bear:
-        bear_overrides = _bear_overrides()
-        settings = _bear_detector_settings(settings)  # stricter breakout detection
-    else:
-        bear_overrides = {}
     # ── Hyperopt env-var overrides ────────────────────────────────────
     _hp_inst_rel = float(os.environ.get('HP_INST_REL', '0'))
     _hp_inst_vol = float(os.environ.get('HP_INST_VOL', '0'))
@@ -1689,6 +1792,15 @@ def _backtest_symbol(
     _hp_dv       = float(os.environ.get('HP_DV', '0'))
     while index < total - 1:
         window = candles[: index + 1]
+        now_ts = window[-1].close_time
+        window_bear = _bear_window_active(args, now_ts, market_trend)
+        shorts_enabled = _bear_shorts_enabled(args, now_ts, market_trend)
+        if window_bear:
+            bear_overrides = _bear_overrides()
+            current_settings = _bear_detector_settings(settings)
+        else:
+            bear_overrides = {}
+            current_settings = settings
         recent = window[-candles_per_24h:]
         quote_volume_24h = sum(candle.quote_volume for candle in recent)
         high_24h = max(candle.high for candle in recent)
@@ -1707,7 +1819,7 @@ def _backtest_symbol(
                 quote_volume_24h,
                 interval_ms,
                 args,
-                settings,
+                current_settings,
                 range_pct_24h,
             )
         else:
@@ -1718,7 +1830,7 @@ def _backtest_symbol(
                 interval_ms,
                 interval=args.interval,
                 range_pct_24h=range_pct_24h,
-                settings=settings,
+                settings=current_settings,
                 include_confirmed=True,
                 now_ms=window[-1].close_time + 1,
             )
@@ -1747,7 +1859,7 @@ def _backtest_symbol(
                 interval_ms,
                 interval=args.interval,
                 range_pct_24h=range_pct_24h,
-                settings=settings,
+                settings=current_settings,
                 now_ms=window[-1].close_time + 1,
             )
 
@@ -1778,8 +1890,35 @@ def _backtest_symbol(
         ):
             index += 1
             continue
+
         regime = _classify_entry_regime(signal)
         context_features = _signal_context_features(window, market_trend, args, symbol_r_history)
+        rp = _regime_params_for(window[-1].close_time, market_trend)
+        allowed_entry_regimes = _allowed_entry_regimes_for(rp, args)
+
+        # ── BTC Regime-Aware Filters ──────────────────────────────────
+        if signal.side == "LONG" and not rp.allow_long:
+            index += 1
+            continue
+        if signal.side == "SHORT" and not rp.allow_short:
+            index += 1
+            continue
+        if rp.allowed_statuses is not None and signal.status not in rp.allowed_statuses:
+            index += 1
+            continue
+        if allowed_entry_regimes is not None and regime not in allowed_entry_regimes:
+            index += 1
+            continue
+        if regime == "INSTANT":
+            if rp.instant_min_rel_mom is not None:
+                rel_mom = context_features.get("feat_rel_momentum_pct", 0.0)
+                if rel_mom < rp.instant_min_rel_mom:
+                    index += 1
+                    continue
+            if rp.instant_min_vol_ratio is not None:
+                if signal.volume_ratio < rp.instant_min_vol_ratio:
+                    index += 1
+                    continue
 
         # ── Per-timestamp regime gate ─────────────────────────────────
         # Targeted fix for W5-style "still-crashing" bear regimes: when BTC
@@ -1818,21 +1957,32 @@ def _backtest_symbol(
 
         # ── Bear-profile INSTANT quality filters ──────────────────────
         # Only apply to standard breakout INSTANT signals, not bear-bounce
-        if window_bear and regime == "INSTANT" and signal.side == "LONG" and signal.status not in ("BEAR_BOUNCE", "FADE"):
+        # (overridden by specific details below)
+        if regime == "INSTANT" and signal.side == "LONG" and signal.status not in ("BEAR_BOUNCE", "FADE"):
             # Gate 1: BTC must be above EMA
             if market_trend is not None:
                 point = market_trend.at_or_before(window[-1].close_time)
                 if point is not None and point.close < point.ema:
                     index += 1
                     continue
-            # Gate 2: relative momentum >= threshold (env HP_INST_REL, default 3)
+            # Gate 2: relative momentum >= threshold (regime override > env > default 3)
             rel_mom = context_features.get("feat_rel_momentum_pct", 0.0)
-            _ir = _hp_inst_rel if _hp_inst_rel > 0 else 3.0
+            _regime_hp_ir = None
+            if getattr(args, "regime_override_map", None):
+                _rcfg = args.regime_override_map.get(rp.name)
+                if _rcfg and "HP_INST_REL" in _rcfg:
+                    _regime_hp_ir = float(_rcfg["HP_INST_REL"])
+            _ir = _regime_hp_ir if _regime_hp_ir is not None else (_hp_inst_rel if _hp_inst_rel > 0 else 3.0)
             if rel_mom < _ir:
                 index += 1
                 continue
-            # Gate 3: volume ratio >= threshold (env HP_INST_VOL, default 3.5)
-            _iv = _hp_inst_vol if _hp_inst_vol > 0 else 3.5
+            # Gate 3: volume ratio >= threshold (regime override > env > default 3.5)
+            _regime_hp_iv = None
+            if getattr(args, "regime_override_map", None):
+                _rcfg = args.regime_override_map.get(rp.name)
+                if _rcfg and "HP_INST_VOL" in _rcfg:
+                    _regime_hp_iv = float(_rcfg["HP_INST_VOL"])
+            _iv = _regime_hp_iv if _regime_hp_iv is not None else (_hp_inst_vol if _hp_inst_vol > 0 else 3.5)
             if signal.volume_ratio < _iv:
                 index += 1
                 continue
@@ -1841,7 +1991,7 @@ def _backtest_symbol(
         # BEAR_BOUNCE is a NET DESTROYER across all windows:
         #   W5: 15.4% win, -0.556 R, -$5.70 net on 13 trades
         #   W1: 30.0% win, -$111 net on 10 trades
-        # Standard BREAKOUT signals capture recovery without the contrarian risk.
+        #   Standard BREAKOUT signals capture recovery without the contrarian risk.
         # BLOCK all BEAR_BOUNCE signals during bear windows.
         if window_bear and signal.status == "BEAR_BOUNCE":
             index += 1
@@ -1895,7 +2045,7 @@ def _backtest_symbol(
             or not _regime_allowed_in_market(regime, window[-1].close_time, market_trend, _hostile_args)
             or not _chop_guard_allows(regime, window[-1].close_time, market_trend, context_features, args)
             or (not window_bear and not _side_allowed_in_market(signal.side, window[-1].close_time, market_trend, args))
-            or not _rel_strength_allows(signal, window, args, market_trend)
+            or not _rel_strength_allows(signal, window, args, market_trend, min_rel_strength_pct=rp.min_rel_strength_pct)
             or (signal.status not in ("BEAR_BOUNCE", "FADE") and not _mtf_aligned(mtf_align, window[-1].close_time, signal.side))
         ):
             index += 1
@@ -1927,14 +2077,41 @@ def _backtest_symbol(
             if ml_active and not args.ml_score_only and selected_score is not None and selected_score < args.ml_filter_threshold:
                 index += 1
                 continue
-        trade = _simulate_trade(signal, candles, index, args, regime, bear_overrides or None)
+
+        # ── Merged overrides combining bear_overrides and rp overrides ──
+        merged_overrides = dict(bear_overrides) if bear_overrides else {}
+        # Apply regime-based config overrides if any
+        if getattr(args, "regime_override_map", None) and rp.name in args.regime_override_map:
+            regime_cfg = args.regime_override_map[rp.name]
+            merged_overrides.update({k: v for k, v in regime_cfg.items() if v is not None})
+        if rp.max_sl_loss_pct is not None:
+            merged_overrides["max_sl_loss_pct"] = rp.max_sl_loss_pct
+
+        # Apply dynamic exit overrides if the CLI flag is set
+        if args.dynamic_threshold is not None:
+            # Mapping of threshold percent → overrides (based on chosen config)
+            _dynamic_map = {
+                2.5: {"breakeven_trigger_r": 1.25, "stagnation_after_r": 2.0, "stagnation_candles": 12},
+                3.0: {"breakeven_trigger_r": 1.25, "stagnation_after_r": 2.0, "stagnation_candles": 12},
+                # Additional thresholds can be added here if needed
+            }
+            cfg = _dynamic_map.get(args.dynamic_threshold)
+            if cfg:
+                merged_overrides.update({k: v for k, v in cfg.items() if v is not None})
+        else:
+            if rp.breakeven_trigger_r is not None:
+                merged_overrides["breakeven_trigger_r"] = rp.breakeven_trigger_r
+            if rp.stagnation_after_r is not None:
+                merged_overrides["stagnation_after_r"] = rp.stagnation_after_r
+            if rp.stagnation_candles is not None:
+                merged_overrides["stagnation_candles"] = rp.stagnation_candles
+
+        trade = _simulate_trade(signal, candles, index, args, regime, merged_overrides, window_bear=window_bear)
         if trade is None:
             index += 1
             continue
         # ── Per-timestamp BTC regime → sizing scale ───────────────────
-        # Look up the current BTC regime at signal time and store the
-        # sizing_scale so _position_pct_for_trade can apply it automatically.
-        rp = _regime_params_for(window[-1].close_time, market_trend)
+        # Store sizing_scale and btc_regime on every BacktestTrade (using already fetched rp)
         trade.sizing_scale = rp.sizing_scale
         trade.btc_regime = rp.name
         _apply_context_features(trade, context_features)
@@ -1947,23 +2124,27 @@ def _backtest_symbol(
 
         # ── FADE: generate independent short trade alongside main ──────
         # Process FADE signal separately — it shares slots with main trades
-        if fade_signal is not None and fade_signal is not signal:
-            fade_regime = _classify_entry_regime(fade_signal)
-            # Quick quality check for FADE
-            if market_trend is not None:
-                point = market_trend.at_or_before(window[-1].close_time)
-                if point is not None:
-                    if point.close > point.ema or point.momentum_pct > 0.5:
-                        pass  # skip: BTC not bearish enough
-                    else:
-                        fade_trade = _simulate_trade(fade_signal, candles, index, args, fade_regime, bear_overrides or None)
-                        if fade_trade is not None:
-                            fade_trade.sizing_scale = rp.sizing_scale
-                            fade_trade.btc_regime = rp.name
-                            _apply_context_features(fade_trade, context_features)
-                            if not ((start_ms is not None and fade_trade.entry_time < start_ms) or (end_ms is not None and fade_trade.entry_time > end_ms)):
-                                trades.append(fade_trade)
-                                symbol_r_history.append(fade_trade.r_multiple)
+        if fade_signal is not None and fade_signal is not signal and rp.allow_short:
+            if rp.allowed_statuses is None or "FADE" in rp.allowed_statuses:
+                fade_regime = _classify_entry_regime(fade_signal)
+                # Quick quality check for FADE
+                if (
+                    (allowed_entry_regimes is None or fade_regime in allowed_entry_regimes)
+                    and market_trend is not None
+                ):
+                    point = market_trend.at_or_before(window[-1].close_time)
+                    if point is not None:
+                        if point.close > point.ema or point.momentum_pct > 0.5:
+                            pass  # skip: BTC not bearish enough
+                        else:
+                            fade_trade = _simulate_trade(fade_signal, candles, index, args, fade_regime, merged_overrides, window_bear=window_bear)
+                            if fade_trade is not None:
+                                fade_trade.sizing_scale = rp.sizing_scale
+                                fade_trade.btc_regime = rp.name
+                                _apply_context_features(fade_trade, context_features)
+                                if not ((start_ms is not None and fade_trade.entry_time < start_ms) or (end_ms is not None and fade_trade.entry_time > end_ms)):
+                                    trades.append(fade_trade)
+                                    symbol_r_history.append(fade_trade.r_multiple)
 
         index = max(trade.exit_time and _index_of_time(candles, trade.exit_time), index) + 1
     return trades
@@ -2184,6 +2365,7 @@ def _simulate_trade(
     args: argparse.Namespace,
     regime: str | None = None,
     bear_overrides: dict | None = None,
+    window_bear: bool = False,
 ) -> BacktestTrade | None:
     side = signal.side
     stop = signal.stop_price
@@ -2290,7 +2472,8 @@ def _simulate_trade(
         tp_target_multiplier=profile.target_multiplier,
         tp_conviction=profile.conviction,
         momentum_score=_momentum_score(signal),
-        window_bear=(bear_overrides is not None),
+        window_bear=window_bear,
+        interval=args.interval if args is not None else "",
         feat_score=signal.score,
         feat_breakout_pct=signal.breakout_pct,
         feat_distance_to_trigger_pct=signal.distance_to_trigger_pct,
@@ -2400,7 +2583,8 @@ def _simulate_exit(
             pairs = profit_lock_pairs if profit_lock_pairs is not None else (getattr(args, "profit_lock_pairs", None) or [])
             if not pairs and args.breakeven_trigger_r > 0:
                 _br = breakeven_trigger_r if breakeven_trigger_r is not None else args.breakeven_trigger_r
-                pairs = [(_br, 0.0)]
+                if _br > 0:
+                    pairs = [(_br, 0.0)]
             if pairs:
                 if side == "LONG":
                     best_lock = 0.0
@@ -2579,19 +2763,61 @@ def _fmt_time(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
 
 
+def _interval_rank(interval: str) -> int:
+    return {
+        "4h": 0,
+        "1h": 1,
+        "15m": 2,
+        "5m": 3,
+    }.get(interval, 99)
+
+
+def _trade_selection_priority(trade: BacktestTrade) -> float:
+    signed_rel = trade.feat_rel_momentum_pct if trade.side == "LONG" else -trade.feat_rel_momentum_pct
+    signed_btc = trade.feat_btc_momentum_pct if trade.side == "LONG" else -trade.feat_btc_momentum_pct
+    score_bias = max(trade.feat_score - 90.0, 0.0) / 20.0
+    return trade.momentum_score + score_bias + (signed_rel * 0.02) + (signed_btc * 0.005)
+
+
+def _portfolio_trade_sort_key(trade: BacktestTrade, args: argparse.Namespace) -> tuple:
+    ml_start = getattr(args, "ml_filter_start_ms", None)
+    ml_rank = -trade.ml_score if getattr(args, "ml_rank_signals", False) and (
+        ml_start is None or trade.entry_time >= ml_start
+    ) else 0.0
+    return (
+        trade.entry_time,
+        ml_rank,
+        -_trade_selection_priority(trade),
+        -trade.feat_score,
+        -trade.feat_reward_risk,
+        _interval_rank(trade.interval),
+        trade.symbol,
+        trade.side,
+        trade.detected_time,
+    )
+
+
 def _portfolio_ordered_trades(trades: list[BacktestTrade], args: argparse.Namespace) -> list[BacktestTrade]:
-    if getattr(args, "ml_rank_signals", False):
-        ml_start = getattr(args, "ml_filter_start_ms", None)
-        return sorted(
-            trades,
-            key=lambda t: (
-                t.entry_time,
-                -t.ml_score if ml_start is None or t.entry_time >= ml_start else 0.0,
-                -t.momentum_score,
-                t.symbol,
-            ),
-        )
-    return sorted(trades, key=lambda t: t.entry_time)
+    return sorted(trades, key=lambda trade: _portfolio_trade_sort_key(trade, args))
+
+
+def _get_cooldown_candles(trade_interval: str, cooldown_type: str, args: argparse.Namespace) -> int:
+    if cooldown_type == "loss":
+        if trade_interval == "15m" and getattr(args, "loss_cooldown_candles_15m", None) is not None:
+            return args.loss_cooldown_candles_15m
+        if trade_interval == "1h" and getattr(args, "loss_cooldown_candles_1h", None) is not None:
+            return args.loss_cooldown_candles_1h
+        if trade_interval == "4h" and getattr(args, "loss_cooldown_candles_4h", None) is not None:
+            return args.loss_cooldown_candles_4h
+        return args.loss_cooldown_candles
+    else:
+        if trade_interval == "15m" and getattr(args, "win_cooldown_candles_15m", None) is not None:
+            return args.win_cooldown_candles_15m
+        if trade_interval == "1h" and getattr(args, "win_cooldown_candles_1h", None) is not None:
+            return args.win_cooldown_candles_1h
+        if trade_interval == "4h" and getattr(args, "win_cooldown_candles_4h", None) is not None:
+            return args.win_cooldown_candles_4h
+        return args.win_cooldown_candles
 
 
 def _simulate_portfolio(
@@ -2623,23 +2849,26 @@ def _simulate_portfolio(
         ):
             equity += position.net_pnl
             open_positions.remove(position)
+            pos_interval_ms = interval_to_ms(position.interval) if position.interval else interval_ms
+            loss_cooldown_candles = _get_cooldown_candles(position.interval, "loss", args)
+            win_cooldown_candles = _get_cooldown_candles(position.interval, "win", args)
             if position.net_pnl < 0:
                 losses = consecutive_losses_by_symbol.get(position.symbol, 0) + 1
                 consecutive_losses_by_symbol[position.symbol] = losses
                 consecutive_wins_by_symbol[position.symbol] = 0
-                if args.loss_cooldown_candles > 0 and losses >= args.loss_cooldown_after:
+                if loss_cooldown_candles > 0 and losses >= args.loss_cooldown_after:
                     cooldown_until_by_symbol[position.symbol] = max(
                         cooldown_until_by_symbol.get(position.symbol, 0),
-                        position.exit_time + args.loss_cooldown_candles * interval_ms,
+                        position.exit_time + loss_cooldown_candles * pos_interval_ms,
                     )
             else:
                 consecutive_losses_by_symbol[position.symbol] = 0
                 wins = consecutive_wins_by_symbol.get(position.symbol, 0) + 1
                 consecutive_wins_by_symbol[position.symbol] = wins
-                if args.win_cooldown_candles > 0 and wins >= args.win_cooldown_after:
+                if win_cooldown_candles > 0 and wins >= args.win_cooldown_after:
                     cooldown_until_by_symbol[position.symbol] = max(
                         cooldown_until_by_symbol.get(position.symbol, 0),
-                        position.exit_time + args.win_cooldown_candles * interval_ms,
+                        position.exit_time + win_cooldown_candles * pos_interval_ms,
                     )
             peak = max(peak, equity)
             # ── DD-based equity reset ──
@@ -2657,8 +2886,10 @@ def _simulate_portfolio(
         realize(trade.entry_time)
         if equity <= 0:
             break  # account blown up
+        trade_loss_candles = _get_cooldown_candles(trade.interval, "loss", args)
+        trade_win_candles = _get_cooldown_candles(trade.interval, "win", args)
         if (
-            (args.loss_cooldown_candles > 0 or args.win_cooldown_candles > 0)
+            (trade_loss_candles > 0 or trade_win_candles > 0)
             and trade.entry_time < cooldown_until_by_symbol.get(trade.symbol, 0)
         ):
             continue
@@ -2763,6 +2994,7 @@ def _simulate_portfolio_with_rotation(
         entry_price = pos["entry_price"]
         notional = pos["notional"]
         fees = pos["fees"]
+        pos_interval_ms = interval_to_ms(trade.interval) if trade.interval else interval_ms
         if side == "LONG":
             price_return = (exit_price - entry_price) / entry_price if entry_price > 0 else 0.0
         else:
@@ -2787,26 +3019,28 @@ def _simulate_portfolio_with_rotation(
                 trade.r_multiple = (exit_price - entry_price) / risk if risk > 0 else 0.0
             else:
                 trade.r_multiple = (entry_price - exit_price) / risk if risk > 0 else 0.0
-            trade.hold_candles = max(int((exit_time_ms - pos["entry_time"]) / max(interval_ms, 1)), 0)
+            trade.hold_candles = max(int((exit_time_ms - pos["entry_time"]) / max(pos_interval_ms, 1)), 0)
             trade.hold_hours = hold_hours
         equity += net_pnl
+        loss_cooldown_candles = _get_cooldown_candles(trade.interval, "loss", args)
+        win_cooldown_candles = _get_cooldown_candles(trade.interval, "win", args)
         if net_pnl < 0:
             losses = consecutive_losses_by_symbol.get(trade.symbol, 0) + 1
             consecutive_losses_by_symbol[trade.symbol] = losses
             consecutive_wins_by_symbol[trade.symbol] = 0
-            if args.loss_cooldown_candles > 0 and losses >= args.loss_cooldown_after:
+            if loss_cooldown_candles > 0 and losses >= args.loss_cooldown_after:
                 cooldown_until_by_symbol[trade.symbol] = max(
                     cooldown_until_by_symbol.get(trade.symbol, 0),
-                    exit_time_ms + args.loss_cooldown_candles * interval_ms,
+                    exit_time_ms + loss_cooldown_candles * pos_interval_ms,
                 )
         else:
             consecutive_losses_by_symbol[trade.symbol] = 0
             wins = consecutive_wins_by_symbol.get(trade.symbol, 0) + 1
             consecutive_wins_by_symbol[trade.symbol] = wins
-            if args.win_cooldown_candles > 0 and wins >= args.win_cooldown_after:
+            if win_cooldown_candles > 0 and wins >= args.win_cooldown_after:
                 cooldown_until_by_symbol[trade.symbol] = max(
                     cooldown_until_by_symbol.get(trade.symbol, 0),
-                    exit_time_ms + args.win_cooldown_candles * interval_ms,
+                    exit_time_ms + win_cooldown_candles * pos_interval_ms,
                 )
         peak = max(peak, equity)
         # ── DD-based equity reset ──
@@ -2858,8 +3092,10 @@ def _simulate_portfolio_with_rotation(
         realize_natural_exits(trade.entry_time)
         if equity <= 0:
             break
+        trade_loss_candles = _get_cooldown_candles(trade.interval, "loss", args)
+        trade_win_candles = _get_cooldown_candles(trade.interval, "win", args)
         if (
-            (args.loss_cooldown_candles > 0 or args.win_cooldown_candles > 0)
+            (trade_loss_candles > 0 or trade_win_candles > 0)
             and trade.entry_time < cooldown_until_by_symbol.get(trade.symbol, 0)
         ):
             continue
@@ -3205,7 +3441,7 @@ def _write_trade_log(
                     "feat_symbol_trades_30": f"{trade.feat_symbol_trades_30:.6f}",
                     "feat_symbol_win_rate_30": f"{trade.feat_symbol_win_rate_30:.6f}",
                     "feat_symbol_avg_r_30": f"{trade.feat_symbol_avg_r_30:.6f}",
-                    "feat_interval": args.interval if args is not None else "",
+                    "feat_interval": trade.interval,
                     "sizing_scale": f"{trade.sizing_scale:.2f}",
                     "btc_regime": trade.btc_regime,
                 }

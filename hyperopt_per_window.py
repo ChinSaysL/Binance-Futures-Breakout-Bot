@@ -8,15 +8,15 @@ Stages (per window):
   1. Detector quality  (HP_INST_REL, HP_INST_VOL)        8 combos
   2. Exit params       (breakeven_r, stagnation_after_r) 6 combos
   3. SL cap            (max_sl_loss_pct)                  4 combos
-  4. MTF + concurrency (mtf_ma_period, max_concurrent)    6 combos
+  4. MTF + concurrency (mtf_ma_period, max_concurrent)    8 combos
 
 Each stage keeps the best result and feeds the params into the next stage.
 
-Concurrency: --combo-workers N runs N param combos at once.  Each combo
-runs only ONE backtest (its window), so total parallel processes = N.
-On an 8-core / 16-thread CPU, pass --combo-workers 8.
+Concurrency: each backtest uses 16 symbol workers. --combo-workers N runs
+N parameter combos at once; keep it at 1 unless you intentionally want to
+oversubscribe the machine.
 
-Run:   python hyperopt_per_window.py --combo-workers 8
+Run:   python hyperopt_per_window.py --combo-workers 1
 Output: hyperopt_per_window_best.json
 """
 
@@ -39,7 +39,7 @@ from pathlib import Path
 WINDOWS: list[tuple[str, str, str, str]] = [
     ("W1", "2025-12-20", "2026-02-10", "bear crash+recovery -21.9%"),
     ("W2", "2025-02-20", "2025-04-05", "bear grinding -19.7%"),
-    ("W3", "2026-04-01", "2026-05-21", "bull strong +28.8%"),
+    ("W3", "2025-04-02", "2025-05-21", "bull strong +25.4%"),
     ("W4", "2025-06-04", "2025-07-23", "bull chop +13.4%"),
     ("W5", "2025-10-08", "2025-11-26", "bear massive crash -28.2%"),
     ("W6", "2026-02-25", "2026-04-15", "bull recovery +16.1%"),
@@ -64,6 +64,7 @@ BASE_CMD: list[str] = [
     "--runner-pct", "50",
     "--bear-profile",
     "--offline-cache-dir", "_kline_cache",
+    "--workers", "16",
 ]
 
 
@@ -77,9 +78,12 @@ STAGES: list[tuple[str, dict[str, list]]] = [
         "breakeven_r": [0.0, 1.0],
         "stag_after_r": [0.5, 1.0],
     }),
+    ("sl_cap", {
+        "max_sl_loss_pct": [35, 40, 45, 50],
+    }),
     ("mtf_conc", {
         "mtf_ma_period": [20, 25],
-        "max_concurrent": [2, 3],
+        "max_concurrent": [2, 3, 4, 5],
     }),
 ]
 
@@ -107,13 +111,13 @@ def run_one(window_id: str, start: str, end: str, params: dict) -> dict:
     cmd = list(BASE_CMD) + [
         "--start-date", start,
         "--end-date", end,
-        "--max-sl-loss-pct", str(params.get("max_sl_loss_pct", 35)),
+        "--max-sl-loss-pct", str(params.get("max_sl_loss_pct", 50)),
         "--stagnation-candles", str(params.get("stag_candles", 12)),
     ]
     if "max_concurrent" in params:
         cmd += ["--max-concurrent", str(params["max_concurrent"])]
     else:
-        cmd += ["--max-concurrent", "2"]
+        cmd += ["--max-concurrent", "5"]
     for k in ("breakeven_r", "stag_after_r", "mtf_ma_period"):
         if k in params:
             cmd += _flag_for(k, params[k])
@@ -204,8 +208,8 @@ def tune_window(window_id: str, start: str, end: str, desc: str,
 
 def main():
     parser = argparse.ArgumentParser(description="Per-window staged hyperopt")
-    parser.add_argument("--combo-workers", type=int, default=8,
-                        help="Parallel combo workers (8 cores). Default 8.")
+    parser.add_argument("--combo-workers", type=int, default=1,
+                        help="Parallel parameter combos. Each backtest uses --workers 16; default 1.")
     parser.add_argument("--windows", default="W1,W2,W3,W4,W5,W6",
                         help="Comma-separated subset of windows to tune.")
     parser.add_argument("--output", default="hyperopt_per_window_best.json")
