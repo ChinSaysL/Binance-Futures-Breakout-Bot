@@ -85,3 +85,9 @@ Thumbs.db
 # --- ML walk-forward outputs (regenerable from train_model.py) ---
 ml_walk_forward_*.csv
 ml_walk_forward_*.json
+
+# --- scratch run/eval artifacts ---
+.run-logs/
+sweep_logs/
+.claude/
+eval_robust*.py
