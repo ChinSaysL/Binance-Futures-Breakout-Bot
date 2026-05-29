@@ -4,6 +4,10 @@ from argparse import Namespace
 
 from screener.backtest import (
     BacktestTrade,
+    MarketTrend,
+    MarketTrendPoint,
+    _bear_shorts_enabled,
+    _bear_window_active,
     _normalize_regime_overrides,
     _parse_args,
     _portfolio_ordered_trades,
@@ -38,6 +42,35 @@ def _trade(symbol: str, *, rel: float, score: float, momentum: float, interval: 
 
 
 class BacktestRegimeConfigTests(unittest.TestCase):
+    def test_bear_profile_uses_live_7d_trigger_not_stale_30d_drawdown(self):
+        day = 24 * 60 * 60 * 1000
+        trend = MarketTrend(
+            points=[
+                MarketTrendPoint(0, 120.0, 100.0, 0.0),
+                MarketTrendPoint(23 * day, 80.0, 100.0, 0.0),
+                MarketTrendPoint(30 * day, 90.0, 100.0, 0.0),
+            ],
+            times=[0, 23 * day, 30 * day],
+        )
+        args = Namespace(bear_profile=True)
+
+        self.assertFalse(_bear_window_active(args, 30 * day, trend))
+        self.assertFalse(_bear_shorts_enabled(args, 30 * day, trend))
+
+    def test_bear_profile_activates_on_live_7d_drop(self):
+        day = 24 * 60 * 60 * 1000
+        trend = MarketTrend(
+            points=[
+                MarketTrendPoint(0, 100.0, 100.0, 0.0),
+                MarketTrendPoint(7 * day, 94.0, 100.0, -6.0),
+            ],
+            times=[0, 7 * day],
+        )
+        args = Namespace(bear_profile=True)
+
+        self.assertTrue(_bear_window_active(args, 7 * day, trend))
+        self.assertTrue(_bear_shorts_enabled(args, 7 * day, trend))
+
     def test_window_config_aliases_map_to_simulator_keys(self):
         overrides = _normalize_regime_overrides(
             {

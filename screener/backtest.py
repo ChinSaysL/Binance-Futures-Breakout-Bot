@@ -40,10 +40,8 @@ from screener.breakout import (
     BreakoutSignal,
     Candle,
     candles_from_klines,
-    detect_bear_bounce,
     detect_failed_rally,
     detect_long_breakout,
-    detect_oversold_bounce,
     detect_short_breakdown,
     evaluate_breakout,
     interval_to_ms,
@@ -185,8 +183,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--start-date", help="UTC start date for the backtest window, YYYY-MM-DD.")
     parser.add_argument("--end-date", help="UTC end date for the backtest window, YYYY-MM-DD.")
     parser.add_argument("--detector", choices=["simple", "squeeze"], default="simple", help="simple = high-recall long-breakout detector; squeeze = the original pre-breakout detector.")
-    parser.add_argument("--interval", default="1h", help="Kline interval, e.g. 15m, 1h, 4h.")
-    parser.add_argument("--intervals", default=None, help="Comma-separated intervals to scan in one run, mirroring live (--timeframes 15m,1h,4h).  When set, each symbol is backtested on every interval and all trades feed into the same portfolio simulator.  Overrides --interval.")
+    parser.add_argument("--interval", default=None, help="Single kline interval to scan, e.g. 15m, 1h, 4h. Overrides --intervals.")
+    parser.add_argument("--intervals", default="15m,1h,4h", help="Comma-separated intervals to scan in one run, mirroring live (--timeframes 15m,1h,4h). Default: 15m,1h,4h.")
     parser.add_argument("--history", type=int, default=1500, help="Klines to pull per symbol (max 1500).")
     parser.add_argument("--trade-log", default="backtest_trades.csv", help="CSV path for the per-signal trade log.")
     parser.add_argument("--order-margin", type=float, default=5.0, help="USDT margin committed per trade.")
@@ -257,16 +255,18 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--longs-only", dest="longs_only", action="store_true", default=True, help="Skip SHORT signals entirely.")
     parser.add_argument("--include-shorts", dest="longs_only", action="store_false", help="Also test SHORT breakdown signals.")
     parser.add_argument("--shorts-only", action="store_true", help="Skip LONG signals entirely and test only SHORT breakdown signals.")
-    parser.add_argument("--bear-profile", action="store_true", help="Activate bear-market-optimised strategy profile: switches exits to fixed take-profits, tightens INSTANT SL, adds oversold-bounce detector, and improves short quality filters when BTC is in a bearish regime. Designed to lift worst-window (W1) results toward bull-window levels without touching bull-market behaviour.")
+    parser.add_argument("--bear-profile", action="store_true", help="Activate bear-market-optimised strategy profile: switches exits to bear-window overrides, tightens INSTANT quality filters, and enables failed-rally / short-breakdown detectors when BTC is in a bearish regime.")
     parser.add_argument("--capital", type=float, default=1000.0, help="Starting account balance.")
     parser.add_argument("--compound", action="store_true", help="Scale each position's margin with the running equity (compounding).")
     parser.add_argument("--max-concurrent", type=int, default=5, help="Max positions open at once. 0 = dynamic cap by current equity.")
     parser.add_argument("--position-pct", type=float, default=0.0, help="Fixed margin percent of equity when --compound is set. 0 = use --sizing-mode.")
     parser.add_argument("--sizing-mode", choices=["guarded", "moonshot", "aggressive", "auto"], default="moonshot", help="guarded = fixed 10%% sizing; moonshot/aggressive = dynamic tiers vs starting-capital multiple; auto = absolute-equity tiers + drawdown haircut (designed to grow micro accounts fast while de-risking on drawdown).")
     parser.add_argument("--skip-entry-regimes", default="TRAILING_RETEST", help="Comma-separated adaptive entry regimes to exclude. Default: TRAILING_RETEST; pass none to include all.")
+    parser.add_argument("--skip-interval-entry-regimes", default="4h:INSTANT,4h:RETEST,15m:INSTANT,15m:RETEST", help="Comma-separated interval:regime pairs to exclude, e.g. 4h:INSTANT,4h:RETEST. Default keeps 15m/4h as context unless the entry is conservative.")
     parser.add_argument("--btc-trend-filter", action="store_true", help="Only take longs when BTC's rolling trend is not hostile; invert the rule for shorts.")
     parser.add_argument("--btc-ema-candles", type=int, default=72, help="EMA length for --btc-trend-filter.")
     parser.add_argument("--btc-momentum-candles", type=int, default=72, help="Momentum lookback for BTC trend and instant-entry guards.")
+    parser.add_argument("--btc-guard-interval", default="1h", help="BTC timeframe used for market/regime guards. Default: 1h, matching live.")
     parser.add_argument("--btc-ema-slack-pct", type=float, default=0.5, help="Allowed BTC distance below EMA for long signals, percent.")
     parser.add_argument("--btc-momentum-guard-pct", type=float, default=1.0, help="Allowed BTC adverse momentum for trend-filtered signals, percent.")
     parser.add_argument("--no-instant-market-guard", dest="instant_market_guard", action="store_false", help="Do not block INSTANT entries during hostile BTC trend.")
@@ -400,6 +400,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     if args.instant_size_multiplier < 0 or args.retest_size_multiplier < 0 or args.trailing_retest_size_multiplier < 0:
         parser.error("size multipliers must be zero or greater")
     args.skip_entry_regimes = _parse_regime_set(args.skip_entry_regimes)
+    try:
+        args.skip_interval_entry_regimes = _parse_interval_regime_skips(args.skip_interval_entry_regimes)
+    except ValueError as exc:
+        parser.error(str(exc))
     args.btc_chop_skip_entry_regimes = _parse_regime_set(args.btc_chop_skip_entry_regimes)
     args.profit_lock_pairs = _parse_profit_lock_ladder(args.profit_lock_ladder, parser)
     if args.stagnation_after_r < 0:
@@ -448,6 +452,24 @@ def _parse_regime_set(raw: str) -> set[str]:
     return {part.strip().upper() for part in raw.split(",") if part.strip()}
 
 
+def _parse_interval_regime_skips(raw: str) -> dict[str, set[str]]:
+    if not raw or raw.strip().lower() in {"none", "off"}:
+        return {}
+    skips: dict[str, set[str]] = {}
+    for chunk in raw.split(","):
+        item = chunk.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(f"--skip-interval-entry-regimes entry {item!r} must be interval:regime")
+        interval, regime = (part.strip() for part in item.split(":", 1))
+        if not interval or not regime:
+            raise ValueError(f"--skip-interval-entry-regimes entry {item!r} must be interval:regime")
+        interval_to_ms(interval)
+        skips.setdefault(interval, set()).add(regime.upper())
+    return skips
+
+
 def _normalize_regime_set(raw: object) -> frozenset[str] | None:
     if raw is None:
         return None
@@ -476,6 +498,19 @@ def _normalize_regime_overrides(raw: dict) -> dict:
     return normalized
 
 
+def _resolve_scan_intervals(args: argparse.Namespace) -> list[str]:
+    raw = args.interval if args.interval else args.intervals
+    intervals: list[str] = []
+    for part in str(raw or "").split(","):
+        interval = part.strip()
+        if interval and interval not in intervals:
+            interval_to_ms(interval)
+            intervals.append(interval)
+    if not intervals:
+        intervals = ["1h"]
+    return intervals
+
+
 def _process_symbol_worker(
     symbol: str,
     index: int,
@@ -497,9 +532,8 @@ def _process_symbol_worker(
     import copy
     thread_args = copy.copy(args_local)
     symbol_trades_all: list[BacktestTrade] = []
-    symbol_candles: list[Candle] | None = None
+    symbol_candles_by_interval: dict[str, list[Candle]] = {}
     symbol_total = 0
-    best_iv_ms = 0
     for iv in scan_intervals_local:
         thread_args.interval = iv
         iv_ms = interval_to_ms(iv)
@@ -535,11 +569,9 @@ def _process_symbol_worker(
         )
         symbol_trades_all.extend(symbol_trades)
         if thread_args.simulate_rotation and symbol_trades:
-            if symbol_candles is None or iv_ms < best_iv_ms:
-                symbol_candles = candles
-                best_iv_ms = iv_ms
+            symbol_candles_by_interval[iv] = candles
         symbol_total += len(symbol_trades)
-    return symbol, symbol_trades_all, symbol_candles, symbol_total, index, total
+    return symbol, symbol_trades_all, symbol_candles_by_interval, symbol_total, index, total
 
 
 def _run(client: BinanceClient, args: argparse.Namespace) -> int:
@@ -558,12 +590,13 @@ def _run(client: BinanceClient, args: argparse.Namespace) -> int:
         target_intensity_max=args.target_intensity_max,
         tp_cap_recent_swing_high_candles=args.tp_cap_recent_swing_high_candles,
     )
-    # Resolve scan intervals (multi-tf when --intervals is set, mirroring live).
-    if args.intervals:
-        scan_intervals = [iv.strip() for iv in args.intervals.split(",") if iv.strip()]
-    else:
-        scan_intervals = [args.interval]
-    interval_ms = interval_to_ms(scan_intervals[0])
+    # Resolve scan intervals independently from the BTC guard interval. Live
+    # scans 15m/1h/4h while keeping BTC guard context on 1h.
+    scan_intervals = _resolve_scan_intervals(args)
+    args.scan_intervals = scan_intervals
+    if args.interval is None:
+        args.interval = scan_intervals[0]
+    btc_guard_interval = getattr(args, "btc_guard_interval", "1h") or "1h"
     symbols = _resolve_symbols(client, args)
     if not symbols:
         print("No symbols resolved for the backtest.")
@@ -583,9 +616,9 @@ def _run(client: BinanceClient, args: argparse.Namespace) -> int:
         except (OSError, ValueError, KeyError) as exc:
             print(f"ML filter disabled - could not load {args.ml_filter_model}: {exc}")
             ml_model = None
-    btc_return, window_start, window_end = _market_context(client, args)
+    btc_return, window_start, window_end = _market_context(client, args, btc_guard_interval)
     market_trend = (
-        _load_market_trend(client, args, interval_ms)
+        _load_market_trend(client, args, btc_guard_interval)
         if args.btc_trend_filter
         or args.instant_market_guard
         or args.hostile_market_strict_only
@@ -597,7 +630,7 @@ def _run(client: BinanceClient, args: argparse.Namespace) -> int:
 
 
     window_size = "full date window" if args.start_ms is not None else f"{args.history} candles"
-    print(f"Backtesting {len(symbols)} symbol(s) on {args.interval}, {window_size} each...")
+    print(f"Backtesting {len(symbols)} symbol(s) on {','.join(scan_intervals)}, {window_size} each...")
     if args.start_ms is not None:
         print("Date-window run: scanning every eligible coin to avoid today's volatility-ranking bias.")
     if args.skip_entry_regimes:
@@ -628,7 +661,7 @@ def _run(client: BinanceClient, args: argparse.Namespace) -> int:
         )
     if getattr(args, "bear_profile", False):
         print(
-            "Bear profile: enabled (activates when window BTC return <= -5%)."
+            "Bear profile: enabled (activates when BTC 7d return <= -5%, matching live)."
         )
 
     # ── Save args that bear profile may modify ───────────────────────
@@ -637,7 +670,7 @@ def _run(client: BinanceClient, args: argparse.Namespace) -> int:
     _saved_max_conc = args.max_concurrent
 
     trades: list[BacktestTrade] = []
-    candles_by_symbol: dict[str, list[Candle]] = {}
+    candles_by_symbol_interval: dict[tuple[str, str], list[Candle]] = {}
     # Save the user-set --interval; we mutate args.interval per scan so the
     # per-symbol code paths (regime detection, interval-aware sizing, trade
     # log labels) see the correct TF for each pass.
@@ -650,13 +683,13 @@ def _run(client: BinanceClient, args: argparse.Namespace) -> int:
     if workers <= 1:
         # ── Serial path (original behaviour) ─────────────────────────
         for index, symbol in enumerate(symbols, start=1):
-            symbol, symbol_trades_all, symbol_candles, symbol_total, _, _ = _process_symbol_worker(
+            symbol, symbol_trades_all, symbol_candles_by_interval, symbol_total, _, _ = _process_symbol_worker(
                 symbol, index, len(symbols), ml_model, btc_return, market_trend,
                 scan_intervals, args, settings, client,
             )
             trades.extend(symbol_trades_all)
-            if symbol_candles is not None:
-                candles_by_symbol[symbol] = symbol_candles
+            for interval, candles in symbol_candles_by_interval.items():
+                candles_by_symbol_interval[(symbol, interval)] = candles
             print(f"  [{index}/{len(symbols)}] {symbol}: {symbol_total} trade(s) across {len(scan_intervals)} TF(s)")
     else:
         # ── Parallel path (ProcessPoolExecutor for true CPU parallelism) ──
@@ -671,16 +704,16 @@ def _run(client: BinanceClient, args: argparse.Namespace) -> int:
                 for idx, symbol in enumerate(symbols, start=1)
             }
             for future in as_completed(futures):
-                symbol, symbol_trades_all, symbol_candles, symbol_total, index, total = future.result()
+                symbol, symbol_trades_all, symbol_candles_by_interval, symbol_total, index, total = future.result()
                 trades.extend(symbol_trades_all)
-                if symbol_candles is not None:
-                    candles_by_symbol[symbol] = symbol_candles
+                for interval, candles in symbol_candles_by_interval.items():
+                    candles_by_symbol_interval[(symbol, interval)] = candles
                 print(f"  [{index}/{total}] {symbol}: {symbol_total} trade(s) across {len(scan_intervals)} TF(s)")
 
     args.interval = _saved_interval
 
     if args.simulate_rotation:
-        taken, final_equity, max_drawdown = _simulate_portfolio_with_rotation(trades, candles_by_symbol, args)
+        taken, final_equity, max_drawdown = _simulate_portfolio_with_rotation(trades, candles_by_symbol_interval, args)
     else:
         taken, final_equity, max_drawdown = _simulate_portfolio(trades, args)
 
@@ -805,6 +838,7 @@ def _fetch_klines_at(
     end_ms: int | None,
     history: int = 1500,
     offline_cache_dir: str | None = None,
+    warmup_candles: int = 150,
 ) -> list[list[object]]:
     """Fetch klines at an arbitrary interval (caches like _fetch_klines).
     Used for the MTF-alignment higher-timeframe lookup."""
@@ -812,7 +846,7 @@ def _fetch_klines_at(
     start_time = start_ms
     end_time = end_ms
     if start_time is not None:
-        start_time = max(int(start_time) - 150 * interval_ms, 0)
+        start_time = max(int(start_time) - max(int(warmup_candles), 0) * interval_ms, 0)
         limit = 1500
     return _fetch_klines_window(client, symbol, interval, interval_ms, limit, start_time, end_time,
                                 offline_cache_dir=offline_cache_dir)
@@ -881,9 +915,28 @@ def _fetch_klines(client: BinanceClient, symbol: str, args: argparse.Namespace, 
                                 offline_cache_dir=offline_dir or None)
 
 
-def _load_market_trend(client: BinanceClient, args: argparse.Namespace, interval_ms: int) -> MarketTrend | None:
+def _load_market_trend(client: BinanceClient, args: argparse.Namespace, interval: str) -> MarketTrend | None:
+    interval_ms = interval_to_ms(interval)
     try:
-        raw = _fetch_klines(client, "BTCUSDT", args, interval_ms)
+        offline_dir = str(getattr(args, "offline_cache_dir", None) or "")
+        start_ms = args.start_ms
+        if start_ms is not None:
+            required_ms = max(
+                _MS_60D,
+                (int(args.btc_ema_candles) + int(args.btc_momentum_candles) + 24) * interval_ms,
+            )
+            start_ms = max(int(start_ms) - required_ms, 0)
+        raw = _fetch_klines_at(
+            client,
+            "BTCUSDT",
+            interval,
+            interval_ms,
+            start_ms,
+            args.end_ms,
+            args.history,
+            offline_cache_dir=offline_dir or None,
+            warmup_candles=0,
+        )
     except BinanceClientError as exc:
         print(f"BTC trend filter disabled: BTCUSDT klines failed ({exc})")
         return None
@@ -918,10 +971,21 @@ def _build_market_trend(candles: list[Candle], ema_candles: int, momentum_candle
     return MarketTrend(points=points, times=[point.close_time for point in points])
 
 
-def _market_context(client: BinanceClient, args: argparse.Namespace) -> tuple[float | None, int, int]:
+def _market_context(client: BinanceClient, args: argparse.Namespace, interval: str) -> tuple[float | None, int, int]:
     """Return BTC's return over the window and the window's start/end timestamps."""
     try:
-        raw = _fetch_klines(client, "BTCUSDT", args, interval_to_ms(args.interval))
+        offline_dir = str(getattr(args, "offline_cache_dir", None) or "")
+        raw = _fetch_klines_at(
+            client,
+            "BTCUSDT",
+            interval,
+            interval_to_ms(interval),
+            args.start_ms,
+            args.end_ms,
+            args.history,
+            offline_cache_dir=offline_dir or None,
+            warmup_candles=0,
+        )
         candles = candles_from_klines(raw)
     except BinanceClientError:
         return None, 0, 0
@@ -1117,7 +1181,7 @@ BEAR_PROFILE_INSTANT_SL_CAP = 0.0   # 0 = inherit CLI cap (no widening)
 # margin fully).  35% tightens that without overhauling the bear strategy.
 BEAR_PROFILE_MAX_SL_CAP = 35.0
 # Keep standard hostile guard – changing it filters too many Jan winners.
-# The bear profile's edge comes from the profit-lock ladder + oversold detector.
+# The bear profile's edge comes from exits plus stricter short quality filters.
 BEAR_PROFILE_HOSTILE_MOMENTUM = 0.0  # 0 = inherit default (no change)
 BEAR_PROFILE_HOSTILE_EMA_SLACK = 0.0  # inherit default
 # Profit-lock ladder: (trigger_R, lock_R) – OFF by default (was net-negative in W1)
@@ -1130,15 +1194,16 @@ BEAR_PROFILE_BREAKEVEN_TRIGGER_R = 1.25
 # 1.0R/8c=517, 1.0R/10c=537.
 BEAR_PROFILE_STAGNATION_AFTER_R = 1.25
 BEAR_PROFILE_STAGNATION_CANDLES = 8
-# Window-level threshold: if BTC's total return over the window is <= this
-# percent, the bear profile activates for the ENTIRE window.
+# Live-compatible bear trigger: live checks roughly the last 7 days of BTC
+# candles and activates the bear profile only when that return is <= this
+# percent. Keep the backtest on the same rolling rule so recovery windows
+# do not inherit stale 30d/60d bear state.
 BEAR_PROFILE_BTC_RETURN_THRESHOLD = -5.0
 # ── Dynamic bear-profile activation for SHORTS ──
 # BTC must be in a sustained downtrend before shorts fire.  60-day lookback
 # at -10% means shorts only activate in genuine bear markets (2024 rarely
 # crossed this threshold, which is exactly the point — shorts bled -$350 in
 # a year when BTC was mostly flat-to-up).
-BEAR_SHORT_60D_RETURN_THRESHOLD = -10.0
 
 # ── DD-based equity reset ──
 # When drawdown exceeds DD_RESET_THRESHOLD%, halve position sizing for the
@@ -1148,59 +1213,19 @@ DD_RESET_TRADES = 5        # number of halved-size trades during reset
 
 
 def _bear_window_active(args: argparse.Namespace, timestamp: int, market_trend: MarketTrend | None) -> bool:
-    """True when --bear-profile is on AND the 30-day BTC return is bearish.
-
-    Bear-profile activation (long-side guards, profit-lock ladder etc.)
-    still uses the shorter 30d/-5% threshold — these protective measures
-    should activate earlier than shorts.
-    """
+    """True when --bear-profile is on and BTC's rolling 7d return is bearish."""
     if not getattr(args, "bear_profile", False):
         return False
     if market_trend is None:
         return False
 
-    point = market_trend.at_or_before(timestamp)
-    if point is None:
-        return False
-
-    # Look back 30 days (2,592,000,000 ms)
-    past_point = market_trend.at_or_before(timestamp - 2_592_000_000)
-    if past_point is None:
-        past_point = market_trend.points[0]
-
-    if past_point.close_time >= timestamp:
-        return False
-
-    btc_return = (point.close / max(past_point.close, 1e-9) - 1.0) * 100.0
-    return btc_return <= BEAR_PROFILE_BTC_RETURN_THRESHOLD
+    btc_return = _btc_return_pct(timestamp, market_trend, _MS_7D)
+    return btc_return is not None and btc_return <= BEAR_PROFILE_BTC_RETURN_THRESHOLD
 
 
 def _bear_shorts_enabled(args: argparse.Namespace, timestamp: int, market_trend: MarketTrend | None) -> bool:
-    """True when shorts should fire: BTC is in a SUSTAINED downtrend.
-
-    Uses a 60-day lookback at -10% — much stricter than the general bear
-    profile.  In 2024 BTC's 60-day return almost never crossed -10%, so
-    shorts stayed off (saving ~$390 of BREAKDOWN bleed).
-    """
-    if not getattr(args, "bear_profile", False):
-        return False
-    if market_trend is None:
-        return False
-
-    point = market_trend.at_or_before(timestamp)
-    if point is None:
-        return False
-
-    # Look back 60 days
-    past_point = market_trend.at_or_before(timestamp - _MS_60D)
-    if past_point is None:
-        past_point = market_trend.points[0]
-
-    if past_point.close_time >= timestamp:
-        return False
-
-    btc_return = (point.close / max(past_point.close, 1e-9) - 1.0) * 100.0
-    return btc_return <= BEAR_SHORT_60D_RETURN_THRESHOLD
+    """True when live would add bear-profile short candidates."""
+    return _bear_window_active(args, timestamp, market_trend)
 
 
 # ---------------------------------------------------------------------------
@@ -1379,7 +1404,6 @@ def _classify_regime(timestamp: int, market_trend: MarketTrend | None) -> str:
             return "BULL_CHOP"
     if ret_7 is None:
         ret_7 = 0.0
-
     # BEAR family — bottom of 60d range ────────────────────────────
     # CRASH: at lows AND still falling.  Sticky — won't flip on a single bounce.
     if pos < 0.20 and ret_7 <= -2.0:
@@ -1390,7 +1414,7 @@ def _classify_regime(timestamp: int, market_trend: MarketTrend | None) -> str:
         return "BEAR_GRIND"               # W2-style: low but stable
 
     # BULL family — top of 60d range ───────────────────────────────
-    if pos >= 0.75 and ret_7 >= 1.0:
+    if pos >= 0.80 and ret_7 >= 1.0:
         return "BULL_STRONG"              # W3-style
     if pos >= 0.50:
         return "BULL_RECOVERY"            # W4 / W6 / mid-range climbing
@@ -1408,61 +1432,6 @@ def _regime_params_for(timestamp: int, market_trend: MarketTrend | None) -> Regi
 def _allowed_entry_regimes_for(rp: RegimeParams, args: argparse.Namespace) -> frozenset[str] | None:
     configured = getattr(args, "regime_allowed_entry_map", {}).get(rp.name)
     return configured if configured is not None else rp.allowed_entry_regimes
-
-
-def _bear_regime(
-    timestamp: int,
-    market_trend: MarketTrend | None,
-) -> str:
-    """Classify the BTC regime at a point in time: BEAR, BULL, or CHOP.
-
-    Used by the oversold-bounce detector to decide when to scan for
-    mean-reversion setups (only during deeply bearish BTC conditions).
-    """
-    if market_trend is None:
-        return "CHOP"
-    point = market_trend.at_or_before(timestamp)
-    if point is None:
-        return "CHOP"
-    ema_dist_pct = (point.close / max(point.ema, 1e-9) - 1.0) * 100.0
-    mom = point.momentum_pct
-    if mom >= 2.0 and ema_dist_pct >= 0.0:
-        return "BULL"
-    if mom <= -2.0 and ema_dist_pct <= 0.0:
-        return "BEAR"
-    return "CHOP"
-
-
-def _bear_oversold_active(
-    timestamp: int,
-    market_trend: MarketTrend | None,
-    args: argparse.Namespace,
-    window_bear_active: bool,
-) -> bool:
-    """True when the oversold-bounce detector should fire.
-
-    Only during bear profile AND when BTC itself is deeply discounted
-    (close position <= 0.25 in its 72-candle range), indicating the
-    market is washed out and a bounce is likely.
-    """
-    if not window_bear_active:
-        return False
-    if market_trend is None:
-        return False
-    point = market_trend.at_or_before(timestamp)
-    if point is None:
-        return False
-    # Need at least 72 points to compute BTC's own close position
-    if len(market_trend.points) < 72:
-        return False
-    recent = market_trend.points[-72:]
-    high_72 = max(p.close for p in recent)
-    low_72 = min(p.close for p in recent)
-    if high_72 <= low_72:
-        return False
-    btc_close_pos = (point.close - low_72) / (high_72 - low_72)
-    return btc_close_pos <= 0.35  # balanced: catches crash recoveries, skips grinding downtrends
-
 
 def _bear_overrides() -> dict:
     """Compute the parameter overrides for the bear market profile."""
@@ -1894,7 +1863,9 @@ def _backtest_symbol(
         regime = _classify_entry_regime(signal)
         context_features = _signal_context_features(window, market_trend, args, symbol_r_history)
         rp = _regime_params_for(window[-1].close_time, market_trend)
+        regime_cfg = getattr(args, "regime_override_map", {}).get(rp.name, {})
         allowed_entry_regimes = _allowed_entry_regimes_for(rp, args)
+        interval_regime_skips = getattr(args, "skip_interval_entry_regimes", {}) or {}
 
         # ── BTC Regime-Aware Filters ──────────────────────────────────
         if signal.side == "LONG" and not rp.allow_long:
@@ -1909,7 +1880,28 @@ def _backtest_symbol(
         if allowed_entry_regimes is not None and regime not in allowed_entry_regimes:
             index += 1
             continue
+        if regime in interval_regime_skips.get(args.interval, set()):
+            index += 1
+            continue
         if regime == "INSTANT":
+            min_score = regime_cfg.get("instant_min_score")
+            if min_score is not None and signal.score < float(min_score):
+                index += 1
+                continue
+            reward_risk = context_features.get("feat_reward_risk", signal.reward_risk)
+            min_reward_risk = regime_cfg.get("instant_min_reward_risk")
+            if min_reward_risk is not None and reward_risk < float(min_reward_risk):
+                index += 1
+                continue
+            max_reward_risk = regime_cfg.get("instant_max_reward_risk")
+            if max_reward_risk is not None and reward_risk > float(max_reward_risk):
+                index += 1
+                continue
+            btc_momentum = context_features.get("feat_btc_momentum_pct", 0.0)
+            max_btc_momentum = regime_cfg.get("instant_max_btc_momentum_pct")
+            if max_btc_momentum is not None and btc_momentum > float(max_btc_momentum):
+                index += 1
+                continue
             if rp.instant_min_rel_mom is not None:
                 rel_mom = context_features.get("feat_rel_momentum_pct", 0.0)
                 if rel_mom < rp.instant_min_rel_mom:
@@ -1956,8 +1948,7 @@ def _backtest_symbol(
 
 
         # ── Bear-profile INSTANT quality filters ──────────────────────
-        # Only apply to standard breakout INSTANT signals, not bear-bounce
-        # (overridden by specific details below)
+        # Only apply to standard breakout INSTANT signals, not FADE shorts.
         if regime == "INSTANT" and signal.side == "LONG" and signal.status not in ("BEAR_BOUNCE", "FADE"):
             # Gate 1: BTC must be above EMA
             if market_trend is not None:
@@ -1968,20 +1959,16 @@ def _backtest_symbol(
             # Gate 2: relative momentum >= threshold (regime override > env > default 3)
             rel_mom = context_features.get("feat_rel_momentum_pct", 0.0)
             _regime_hp_ir = None
-            if getattr(args, "regime_override_map", None):
-                _rcfg = args.regime_override_map.get(rp.name)
-                if _rcfg and "HP_INST_REL" in _rcfg:
-                    _regime_hp_ir = float(_rcfg["HP_INST_REL"])
+            if regime_cfg and "HP_INST_REL" in regime_cfg:
+                _regime_hp_ir = float(regime_cfg["HP_INST_REL"])
             _ir = _regime_hp_ir if _regime_hp_ir is not None else (_hp_inst_rel if _hp_inst_rel > 0 else 3.0)
             if rel_mom < _ir:
                 index += 1
                 continue
             # Gate 3: volume ratio >= threshold (regime override > env > default 3.5)
             _regime_hp_iv = None
-            if getattr(args, "regime_override_map", None):
-                _rcfg = args.regime_override_map.get(rp.name)
-                if _rcfg and "HP_INST_VOL" in _rcfg:
-                    _regime_hp_iv = float(_rcfg["HP_INST_VOL"])
+            if regime_cfg and "HP_INST_VOL" in regime_cfg:
+                _regime_hp_iv = float(regime_cfg["HP_INST_VOL"])
             _iv = _regime_hp_iv if _regime_hp_iv is not None else (_hp_inst_vol if _hp_inst_vol > 0 else 3.5)
             if signal.volume_ratio < _iv:
                 index += 1
@@ -2081,8 +2068,7 @@ def _backtest_symbol(
         # ── Merged overrides combining bear_overrides and rp overrides ──
         merged_overrides = dict(bear_overrides) if bear_overrides else {}
         # Apply regime-based config overrides if any
-        if getattr(args, "regime_override_map", None) and rp.name in args.regime_override_map:
-            regime_cfg = args.regime_override_map[rp.name]
+        if regime_cfg:
             merged_overrides.update({k: v for k, v in regime_cfg.items() if v is not None})
         if rp.max_sl_loss_pct is not None:
             merged_overrides["max_sl_loss_pct"] = rp.max_sl_loss_pct
@@ -2957,7 +2943,7 @@ def _mark_price_at(candles: list[Candle], target_time_ms: int) -> float:
 
 def _simulate_portfolio_with_rotation(
     trades: list[BacktestTrade],
-    candles_by_symbol: dict[str, list[Candle]],
+    candles_by_symbol_interval: dict[tuple[str, str], list[Candle]],
     args: argparse.Namespace,
 ) -> tuple[list[BacktestTrade], float, float]:
     """Walk signals in time order with a concurrency cap, like _simulate_portfolio,
@@ -3074,6 +3060,7 @@ def _simulate_portfolio_with_rotation(
         open_positions.append({
             "trade": trade,
             "symbol": trade.symbol,
+            "interval": trade.interval,
             "side": trade.side,
             "entry_time": trade.entry_time,
             "entry_price": trade.entry_price,
@@ -3122,7 +3109,7 @@ def _simulate_portfolio_with_rotation(
                 continue  # exploder does not clearly out-rank this position
             if trade.entry_time - pos["entry_time"] < rotation_min_hold_ms:
                 continue  # position has not had room to work yet
-            sym_candles = candles_by_symbol.get(pos["symbol"])
+            sym_candles = candles_by_symbol_interval.get((pos["symbol"], pos["interval"]))
             if not sym_candles:
                 continue
             mark = _mark_price_at(sym_candles, trade.entry_time)
@@ -3463,7 +3450,8 @@ def _print_report(
     print("=" * 64)
     print("BACKTEST REPORT")
     print("=" * 64)
-    window_span = f"full date window x {args.interval}" if args.start_ms is not None else f"{args.history} x {args.interval}"
+    intervals = ",".join(getattr(args, "scan_intervals", None) or [args.interval])
+    window_span = f"full date window x {intervals}" if args.start_ms is not None else f"{args.history} x {intervals}"
     print(f"Window      {_fmt_time(window_start)} -> {_fmt_time(window_end)} UTC  ({window_span})")
     if btc_return is not None:
         regime = "uptrend" if btc_return > 3 else "downtrend" if btc_return < -3 else "flat"
@@ -3516,7 +3504,7 @@ def _print_report(
         if bear_was_active:
             print(
                 "Profile     BEAR window: shorts enabled with quality filters, "
-                "oversold-bounce detector active"
+                "failed-rally detector active"
             )
         else:
             print(

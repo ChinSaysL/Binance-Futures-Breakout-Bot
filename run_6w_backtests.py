@@ -10,7 +10,7 @@ from pathlib import Path
 WINDOWS = [
     ("W1_bear_crash",    "W1", "2025-12-20", "2026-02-10", "Bear crash+recovery -21.9%"),
     ("W2_bear_grind",    "W2", "2025-02-20", "2025-04-05", "Bear grinding -19.7%"),
-    ("W3_bull_strong",   "W3", "2025-04-02", "2025-05-21", "Bull strong +25.4%"),
+    ("W3_bull_strong",   "W3", "2026-04-01", "2026-05-21", "Bull strong +14.1%"),
     ("W4_bull_chop",     "W4", "2025-06-04", "2025-07-23", "Bull choppy +13.4%"),
     ("W5_bear_crash2",   "W5", "2025-10-08", "2025-11-26", "Bear massive -28.2%"),
     ("W6_bull_recovery", "W6", "2026-02-25", "2026-04-15", "Bull recovery +16.1%"),
@@ -21,7 +21,8 @@ HYPEROPT_FILE = "hyperopt_per_window_best.json"
 BASE_CMD = [
     sys.executable, "-m", "screener.backtest",
     "--top", "0",
-    "--interval", "1h",
+    "--intervals", "15m,1h,4h",
+    "--btc-guard-interval", "1h",
     "--mtf-alignment-tf", "4h",
     "--capital", "10",
     "--compound",

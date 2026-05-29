@@ -714,6 +714,9 @@ class RotationPrecheckTests(unittest.TestCase):
             with (
                 patch("screener.cli._fresh_order_signal", return_value=signal),
                 patch("screener.cli.trading_rules_from_exchange_info", return_value={signal.symbol: rule}),
+                patch("screener.cli._current_btc_guard_point", return_value=(100000.0, 100000.0, 0.05)),
+                patch("screener.cli._btc_guard_reject_reason", return_value=""),
+                patch("screener.cli._btc_chop_guard_reject_reason", return_value=""),
                 patch("screener.cli.build_entry_order_plan") as build_entry_order_plan,
             ):
                 ready, reason = cli._exploder_entry_ready(
@@ -726,7 +729,7 @@ class RotationPrecheckTests(unittest.TestCase):
 
         self.assertIs(ready, signal)
         self.assertEqual(reason, "")
-        self.assertAlmostEqual(build_entry_order_plan.call_args.kwargs["requested_notional"], 122.32, places=2)
+        self.assertAlmostEqual(build_entry_order_plan.call_args.kwargs["requested_notional"], 88.96, places=2)
 
 
 class RotationScanTests(unittest.TestCase):
@@ -989,6 +992,7 @@ def _args(entry_file: Path, exit_file: Path) -> Namespace:
         exhaustion_exit=False,
         stagnation_after_r=0.0,
         stagnation_candles=0,
+        trailing_stop=False,
     )
 
 

@@ -39,7 +39,7 @@ from pathlib import Path
 WINDOWS: list[tuple[str, str, str, str]] = [
     ("W1", "2025-12-20", "2026-02-10", "bear crash+recovery -21.9%"),
     ("W2", "2025-02-20", "2025-04-05", "bear grinding -19.7%"),
-    ("W3", "2025-04-02", "2025-05-21", "bull strong +25.4%"),
+    ("W3", "2026-04-01", "2026-05-21", "bull strong +14.1%"),
     ("W4", "2025-06-04", "2025-07-23", "bull chop +13.4%"),
     ("W5", "2025-10-08", "2025-11-26", "bear massive crash -28.2%"),
     ("W6", "2026-02-25", "2026-04-15", "bull recovery +16.1%"),
@@ -50,7 +50,8 @@ WINDOWS: list[tuple[str, str, str, str]] = [
 BASE_CMD: list[str] = [
     sys.executable, "-m", "screener.backtest",
     "--top", "0",
-    "--interval", "1h",
+    "--intervals", "15m,1h,4h",
+    "--btc-guard-interval", "1h",
     "--mtf-alignment-tf", "4h",
     "--capital", "10",
     "--compound",
