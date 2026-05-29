@@ -26,7 +26,6 @@ from bisect import bisect_right
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import csv
 from dataclasses import dataclass, replace
-from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 import json
 
@@ -1884,35 +1883,19 @@ def _backtest_symbol(
             index += 1
             continue
         if regime == "INSTANT":
-            min_score = regime_cfg.get("instant_min_score")
-            if min_score is not None and signal.score < float(min_score):
-                index += 1
-                continue
-            reward_risk = context_features.get("feat_reward_risk", signal.reward_risk)
-            min_reward_risk = regime_cfg.get("instant_min_reward_risk")
-            if min_reward_risk is not None and reward_risk < float(min_reward_risk):
-                index += 1
-                continue
-            max_reward_risk = regime_cfg.get("instant_max_reward_risk")
-            if max_reward_risk is not None and reward_risk > float(max_reward_risk):
-                index += 1
-                continue
-            btc_momentum = context_features.get("feat_btc_momentum_pct", 0.0)
-            max_btc_momentum = regime_cfg.get("instant_max_btc_momentum_pct")
-            if max_btc_momentum is not None and btc_momentum > float(max_btc_momentum):
-                index += 1
-                continue
-            _ir = regime_cfg.get("HP_INST_REL")
-            _effective_ir = float(_ir) if _ir is not None else rp.instant_min_rel_mom
-            if _effective_ir is not None:
+            # NOTE: The window_config "quality" filters (instant_min_score,
+            # instant_min/max_reward_risk, instant_max_btc_momentum_pct) are
+            # intentionally NOT applied here. Cross-window validation showed they
+            # filter out winning trades (W1/W3/W4 lose 20-40% of equity). The only
+            # INSTANT entry gates are the relative-momentum and volume-ratio gates
+            # below, which the live path mirrors in _btc_regime_quality_reject_reason.
+            if rp.instant_min_rel_mom is not None:
                 rel_mom = context_features.get("feat_rel_momentum_pct", 0.0)
-                if rel_mom < _effective_ir:
+                if rel_mom < rp.instant_min_rel_mom:
                     index += 1
                     continue
-            _iv = regime_cfg.get("HP_INST_VOL")
-            _effective_iv = float(_iv) if _iv is not None else rp.instant_min_vol_ratio
-            if _effective_iv is not None:
-                if signal.volume_ratio < _effective_iv:
+            if rp.instant_min_vol_ratio is not None:
+                if signal.volume_ratio < rp.instant_min_vol_ratio:
                     index += 1
                     continue
 
@@ -2069,36 +2052,34 @@ def _backtest_symbol(
                 index += 1
                 continue
 
-        # ── Merged overrides combining bear_overrides and rp overrides ──
+        # ── Merged overrides: window_config is the single source of truth ──
+        # The live bot reads exit params (breakeven_trigger_r, stagnation_*,
+        # max_sl_loss_pct) from window_config.json via _resolve_regime_overrides.
+        # The backtest MUST use the same values so backtested exits == live exits.
+        # REGIME_PARAMS (rp) only fills fields that window_config does not define;
+        # when --window-config is supplied, regime_cfg wins on every shared field.
         merged_overrides = dict(bear_overrides) if bear_overrides else {}
-        # Apply regime-based config overrides if any (highest priority)
+
+        _exit_fields = ("breakeven_trigger_r", "stagnation_after_r",
+                        "stagnation_candles", "max_sl_loss_pct")
+        # rp fallbacks first (lowest priority)
+        for _f in _exit_fields:
+            _rpv = getattr(rp, _f, None)
+            if _rpv is not None:
+                merged_overrides[_f] = _rpv
+        # window_config regime overrides win (highest priority)
         if regime_cfg:
             merged_overrides.update({k: v for k, v in regime_cfg.items() if v is not None})
-        
-        # Apply default rp (REGIME_PARAMS) values only if not already defined in merged_overrides
-        # AND only if window_config is loaded (otherwise, we want to respect global CLI parameters)
-        if args.window_config:
-            if rp.max_sl_loss_pct is not None and "max_sl_loss_pct" not in merged_overrides:
-                merged_overrides["max_sl_loss_pct"] = rp.max_sl_loss_pct
 
-        # Apply dynamic exit overrides if the CLI flag is set
+        # --dynamic-threshold, if set, overrides the exit ladder explicitly.
         if args.dynamic_threshold is not None:
-            # Mapping of threshold percent → overrides (based on chosen config)
             _dynamic_map = {
                 2.5: {"breakeven_trigger_r": 1.25, "stagnation_after_r": 2.0, "stagnation_candles": 12},
                 3.0: {"breakeven_trigger_r": 1.25, "stagnation_after_r": 2.0, "stagnation_candles": 12},
-                # Additional thresholds can be added here if needed
             }
             cfg = _dynamic_map.get(args.dynamic_threshold)
             if cfg:
                 merged_overrides.update({k: v for k, v in cfg.items() if v is not None})
-        elif args.window_config:
-            if rp.breakeven_trigger_r is not None and "breakeven_trigger_r" not in merged_overrides:
-                merged_overrides["breakeven_trigger_r"] = rp.breakeven_trigger_r
-            if rp.stagnation_after_r is not None and "stagnation_after_r" not in merged_overrides:
-                merged_overrides["stagnation_after_r"] = rp.stagnation_after_r
-            if rp.stagnation_candles is not None and "stagnation_candles" not in merged_overrides:
-                merged_overrides["stagnation_candles"] = rp.stagnation_candles
 
         trade = _simulate_trade(signal, candles, index, args, regime, merged_overrides, window_bear=window_bear)
         if trade is None:
@@ -2575,9 +2556,15 @@ def _simulate_exit(
         # original stop has priority on the bar where a rung first activates.
         if initial_risk > 0:
             pairs = profit_lock_pairs if profit_lock_pairs is not None else (getattr(args, "profit_lock_pairs", None) or [])
-            _effective_br = breakeven_trigger_r if breakeven_trigger_r is not None else args.breakeven_trigger_r
-            if not pairs and _effective_br > 0:
-                pairs = [(_effective_br, 0.0)]
+            # Gate on the EFFECTIVE per-trade breakeven trigger (from window_config /
+            # overrides), falling back to the CLI default — exactly like the live bot
+            # (_maybe_reposition_sl gates on item["breakeven_trigger_r"]). Do NOT add a
+            # separate args.breakeven_trigger_r>0 outer guard: live has no such guard,
+            # so it would desync live and backtest breakeven behaviour.
+            if not pairs:
+                _br = breakeven_trigger_r if breakeven_trigger_r is not None else args.breakeven_trigger_r
+                if _br and _br > 0:
+                    pairs = [(_br, 0.0)]
             if pairs:
                 if side == "LONG":
                     best_lock = 0.0

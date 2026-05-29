@@ -4923,44 +4923,25 @@ def _btc_regime_quality_reject_reason(
 
     regime_cfg = getattr(args, "regime_override_map", {}).get(btc_regime, {})
 
-    # HP_INST_REL (relative strength) gate: check overrides, CLI args, or default to 3.0
+    # NOTE: This mirrors the backtest INSTANT entry gates exactly
+    # (screener/backtest.py _backtest_symbol). Only the relative-momentum and
+    # volume-ratio gates are enforced. The window_config "quality" filters
+    # (instant_min_score, instant_min/max_reward_risk, instant_max_btc_momentum_pct)
+    # are deliberately NOT applied — cross-window validation showed they filter out
+    # winning trades. Keep this in lockstep with the backtest so live trades match
+    # the validated backtest.
+
+    # HP_INST_REL (relative momentum) gate: regime override > env-equivalent > 3.0
     _regime_hp_ir = regime_cfg.get("HP_INST_REL")
-    _default_ir = getattr(args, "bull_strong_instant_min_rel_strength_pct", 8.0) if btc_regime == "BULL_STRONG" else 3.0
-    _ir = float(_regime_hp_ir) if _regime_hp_ir is not None else _default_ir
+    _ir = float(_regime_hp_ir) if _regime_hp_ir is not None else 3.0
     if rel_strength < _ir:
         return f"BTC {btc_regime} quality blocked INSTANT rel strength {rel_strength:.2f}% < {_ir:.2f}%"
 
-    # HP_INST_VOL (volume ratio) gate: check overrides, CLI args, or default to 3.5
+    # HP_INST_VOL (volume ratio) gate: regime override > env-equivalent > 3.5
     _regime_hp_iv = regime_cfg.get("HP_INST_VOL")
-    _default_iv = getattr(args, "bull_strong_instant_min_volume_ratio", 3.5) if btc_regime == "BULL_STRONG" else 3.5
-    _iv = float(_regime_hp_iv) if _regime_hp_iv is not None else _default_iv
+    _iv = float(_regime_hp_iv) if _regime_hp_iv is not None else 3.5
     if signal.volume_ratio < _iv:
         return f"BTC {btc_regime} quality blocked INSTANT volume {signal.volume_ratio:.2f}x < {_iv:.2f}x"
-
-    # Extra quality filters: check overrides, or fall back to default CLI args if btc_regime == "BULL_STRONG"
-    min_score = regime_cfg.get("instant_min_score")
-    if min_score is None and btc_regime == "BULL_STRONG":
-        min_score = getattr(args, "bull_strong_instant_min_score", 94.0)
-    if min_score is not None and signal.score < float(min_score):
-        return f"BTC {btc_regime} quality blocked INSTANT score {signal.score:.1f} < {float(min_score):.1f}"
-
-    min_rr = regime_cfg.get("instant_min_reward_risk")
-    if min_rr is None and btc_regime == "BULL_STRONG":
-        min_rr = getattr(args, "bull_strong_instant_min_rr", 1.4)
-    if min_rr is not None and signal.reward_risk < float(min_rr):
-        return f"BTC {btc_regime} quality blocked INSTANT R/R {signal.reward_risk:.2f} < {float(min_rr):.2f}"
-
-    max_rr = regime_cfg.get("instant_max_reward_risk")
-    if max_rr is None and btc_regime == "BULL_STRONG":
-        max_rr = getattr(args, "bull_strong_instant_max_rr", 2.5)
-    if max_rr is not None and signal.reward_risk > float(max_rr):
-        return f"BTC {btc_regime} quality blocked INSTANT R/R {signal.reward_risk:.2f} > {float(max_rr):.2f}"
-
-    max_btc = regime_cfg.get("instant_max_btc_momentum_pct")
-    if max_btc is None and btc_regime == "BULL_STRONG":
-        max_btc = getattr(args, "bull_strong_instant_max_btc_momentum_pct", 8.0)
-    if max_btc is not None and btc_momentum > float(max_btc):
-        return f"BTC {btc_regime} quality blocked INSTANT BTC momentum {btc_momentum:.2f}% > {float(max_btc):.2f}%"
 
     return ""
 

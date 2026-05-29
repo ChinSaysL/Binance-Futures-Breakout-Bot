@@ -57,7 +57,11 @@ class LiveBtcRegimeGuardTests(unittest.TestCase):
         context["_btc_range_pos_60d"] = 0.79
         self.assertEqual(cli._btc_regime_from_context(context), "BULL_RECOVERY")
 
-    def test_btc_regime_guard_uses_quality_filter_in_bull_strong(self):
+    def test_btc_regime_quality_filter_matches_backtest_gates(self):
+        # The live quality gate must mirror the backtest INSTANT entry gates:
+        # only relative-momentum (HP_INST_REL) and volume-ratio (HP_INST_VOL) are
+        # enforced. The score/RR/BTC-momentum "quality" filters were removed because
+        # cross-window validation showed they filter out winning trades.
         args = Namespace(
             btc_market_guards=True,
             btc_regime_guards=True,
@@ -66,17 +70,23 @@ class LiveBtcRegimeGuardTests(unittest.TestCase):
                 "_btc_return_7d_pct": 2.1,
                 "feat_btc_momentum_pct": 3.0,
             },
+            # rel momentum 7.0 clears the default 3.0 gate; no regime override map.
             _live_ml_signal_contexts={("TESTUSDT", "1h"): {"feat_rel_momentum_pct": 7.0, "feat_btc_momentum_pct": 3.0}},
+            regime_override_map={},
         )
 
         self.assertEqual(cli._btc_regime_guard_reject_reason("INSTANT", args), "")
-        self.assertIn("BULL_STRONG", cli._btc_regime_quality_reject_reason(_signal(), "INSTANT", args))
-        self.assertEqual(cli._btc_regime_guard_reject_reason("STRICT_RETEST", args), "")
-
-        args._live_ml_signal_contexts = {
-            ("TESTUSDT", "1h"): {"feat_rel_momentum_pct": 9.0, "feat_btc_momentum_pct": 3.0}
-        }
+        # Score 95 / RR 2.0 / BTC momentum 3.0 would all have been blocked by the
+        # old BULL_STRONG quality filters; now only rel/vol gate, which passes.
         self.assertEqual(cli._btc_regime_quality_reject_reason(_signal(), "INSTANT", args), "")
+
+        # A regime override raising HP_INST_REL to 8.0 blocks rel momentum 7.0.
+        args.regime_override_map = {"BULL_STRONG": {"HP_INST_REL": 8.0}}
+        self.assertIn("rel strength", cli._btc_regime_quality_reject_reason(_signal(), "INSTANT", args))
+
+        # Low volume signal blocked by the HP_INST_VOL gate (default 3.5).
+        args.regime_override_map = {}
+        self.assertIn("volume", cli._btc_regime_quality_reject_reason(_signal(volume_ratio=2.0), "INSTANT", args))
 
     def test_btc_range_position_from_candles_uses_close(self):
         from screener.breakout import Candle
