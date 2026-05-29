@@ -5,7 +5,7 @@
       "HP_INST_REL": 4.0,
       "HP_INST_VOL": 3.5,
       "breakeven_trigger_r": 0.0,
-      "stagnation_after_r": 0.5,
+      "stagnation_after_r": 2.0,
       "stagnation_candles": 12,
       "max_sl_loss_pct": 40.0
     }
@@ -20,7 +20,7 @@
       "instant_max_reward_risk": 2.5,
       "instant_max_btc_momentum_pct": 8.0,
       "breakeven_trigger_r": 1.0,
-      "stagnation_after_r": 0.5,
+      "stagnation_after_r": 2.0,
       "stagnation_candles": 12,
       "max_sl_loss_pct": 50.0
     }
@@ -31,7 +31,7 @@
       "HP_INST_REL": 4.0,
       "HP_INST_VOL": 3.5,
       "breakeven_trigger_r": 1.0,
-      "stagnation_after_r": 0.5,
+      "stagnation_after_r": 2.0,
       "stagnation_candles": 12,
       "max_sl_loss_pct": 50.0
     }
@@ -42,7 +42,7 @@
       "HP_INST_REL": 5.0,
       "HP_INST_VOL": 3.0,
       "breakeven_trigger_r": 0.0,
-      "stagnation_after_r": 0.5,
+      "stagnation_after_r": 2.0,
       "stagnation_candles": 12,
       "max_sl_loss_pct": 50.0
     }
@@ -53,7 +53,7 @@
       "HP_INST_REL": 3.0,
       "HP_INST_VOL": 3.5,
       "breakeven_trigger_r": 0.0,
-      "stagnation_after_r": 0.5,
+      "stagnation_after_r": 2.0,
       "stagnation_candles": 12,
       "max_sl_loss_pct": 50.0
     }

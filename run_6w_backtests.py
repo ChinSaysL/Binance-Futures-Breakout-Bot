@@ -35,7 +35,7 @@ BASE_CMD = [
     "--stagnation-candles", "12",
     "--leverage", "10",
     "--max-sl-loss-pct", "50",
-    "--runner-pct", "50",
+    "--runner-pct", "65",
     "--bear-profile",
     "--offline-cache-dir", "_kline_cache",
     "--window-config", "window_config.json",
