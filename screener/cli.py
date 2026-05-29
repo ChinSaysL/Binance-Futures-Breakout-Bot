@@ -4867,6 +4867,8 @@ def _btc_regime_from_context(context: dict[str, float]) -> str:
         return "BEAR_CRASH"
     if pos < 0.40 and ret_7 >= 3.0:
         return "BEAR_RECOVERY"
+    if pos < 0.40 and ret_7 >= 1.5:
+        return "BULL_RECOVERY"  # mirror backtest _classify_regime: rally off lows
     if pos < 0.40:
         return "BEAR_GRIND"
     if pos >= 0.80 and ret_7 >= 1.0:

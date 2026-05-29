@@ -1409,6 +1409,10 @@ def _classify_regime(timestamp: int, market_trend: MarketTrend | None) -> str:
         return "BEAR_CRASH"               # W5-style
     if pos < 0.40 and ret_7 >= 3.0:
         return "BEAR_RECOVERY"            # W1's recovery phase, W6 cold open
+    if pos < 0.40 and ret_7 >= 1.5:
+        return "BULL_RECOVERY"            # strong rally off lows — treat as a real
+                                          # recovery (correct sizing/exits), not a
+                                          # bear grind just because 60d-range is low.
     if pos < 0.40:
         return "BEAR_GRIND"               # W2-style: low but stable
 
@@ -3170,6 +3174,18 @@ def _position_pct_for_trade(equity: float, peak: float, trade: BacktestTrade, ar
         # whipsaves in crashes).
         if trade.side == "SHORT":
             pct = min(pct, 12.0)
+        # INSTANT is a high-variance coin-flip with deep outlier losers; size it
+        # down like moonshot/aggressive do (auto previously skipped this).
+        if trade.regime == "INSTANT":
+            pct *= args.instant_size_multiplier
+        # Drawdown circuit-breaker: hard ceiling (not a floor) so deep DD actually
+        # de-risks instead of spiralling. Viable at >=~$40 start without tripping
+        # Binance's $5 min-notional.
+        drawdown = (peak - equity) / peak * 100.0 if peak > 0 else 0.0
+        if drawdown >= 45.0:
+            pct = min(pct, 10.0)
+        elif drawdown >= 30.0:
+            pct = min(pct, 14.0)
         pct = max(pct, 8.0)
         pct *= trade.sizing_scale
         return pct
