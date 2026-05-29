@@ -602,6 +602,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--order-margin", type=float, default=0.0, help="Approximate USDT margin per entry order. Position notional is margin multiplied by --leverage. Ignored when --sizing-mode auto sets margin from current equity.")
     parser.add_argument("--sizing-mode", choices=["fixed", "auto"], default="fixed", help="fixed = use --order-margin per trade; auto = size each trade from current wallet equity using the backtested absolute-equity tiers and drawdown-aware floor.")
     parser.add_argument("--equity-peak-file", default=".equity_peak.json", help="Path to JSON state file storing the running equity peak for the --sizing-mode auto drawdown haircut. Reset by deleting this file.")
+    parser.add_argument("--instant-size-multiplier", type=float, default=0.4, help="Auto-sizing multiplier for INSTANT regimes (higher-variance entries). Mirrors the backtest default (0.4) so live position sizing matches the validated backtest.")
     parser.add_argument("--leverage", type=int, default=0, help="Set initial leverage for each ordered symbol before placing the entry order.")
     parser.add_argument("--dynamic-leverage", action="store_true", help="Scale leverage per coin from ATR volatility and stop distance. --leverage sets the base (default 10 when enabled).")
     parser.add_argument("--max-sl-loss-pct", type=float, default=50.0, help="Maximum leveraged loss percent on margin if the stop loss is hit. Use 0 to disable leverage-aware stop tightening.")
@@ -1103,6 +1104,20 @@ def place_best_orders(
         if chop_reason := _btc_chop_guard_reject_reason(signal, entry_regime, btc_guard_point, args):
             failures.append(f"{signal.symbol}@{signal.interval}: skipped after recheck, {chop_reason}")
             continue
+
+        # ── Per-signal auto-sizing adjustments (mirror backtest _position_pct_for_trade) ──
+        # The base auto_margin is the equity-curve margin; the backtest then caps
+        # SHORTs and down-sizes the higher-variance INSTANT regime per trade. Apply
+        # the same here so live position sizing matches the validated backtest.
+        if auto_margin > 0:
+            _eq = _current_equity(account or {})
+            adj_margin = auto_margin
+            if signal.side == "SHORT" and _eq > 0:
+                adj_margin = min(adj_margin, _eq * 0.12)  # backtest SHORT cap = 12% of equity
+            if entry_regime == "INSTANT":
+                adj_margin *= getattr(args, "instant_size_multiplier", 0.4)
+            effective_margin = adj_margin
+            effective_notional = adj_margin * effective_leverage
 
         if (
             args.live_orders
@@ -4591,6 +4606,12 @@ def _auto_margin_for_equity(equity: float, peak: float) -> float:
         pct = max(base * 0.55, 10.0)
     else:
         pct = max(base * 0.40, 8.0)
+    # Drawdown circuit-breaker — hard ceiling, mirrors backtest _position_pct_for_trade
+    # so live de-risks deep drawdowns the same way the validated backtest does.
+    if drawdown >= 45.0:
+        pct = min(pct, 10.0)
+    elif drawdown >= 30.0:
+        pct = min(pct, 14.0)
     pct = min(pct, 55.0)
     return equity * pct / 100.0
 

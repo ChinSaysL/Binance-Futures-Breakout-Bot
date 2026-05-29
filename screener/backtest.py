@@ -296,7 +296,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--win-cooldown-candles-15m", type=int, default=None, help="Win cooldown candles for 15m timeframe. If None, inherits --win-cooldown-candles.")
     parser.add_argument("--win-cooldown-candles-1h", type=int, default=None, help="Win cooldown candles for 1h timeframe. If None, inherits --win-cooldown-candles.")
     parser.add_argument("--win-cooldown-candles-4h", type=int, default=None, help="Win cooldown candles for 4h timeframe. If None, inherits --win-cooldown-candles.")
-    parser.add_argument("--instant-size-multiplier", type=float, default=0.5, help="Moonshot sizing multiplier for INSTANT regimes.")
+    parser.add_argument("--instant-size-multiplier", type=float, default=0.4, help="Sizing multiplier for INSTANT regimes (higher-variance coin-flip entries). Walk-forward cross-validated (2024 H1/H2 folds): 0.4 beat 0.5/0.7 on the worst fold and improved full-2024 OOS to $637 @ 34.3%% DD.")
     parser.add_argument("--retest-size-multiplier", type=float, default=0.9, help="Moonshot sizing multiplier for RETEST regimes.")
     parser.add_argument("--trailing-retest-size-multiplier", type=float, default=0.5, help="Moonshot sizing multiplier for TRAILING_RETEST regimes.")
     parser.add_argument("--timeout", type=float, default=10.0, help="HTTP timeout seconds.")
