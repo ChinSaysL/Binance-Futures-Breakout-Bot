@@ -1902,13 +1902,17 @@ def _backtest_symbol(
             if max_btc_momentum is not None and btc_momentum > float(max_btc_momentum):
                 index += 1
                 continue
-            if rp.instant_min_rel_mom is not None:
+            _ir = regime_cfg.get("HP_INST_REL")
+            _effective_ir = float(_ir) if _ir is not None else rp.instant_min_rel_mom
+            if _effective_ir is not None:
                 rel_mom = context_features.get("feat_rel_momentum_pct", 0.0)
-                if rel_mom < rp.instant_min_rel_mom:
+                if rel_mom < _effective_ir:
                     index += 1
                     continue
-            if rp.instant_min_vol_ratio is not None:
-                if signal.volume_ratio < rp.instant_min_vol_ratio:
+            _iv = regime_cfg.get("HP_INST_VOL")
+            _effective_iv = float(_iv) if _iv is not None else rp.instant_min_vol_ratio
+            if _effective_iv is not None:
+                if signal.volume_ratio < _effective_iv:
                     index += 1
                     continue
 
@@ -2067,11 +2071,15 @@ def _backtest_symbol(
 
         # ── Merged overrides combining bear_overrides and rp overrides ──
         merged_overrides = dict(bear_overrides) if bear_overrides else {}
-        # Apply regime-based config overrides if any
+        # Apply regime-based config overrides if any (highest priority)
         if regime_cfg:
             merged_overrides.update({k: v for k, v in regime_cfg.items() if v is not None})
-        if rp.max_sl_loss_pct is not None:
-            merged_overrides["max_sl_loss_pct"] = rp.max_sl_loss_pct
+        
+        # Apply default rp (REGIME_PARAMS) values only if not already defined in merged_overrides
+        # AND only if window_config is loaded (otherwise, we want to respect global CLI parameters)
+        if args.window_config:
+            if rp.max_sl_loss_pct is not None and "max_sl_loss_pct" not in merged_overrides:
+                merged_overrides["max_sl_loss_pct"] = rp.max_sl_loss_pct
 
         # Apply dynamic exit overrides if the CLI flag is set
         if args.dynamic_threshold is not None:
@@ -2084,12 +2092,12 @@ def _backtest_symbol(
             cfg = _dynamic_map.get(args.dynamic_threshold)
             if cfg:
                 merged_overrides.update({k: v for k, v in cfg.items() if v is not None})
-        else:
-            if rp.breakeven_trigger_r is not None:
+        elif args.window_config:
+            if rp.breakeven_trigger_r is not None and "breakeven_trigger_r" not in merged_overrides:
                 merged_overrides["breakeven_trigger_r"] = rp.breakeven_trigger_r
-            if rp.stagnation_after_r is not None:
+            if rp.stagnation_after_r is not None and "stagnation_after_r" not in merged_overrides:
                 merged_overrides["stagnation_after_r"] = rp.stagnation_after_r
-            if rp.stagnation_candles is not None:
+            if rp.stagnation_candles is not None and "stagnation_candles" not in merged_overrides:
                 merged_overrides["stagnation_candles"] = rp.stagnation_candles
 
         trade = _simulate_trade(signal, candles, index, args, regime, merged_overrides, window_bear=window_bear)
@@ -2567,10 +2575,9 @@ def _simulate_exit(
         # original stop has priority on the bar where a rung first activates.
         if initial_risk > 0:
             pairs = profit_lock_pairs if profit_lock_pairs is not None else (getattr(args, "profit_lock_pairs", None) or [])
-            if not pairs and args.breakeven_trigger_r > 0:
-                _br = breakeven_trigger_r if breakeven_trigger_r is not None else args.breakeven_trigger_r
-                if _br > 0:
-                    pairs = [(_br, 0.0)]
+            _effective_br = breakeven_trigger_r if breakeven_trigger_r is not None else args.breakeven_trigger_r
+            if not pairs and _effective_br > 0:
+                pairs = [(_effective_br, 0.0)]
             if pairs:
                 if side == "LONG":
                     best_lock = 0.0

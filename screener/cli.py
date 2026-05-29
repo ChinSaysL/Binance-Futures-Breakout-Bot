@@ -591,6 +591,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--retries", type=int, default=2, help="Retries for transient request errors.")
     parser.add_argument("--rate-limit-rpm", type=float, default=1100.0, help="Max Binance requests per minute. Stays under Binance's 2400/min IP cap so scans do not get 429'd. 0 disables.")
     parser.add_argument("--env-file", type=Path, default=Path(".env"), help="Path to .env file with Binance API credentials.")
+    parser.add_argument("--window-config", type=str, default=None, help="Path to JSON file mapping window start/end dates to exit overrides.")
 
     parser.add_argument("--scan-interval-minutes", type=int, default=3, help="How often the auto-trader scans for new opportunities. Default 3 - a slow scan discovers fast breakouts after the move is over.")
     parser.add_argument("--live-orders", action="store_true", help="Deprecated/no-op: the auto-trader always trades live. Use --testnet for a safe environment.")
@@ -775,6 +776,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.trailing_runner_pct = 0.0
     if not args.no_exits:
         args.tp_splits_pct, args.trailing_runner_pct = _resolve_exit_splits(args, parser)
+
+    # Load regime-based overrides configuration if --window-config is supplied
+    import json
+    if getattr(args, "window_config", ""):
+        try:
+            with open(args.window_config, "r", encoding="utf-8") as f:
+                raw_cfg = json.load(f)
+        except Exception as exc:
+            parser.error(f"Failed to load window-config {args.window_config}: {exc}")
+        args.regime_override_map = {}
+        for win_name, win_def in raw_cfg.items():
+            regime = win_def.get("regime")
+            if not regime:
+                continue
+            overrides = args.regime_override_map.get(regime, {})
+            overrides.update(_normalize_regime_overrides(win_def.get("overrides", {})))
+            args.regime_override_map[regime] = overrides
+    else:
+        args.regime_override_map = {}
+
     return args
 
 
@@ -2260,6 +2281,29 @@ def _scan_and_arm(client: BinanceClient, args: argparse.Namespace, settings: Bre
                     pass
         signals.extend(short_signals)
 
+    # ── BTC Regime-Aware Direction Filters ───────────────────────────
+    if getattr(args, "btc_market_guards", True):
+        REGIME_DIRECTIONS = {
+            "BULL_STRONG":   {"allow_long": True,  "allow_short": False},
+            "BULL_RECOVERY": {"allow_long": True,  "allow_short": False},
+            "BULL_CHOP":     {"allow_long": True,  "allow_short": False},
+            "BEAR_GRIND":    {"allow_long": True,  "allow_short": True},
+            "BEAR_CRASH":    {"allow_long": False, "allow_short": True},
+            "BEAR_RECOVERY": {"allow_long": True,  "allow_short": True},
+        }
+        btc_context = getattr(args, "_live_ml_btc_context", {}) or {}
+        btc_regime = _btc_regime_from_context(btc_context) if btc_context else "BULL_CHOP"
+        directions = REGIME_DIRECTIONS.get(btc_regime, {"allow_long": True, "allow_short": False})
+        
+        filtered = []
+        for s in signals:
+            if s.side == "LONG" and not directions["allow_long"]:
+                continue
+            if s.side == "SHORT" and not directions["allow_short"]:
+                continue
+            filtered.append(s)
+        signals = filtered
+
     _rank_order_signals(signals, args)
     if not signals:
         _quiet_scan_heartbeat()
@@ -3730,8 +3774,8 @@ def _maybe_stagnation_exit(
     backtest.py:1518-1533, without the buggy 4-candle rejection-candle path that
     makes --exhaustion-exit cut breakout consolidations short.
     """
-    after_r = _safe_float(args.stagnation_after_r)
-    stall_n = int(args.stagnation_candles)
+    after_r = _safe_float(item.get("stagnation_after_r") if item.get("stagnation_after_r") is not None else getattr(args, "stagnation_after_r", 1.0))
+    stall_n = int(item.get("stagnation_candles") if item.get("stagnation_candles") is not None else getattr(args, "stagnation_candles", 12))
     if after_r <= 0 or stall_n < 1:
         return False
     symbol = str(item.get("symbol", ""))
@@ -3745,7 +3789,7 @@ def _maybe_stagnation_exit(
 
     now_ms = int(time.time() * 1000)
     try:
-        lookback = max(int(args.stagnation_lookback), stall_n + 5, 10)
+        lookback = max(int(getattr(args, "stagnation_lookback", 80)), stall_n + 5, 10)
         klines = client.klines(symbol, interval, lookback)
     except BinanceClientError as exc:
         failures.append(f"{symbol}@{interval} stagnation check: {exc}")
@@ -4010,7 +4054,7 @@ def _place_entry_order(
 def _software_trail_metadata(args: argparse.Namespace, signal: BreakoutSignal, entry_quantity: str) -> dict[str, object] | None:
     """Build software trail config to store with the pending entry. The bot
     tracks the trail itself instead of placing a Binance TRAILING_STOP_MARKET."""
-    if not args.trailing_stop or not getattr(args, "software_trail", False):
+    if not getattr(args, "trailing_stop", False) or not getattr(args, "software_trail", False):
         return None
     callback = _resolve_callback_pct(signal.atr_pct, args)
     gate_r = getattr(args, "trail_activation_r", 0.0)
@@ -4020,8 +4064,17 @@ def _software_trail_metadata(args: argparse.Namespace, signal: BreakoutSignal, e
         "callback_pct": callback,
         "trail_activation_r": gate_r,
         "entry_quantity": entry_quantity,
-        "runner_pct": args.trailing_quantity_pct,
+        "runner_pct": getattr(args, "trailing_quantity_pct", 50.0),
     }
+
+
+def _resolve_regime_overrides(signal: BreakoutSignal, args: argparse.Namespace) -> dict[str, float]:
+    btc_context = getattr(args, "_live_ml_btc_context", {}) or {}
+    btc_regime = _btc_regime_from_context(btc_context) if btc_context else ""
+    if not btc_regime:
+        return {}
+    regime_overrides = getattr(args, "regime_override_map", {}).get(btc_regime, {})
+    return regime_overrides or {}
 
 
 def _save_pending_entry_plan(
@@ -4035,6 +4088,12 @@ def _save_pending_entry_plan(
     bracket_id: str = "",
 ) -> None:
     pending = _load_pending_entry_plans(path)
+    regime_overrides = _resolve_regime_overrides(signal, args)
+    _breakeven_r = regime_overrides.get("breakeven_trigger_r", getattr(args, "breakeven_trigger_r", 0.0))
+    _stag_after_r = regime_overrides.get("stagnation_after_r", getattr(args, "stagnation_after_r", 1.0))
+    _stag_candles = regime_overrides.get("stagnation_candles", getattr(args, "stagnation_candles", 12))
+    _max_sl = regime_overrides.get("max_sl_loss_pct", getattr(args, "max_sl_loss_pct", 50.0))
+
     pending.append(
         {
             "created_at": int(time.time()),
@@ -4042,39 +4101,40 @@ def _save_pending_entry_plan(
             "symbol": signal.symbol,
             "side": signal.side,
             "interval": signal.interval,
-            "hedge_mode": args.hedge_mode,
+            "hedge_mode": getattr(args, "hedge_mode", False),
             "binance_side": entry_plan.binance_side,
             "quantity": entry_plan.quantity,
             "trigger_price": entry_plan.trigger_price,
             "limit_price": entry_plan.limit_price,
-            "retest_timeout_seconds": args.retest_timeout_seconds,
-            "entry_stale_minutes": args.entry_stale_minutes,
+            "retest_timeout_seconds": getattr(args, "retest_timeout_seconds", 300.0),
+            "entry_stale_minutes": getattr(args, "entry_stale_minutes", 30.0),
             "entry_client_order_id": entry_plan.client_order_id,
-            "leverage": leverage or args.leverage,
-            "margin_type": args.margin_type or "",
-            "max_concurrent_orders": args.max_concurrent_orders,
-            "max_market_deviation_pct": args.max_market_deviation_pct,
-            "no_market_fallback": args.no_market_fallback,
+            "leverage": leverage or getattr(args, "leverage", 10),
+            "margin_type": getattr(args, "margin_type", "") or "",
+            "max_concurrent_orders": getattr(args, "max_concurrent_orders", 5),
+            "max_market_deviation_pct": getattr(args, "max_market_deviation_pct", 1.5),
+            "no_market_fallback": getattr(args, "no_market_fallback", False),
             "entry_regime": entry_regime,
             "trailing_retest_band_pct": _trailing_retest_band_pct(signal) if entry_regime == "TRAILING_RETEST" else 0.0,
             "bracket_id": bracket_id,
             "momentum_score": round(_momentum_score(signal), 4),
             "ml_rank_score": round(_live_ml_rank_score(signal, args), 6) if getattr(args, "ml_rank_model_data", None) else 0.0,
-            "ml_rank_score_name": args.ml_rank_score if getattr(args, "ml_rank_model_data", None) else "",
-            "dynamic_sl": args.dynamic_sl,
-            "sl_update_interval_seconds": args.sl_update_interval_seconds,
-            "sl_lookback": args.sl_lookback,
-            "exhaustion_exit": args.exhaustion_exit,
-            "exhaustion_lookback": args.exhaustion_lookback,
-            "stagnation_after_r": args.stagnation_after_r,
-            "stagnation_candles": args.stagnation_candles,
-            "stagnation_lookback": args.stagnation_lookback,
-            "max_sl_loss_pct": args.max_sl_loss_pct,
-            "software_trail": _software_trail_metadata(args, signal, entry_plan.quantity) if args.trailing_stop and getattr(args, "software_trail", False) else None,
-            "smart_tp": args.smart_tp,
-            "smart_tp_max_target_multiplier": args.smart_tp_max_target_multiplier,
-            "smart_tp_min_runner_pct": args.smart_tp_min_runner_pct,
-            "smart_tp_max_runner_pct": args.smart_tp_max_runner_pct,
+            "ml_rank_score_name": getattr(args, "ml_rank_score", "") if getattr(args, "ml_rank_model_data", None) else "",
+            "dynamic_sl": getattr(args, "dynamic_sl", False),
+            "sl_update_interval_seconds": getattr(args, "sl_update_interval_seconds", 300.0),
+            "sl_lookback": getattr(args, "sl_lookback", 20),
+            "exhaustion_exit": getattr(args, "exhaustion_exit", False),
+            "exhaustion_lookback": getattr(args, "exhaustion_lookback", 80),
+            "breakeven_trigger_r": _breakeven_r,
+            "stagnation_after_r": _stag_after_r,
+            "stagnation_candles": _stag_candles,
+            "stagnation_lookback": getattr(args, "stagnation_lookback", 80),
+            "max_sl_loss_pct": _max_sl,
+            "software_trail": _software_trail_metadata(args, signal, entry_plan.quantity) if getattr(args, "trailing_stop", False) and getattr(args, "software_trail", False) else None,
+            "smart_tp": getattr(args, "smart_tp", False),
+            "smart_tp_max_target_multiplier": getattr(args, "smart_tp_max_target_multiplier", 2.5),
+            "smart_tp_min_runner_pct": getattr(args, "smart_tp_min_runner_pct", 20.0),
+            "smart_tp_max_runner_pct": getattr(args, "smart_tp_max_runner_pct", 55.0),
             "exit_plans": _serialize_exit_plans(exit_plans),
         }
     )
@@ -4092,6 +4152,12 @@ def _save_pending_exit_plans(
 ) -> None:
     pending = _load_pending_exit_plans(path)
     now = int(time.time())
+    regime_overrides = _resolve_regime_overrides(signal, args)
+    _breakeven_r = regime_overrides.get("breakeven_trigger_r", getattr(args, "breakeven_trigger_r", 0.0))
+    _stag_after_r = regime_overrides.get("stagnation_after_r", getattr(args, "stagnation_after_r", 1.0))
+    _stag_candles = regime_overrides.get("stagnation_candles", getattr(args, "stagnation_candles", 12))
+    _max_sl = regime_overrides.get("max_sl_loss_pct", getattr(args, "max_sl_loss_pct", 50.0))
+
     pending.append(
         {
             "created_at": now,
@@ -4099,37 +4165,38 @@ def _save_pending_exit_plans(
             "symbol": signal.symbol,
             "side": signal.side,
             "interval": signal.interval,
-            "hedge_mode": args.hedge_mode,
+            "hedge_mode": getattr(args, "hedge_mode", False),
             "binance_side": entry_plan.binance_side,
             "quantity": entry_plan.quantity,
             "trigger_price": entry_plan.trigger_price,
             "limit_price": entry_plan.limit_price,
-            "retest_timeout_seconds": args.retest_timeout_seconds,
-            "entry_stale_minutes": args.entry_stale_minutes,
+            "retest_timeout_seconds": getattr(args, "retest_timeout_seconds", 300.0),
+            "entry_stale_minutes": getattr(args, "entry_stale_minutes", 30.0),
             "entry_client_order_id": entry_plan.client_order_id,
-            "leverage": leverage or args.leverage,
-            "margin_type": args.margin_type or "",
-            "max_concurrent_orders": args.max_concurrent_orders,
-            "max_market_deviation_pct": args.max_market_deviation_pct,
-            "no_market_fallback": args.no_market_fallback,
+            "leverage": leverage or getattr(args, "leverage", 10),
+            "margin_type": getattr(args, "margin_type", "") or "",
+            "max_concurrent_orders": getattr(args, "max_concurrent_orders", 5),
+            "max_market_deviation_pct": getattr(args, "max_market_deviation_pct", 1.5),
+            "no_market_fallback": getattr(args, "no_market_fallback", False),
             "entry_regime": entry_regime,
             "momentum_score": round(_momentum_score(signal), 4),
             "ml_rank_score": round(_live_ml_rank_score(signal, args), 6) if getattr(args, "ml_rank_model_data", None) else 0.0,
-            "ml_rank_score_name": args.ml_rank_score if getattr(args, "ml_rank_model_data", None) else "",
-            "dynamic_sl": args.dynamic_sl,
-            "sl_update_interval_seconds": args.sl_update_interval_seconds,
-            "sl_lookback": args.sl_lookback,
-            "exhaustion_exit": args.exhaustion_exit,
-            "exhaustion_lookback": args.exhaustion_lookback,
-            "stagnation_after_r": args.stagnation_after_r,
-            "stagnation_candles": args.stagnation_candles,
-            "stagnation_lookback": args.stagnation_lookback,
-            "max_sl_loss_pct": args.max_sl_loss_pct,
-            "software_trail": _software_trail_metadata(args, signal, entry_plan.quantity) if args.trailing_stop and getattr(args, "software_trail", False) else None,
-            "smart_tp": args.smart_tp,
-            "smart_tp_max_target_multiplier": args.smart_tp_max_target_multiplier,
-            "smart_tp_min_runner_pct": args.smart_tp_min_runner_pct,
-            "smart_tp_max_runner_pct": args.smart_tp_max_runner_pct,
+            "ml_rank_score_name": getattr(args, "ml_rank_score", "") if getattr(args, "ml_rank_model_data", None) else "",
+            "dynamic_sl": getattr(args, "dynamic_sl", False),
+            "sl_update_interval_seconds": getattr(args, "sl_update_interval_seconds", 300.0),
+            "sl_lookback": getattr(args, "sl_lookback", 20),
+            "exhaustion_exit": getattr(args, "exhaustion_exit", False),
+            "exhaustion_lookback": getattr(args, "exhaustion_lookback", 80),
+            "breakeven_trigger_r": _breakeven_r,
+            "stagnation_after_r": _stag_after_r,
+            "stagnation_candles": _stag_candles,
+            "stagnation_lookback": getattr(args, "stagnation_lookback", 80),
+            "max_sl_loss_pct": _max_sl,
+            "software_trail": _software_trail_metadata(args, signal, entry_plan.quantity) if getattr(args, "trailing_stop", False) and getattr(args, "software_trail", False) else None,
+            "smart_tp": getattr(args, "smart_tp", False),
+            "smart_tp_max_target_multiplier": getattr(args, "smart_tp_max_target_multiplier", 2.5),
+            "smart_tp_min_runner_pct": getattr(args, "smart_tp_min_runner_pct", 20.0),
+            "smart_tp_max_runner_pct": getattr(args, "smart_tp_max_runner_pct", 55.0),
             "exit_plans": _serialize_exit_plans(exit_plans),
         }
     )
@@ -4842,8 +4909,9 @@ def _btc_regime_quality_reject_reason(
     if entry_regime != "INSTANT":
         return ""
     btc_context = getattr(args, "_live_ml_btc_context", {}) or {}
-    if not btc_context or _btc_regime_from_context(btc_context) != "BULL_STRONG":
+    if not btc_context:
         return ""
+    btc_regime = _btc_regime_from_context(btc_context)
 
     signal_context = _signal_context_for(signal, args)
     btc_momentum = _safe_float(signal_context.get("feat_btc_momentum_pct"))
@@ -4853,29 +4921,46 @@ def _btc_regime_quality_reject_reason(
     if not signal_context:
         rel_strength = signal.price_change_pct_24h - btc_momentum
 
-    min_rel = getattr(args, "bull_strong_instant_min_rel_strength_pct", 8.0)
-    if min_rel is not None and rel_strength < float(min_rel):
-        return f"BTC BULL_STRONG quality blocked INSTANT rel strength {rel_strength:.2f}% < {float(min_rel):.2f}%"
+    regime_cfg = getattr(args, "regime_override_map", {}).get(btc_regime, {})
 
-    min_score = getattr(args, "bull_strong_instant_min_score", 94.0)
+    # HP_INST_REL (relative strength) gate: check overrides, CLI args, or default to 3.0
+    _regime_hp_ir = regime_cfg.get("HP_INST_REL")
+    _default_ir = getattr(args, "bull_strong_instant_min_rel_strength_pct", 8.0) if btc_regime == "BULL_STRONG" else 3.0
+    _ir = float(_regime_hp_ir) if _regime_hp_ir is not None else _default_ir
+    if rel_strength < _ir:
+        return f"BTC {btc_regime} quality blocked INSTANT rel strength {rel_strength:.2f}% < {_ir:.2f}%"
+
+    # HP_INST_VOL (volume ratio) gate: check overrides, CLI args, or default to 3.5
+    _regime_hp_iv = regime_cfg.get("HP_INST_VOL")
+    _default_iv = getattr(args, "bull_strong_instant_min_volume_ratio", 3.5) if btc_regime == "BULL_STRONG" else 3.5
+    _iv = float(_regime_hp_iv) if _regime_hp_iv is not None else _default_iv
+    if signal.volume_ratio < _iv:
+        return f"BTC {btc_regime} quality blocked INSTANT volume {signal.volume_ratio:.2f}x < {_iv:.2f}x"
+
+    # Extra quality filters: check overrides, or fall back to default CLI args if btc_regime == "BULL_STRONG"
+    min_score = regime_cfg.get("instant_min_score")
+    if min_score is None and btc_regime == "BULL_STRONG":
+        min_score = getattr(args, "bull_strong_instant_min_score", 94.0)
     if min_score is not None and signal.score < float(min_score):
-        return f"BTC BULL_STRONG quality blocked INSTANT score {signal.score:.1f} < {float(min_score):.1f}"
+        return f"BTC {btc_regime} quality blocked INSTANT score {signal.score:.1f} < {float(min_score):.1f}"
 
-    min_rr = getattr(args, "bull_strong_instant_min_rr", 1.4)
+    min_rr = regime_cfg.get("instant_min_reward_risk")
+    if min_rr is None and btc_regime == "BULL_STRONG":
+        min_rr = getattr(args, "bull_strong_instant_min_rr", 1.4)
     if min_rr is not None and signal.reward_risk < float(min_rr):
-        return f"BTC BULL_STRONG quality blocked INSTANT R/R {signal.reward_risk:.2f} < {float(min_rr):.2f}"
+        return f"BTC {btc_regime} quality blocked INSTANT R/R {signal.reward_risk:.2f} < {float(min_rr):.2f}"
 
-    max_rr = getattr(args, "bull_strong_instant_max_rr", 2.5)
+    max_rr = regime_cfg.get("instant_max_reward_risk")
+    if max_rr is None and btc_regime == "BULL_STRONG":
+        max_rr = getattr(args, "bull_strong_instant_max_rr", 2.5)
     if max_rr is not None and signal.reward_risk > float(max_rr):
-        return f"BTC BULL_STRONG quality blocked INSTANT R/R {signal.reward_risk:.2f} > {float(max_rr):.2f}"
+        return f"BTC {btc_regime} quality blocked INSTANT R/R {signal.reward_risk:.2f} > {float(max_rr):.2f}"
 
-    max_btc = getattr(args, "bull_strong_instant_max_btc_momentum_pct", 8.0)
+    max_btc = regime_cfg.get("instant_max_btc_momentum_pct")
+    if max_btc is None and btc_regime == "BULL_STRONG":
+        max_btc = getattr(args, "bull_strong_instant_max_btc_momentum_pct", 8.0)
     if max_btc is not None and btc_momentum > float(max_btc):
-        return f"BTC BULL_STRONG quality blocked INSTANT BTC momentum {btc_momentum:.2f}% > {float(max_btc):.2f}%"
-
-    min_volume = getattr(args, "bull_strong_instant_min_volume_ratio", 3.5)
-    if min_volume is not None and signal.volume_ratio < float(min_volume):
-        return f"BTC BULL_STRONG quality blocked INSTANT volume {signal.volume_ratio:.2f}x < {float(min_volume):.2f}x"
+        return f"BTC {btc_regime} quality blocked INSTANT BTC momentum {btc_momentum:.2f}% > {float(max_btc):.2f}%"
 
     return ""
 
@@ -5662,32 +5747,33 @@ def _maybe_reposition_sl(
 
     if not sl_client_order_id or current_sl <= 0:
         return
-    if time.time() - last_update < args.sl_update_interval_seconds:
+    if time.time() - last_update < getattr(args, "sl_update_interval_seconds", 300.0):
         return
 
     item["last_sl_update"] = time.time()
 
     try:
-        klines = client.klines(symbol, interval, args.sl_lookback + 5)
+        klines = client.klines(symbol, interval, getattr(args, "sl_lookback", 20) + 5)
         mark = client.mark_price(symbol)
     except BinanceClientError:
         return
 
     candles = candles_from_klines(klines)
-    if len(candles) < args.sl_lookback:
+    if len(candles) < getattr(args, "sl_lookback", 20):
         return
 
-    window = candles[-args.sl_lookback:]
-    stop_buffer = args.stop_buffer_pct / 100
-    max_loss_pct = _safe_float(item.get("max_sl_loss_pct")) or args.max_sl_loss_pct
-    leverage = int(_safe_float(item.get("leverage")) or args.leverage or 1)
+    window = candles[-getattr(args, "sl_lookback", 20):]
+    stop_buffer = getattr(args, "stop_buffer_pct", 0.20) / 100
+    max_loss_pct = _safe_float(item.get("max_sl_loss_pct")) or getattr(args, "max_sl_loss_pct", 50.0)
+    leverage = int(_safe_float(item.get("leverage")) or getattr(args, "leverage", 10) or 1)
     entry_ref = _safe_float(item.get("trigger_price")) or _safe_float(item.get("live_entry_price"))
 
     # Breakeven ratchet: once unrealized profit reaches breakeven_trigger_r x
     # initial_risk, pull the stop to entry + a tiny profit lock. Validated by a
     # 12-run sweep across 3 regime windows (compounded 61x -> 117x at +1.5R).
     breakeven_sl = 0.0
-    if _safe_float(args.breakeven_trigger_r) > 0:
+    trigger_r = _safe_float(item.get("breakeven_trigger_r") if item.get("breakeven_trigger_r") is not None else getattr(args, "breakeven_trigger_r", 0.0))
+    if trigger_r > 0:
         position = _account_position(
             account, symbol, side, bool(item.get("hedge_mode", False))
         )
@@ -5702,7 +5788,6 @@ def _maybe_reposition_sl(
         if entry_price > 0 and initial_stop > 0:
             initial_risk = abs(entry_price - initial_stop)
             if initial_risk > 0:
-                trigger_r = args.breakeven_trigger_r
                 offset = args.breakeven_offset_pct / 100.0
                 if side == "LONG" and mark >= entry_price + trigger_r * initial_risk:
                     breakeven_sl = entry_price * (1.0 + offset)
@@ -5844,7 +5929,7 @@ def _resolve_callback_pct(signal_atr_pct: float, args: argparse.Namespace) -> fl
     (backtest only checks at hourly close, so it can use a tighter 0.5% floor).
     Binance accepts 0.1-10%."""
     if not getattr(args, "adaptive_trailing_callback", False) or signal_atr_pct <= 0:
-        return args.trailing_callback_pct
+        return getattr(args, "trailing_callback_pct", 1.2)
     multiplier = getattr(args, "adaptive_trailing_callback_multiplier", 0.3)
     return max(1.0, min(5.0, signal_atr_pct * 100.0 * multiplier))
 
