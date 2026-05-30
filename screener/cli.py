@@ -4749,6 +4749,24 @@ def _parse_percent_list(raw: str, parser: argparse.ArgumentParser) -> list[float
 ENTRY_REGIMES = {"INSTANT", "RETEST", "STRICT_RETEST", "TRAILING_RETEST"}
 
 
+_REGIME_OVERRIDE_ALIASES = {
+    "breakeven": "breakeven_trigger_r",
+    "breakeven_r": "breakeven_trigger_r",
+    "stag_after_r": "stagnation_after_r",
+    "stag_candles": "stagnation_candles",
+}
+
+
+def _normalize_regime_overrides(raw: dict[str, object]) -> dict[str, object]:
+    """Accept historical hyperopt keys while storing live CLI keys."""
+    normalized: dict[str, object] = {}
+    for key, value in raw.items():
+        if value is None:
+            continue
+        normalized[_REGIME_OVERRIDE_ALIASES.get(key, key)] = value
+    return normalized
+
+
 def _parse_entry_regime_set(raw: str, parser: argparse.ArgumentParser) -> set[str]:
     if raw.strip().lower() in {"", "none", "off"}:
         return set()
